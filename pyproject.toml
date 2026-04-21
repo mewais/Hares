@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hares"
+version = "0.1.0"
+description = "Hares (حارس) — resource-aware command-execution MCP server."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "Mohamed Ewais" }]
+dependencies = [
+  "mcp>=1.0",
+  "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7",
+  "pytest-asyncio>=0.21",
+]
+
+[project.scripts]
+hares-mcp = "hares.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["hares"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
