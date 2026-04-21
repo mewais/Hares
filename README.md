@@ -8,6 +8,11 @@ concurrency semaphore, and CPU-affinity pinning.
 Designed as a drop-in replacement for unconstrained shell tools in any
 MCP-aware client (Naseej, claude-code, etc.).
 
+> **Tuning** — every cap is controlled by an env var (`HARES_MAX_CONCURRENT`,
+> `HARES_MEM_LIMIT_MB`, `HARES_CPU_LIMIT_SEC`, …). See [Configuration
+> (env vars)](#configuration-env-vars) below for the full table and tuning
+> examples for big workstations vs small containers.
+
 ## What Hares does
 
 For every command it runs:
@@ -52,6 +57,27 @@ All defaults are tuned for a 2-core / 16 GB box. Override via env to scale.
 | `HARES_RSS_OVERSHOOT_RATIO`    | `1.2`   | Kill if process-tree RSS > `MEM_LIMIT × ratio`.   |
 
 A per-call `timeout` argument always wins over `HARES_DEFAULT_TIMEOUT_SEC`.
+
+### Tuning examples
+
+```sh
+# Big workstation — 16 cores, 128 GB:
+export HARES_MAX_CONCURRENT=8
+export HARES_MEM_LIMIT_MB=14336        # 14 GB per command
+export HARES_CPU_LIMIT_SEC=3600        # 1 hour
+
+# Tiny container — 1 core, 4 GB:
+export HARES_MAX_CONCURRENT=1
+export HARES_MEM_LIMIT_MB=2048         # 2 GB
+export HARES_CPU_LIMIT_SEC=300
+
+# Stress test — let everything overrun the cap quickly:
+export HARES_RSS_OVERSHOOT_RATIO=1.05  # kill at +5% over cap
+export HARES_RSS_POLL_INTERVAL_SEC=0.5 # check every 500 ms
+```
+
+The same vars can be set in an MCP client's `env:` block (see next section)
+so each MCP-aware tool gets a separate Hares instance with its own limits.
 
 ## MCP client config
 
