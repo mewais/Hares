@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -115,17 +116,25 @@ def _build_server(runner: Runner) -> Server:
 
 
 async def _serve() -> None:
-    cfg = load_config()
+    cfg = load_config(default_cwd=os.getcwd())
     logger.info(
-        "Hares starting: max_concurrent=%d, mem=%dMB, cpu=%ds",
+        "Hares starting: max_concurrent=%d, mem=%dMB, cpu=%ds, sandbox=%s",
         cfg.max_concurrent, cfg.mem_limit_mb, cfg.cpu_limit_sec,
+        "bwrap" if cfg.sandbox.enabled else "off",
     )
+    if cfg.sandbox.enabled:
+        logger.info(
+            "Sandbox: rw_binds=%s ro_binds=%s network=%s",
+            list(cfg.sandbox.rw_binds), list(cfg.sandbox.ro_binds),
+            "on" if cfg.sandbox.allow_network else "off",
+        )
     runner = Runner(
         max_concurrent=cfg.max_concurrent,
         mem_limit_mb=cfg.mem_limit_mb,
         cpu_limit_sec=cfg.cpu_limit_sec,
         rss_poll_interval=cfg.rss_poll_interval,
         rss_overshoot_ratio=cfg.rss_overshoot_ratio,
+        sandbox=cfg.sandbox,
     )
     server = _build_server(runner)
     async with stdio_server() as (read, write):

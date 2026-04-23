@@ -29,6 +29,7 @@ import signal
 from typing import Any, Optional
 
 from .inspector import format_rewrite_notice, inspect_command
+from .sandbox import SandboxConfig, build_bwrap_argv
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,7 @@ class Runner:
         rss_overshoot_ratio: float = 1.2,
         pin_cpu: bool = True,
         rewrite_overcommits: bool = True,
+        sandbox: Optional[SandboxConfig] = None,
     ) -> None:
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be >= 1")
@@ -85,6 +87,7 @@ class Runner:
         self._rss_overshoot = rss_overshoot_ratio
         self._pin_cpu = pin_cpu and hasattr(os, "sched_setaffinity")
         self._rewrite = rewrite_overcommits
+        self._sandbox = sandbox if (sandbox and sandbox.enabled) else None
 
         # Core allocator: pool of currently-free cores from the parent's
         # affinity set, capped to max_concurrent so we never claim more
@@ -251,14 +254,31 @@ class Runner:
 
             pinned_cores = await self._claim_cores(weight)
 
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=cwd,
-                env=child_env,
-                preexec_fn=self._make_preexec(pinned_cores),
-            )
+            if self._sandbox is not None:
+                # Wrap the command in a bwrap invocation. bwrap handles
+                # --chdir internally, so we don't pass cwd to the
+                # subprocess (otherwise bwrap would itself try to
+                # chdir there in the host namespace before mounting,
+                # which is unnecessary and breaks if cwd is a sandbox-
+                # only path).
+                argv = build_bwrap_argv(self._sandbox, command, cwd)
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=None,
+                    env=child_env,
+                    preexec_fn=self._make_preexec(pinned_cores),
+                )
+            else:
+                proc = await asyncio.create_subprocess_shell(
+                    command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=cwd,
+                    env=child_env,
+                    preexec_fn=self._make_preexec(pinned_cores),
+                )
 
             kill_flag: dict[str, Any] = {}
             monitor = asyncio.create_task(self._monitor_rss(proc.pid, kill_flag))

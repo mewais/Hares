@@ -10,6 +10,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from .sandbox import SandboxConfig, load_sandbox_config
+
 
 @dataclass(frozen=True)
 class Config:
@@ -19,6 +21,7 @@ class Config:
     default_timeout: float  # Default wall-clock timeout per command (sec).
     rss_poll_interval: float  # Seconds between RSS monitor polls.
     rss_overshoot_ratio: float  # Kill if RSS > mem_limit * this.
+    sandbox: SandboxConfig  # Filesystem-namespace isolation settings.
 
 
 def _intenv(name: str, default: int) -> int:
@@ -41,8 +44,15 @@ def _floatenv(name: str, default: float) -> float:
         raise ValueError(f"{name} must be a float, got {raw!r}") from exc
 
 
-def load_config() -> Config:
-    """Build a Config from HARES_* environment variables."""
+def load_config(default_cwd: str | None = None) -> Config:
+    """Build a Config from HARES_* environment variables.
+
+    Args:
+      default_cwd: Used as the default rw bind for the sandbox if
+        HARES_SANDBOX_RW is unset. Pass the server process's cwd so
+        the sandbox defaults to "agent can only see the directory I
+        was launched from".
+    """
     return Config(
         max_concurrent=_intenv("HARES_MAX_CONCURRENT", 2),
         mem_limit_mb=_intenv("HARES_MEM_LIMIT_MB", 7168),
@@ -50,4 +60,5 @@ def load_config() -> Config:
         default_timeout=_floatenv("HARES_DEFAULT_TIMEOUT_SEC", 300.0),
         rss_poll_interval=_floatenv("HARES_RSS_POLL_INTERVAL_SEC", 2.0),
         rss_overshoot_ratio=_floatenv("HARES_RSS_OVERSHOOT_RATIO", 1.2),
+        sandbox=load_sandbox_config(default_cwd=default_cwd),
     )

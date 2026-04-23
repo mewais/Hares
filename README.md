@@ -33,6 +33,11 @@ For every command it runs:
    process group on overrun.
 7. **Global semaphore** — only `HARES_MAX_CONCURRENT` commands run at once
    across all callers; extras queue inside the server.
+8. **Optional bwrap sandbox** — when `HARES_SANDBOX_MODE=bwrap`, the
+   subprocess runs inside a fresh mount namespace that only sees an
+   allowlist of host paths (default: the server's cwd). Stops careless
+   `find /home -name …` style walks at the kernel level — those host
+   directories simply don't exist in the child's filesystem view.
 
 ## Installing
 
@@ -55,6 +60,12 @@ All defaults are tuned for a 2-core / 16 GB box. Override via env to scale.
 | `HARES_DEFAULT_TIMEOUT_SEC`    | `300`   | Default per-command wall-clock timeout (sec).     |
 | `HARES_RSS_POLL_INTERVAL_SEC`  | `2`     | Seconds between RSS aggregation polls.            |
 | `HARES_RSS_OVERSHOOT_RATIO`    | `1.2`   | Kill if process-tree RSS > `MEM_LIMIT × ratio`.   |
+| `HARES_SANDBOX_MODE`           | `none`  | `none` (off, default) or `bwrap` (filesystem isolation via bubblewrap). |
+| `HARES_SANDBOX_RW`             | *cwd*   | Colon-separated paths bind-mounted read-write. Defaults to the server's cwd. |
+| `HARES_SANDBOX_RO`             | *empty* | Colon-separated extra paths bind-mounted read-only. |
+| `HARES_SANDBOX_NETWORK`        | `on`    | `on` (default — keeps pip/git working) or `off` (also unshare the netns). |
+| `HARES_SANDBOX_TMP_SIZE_MB`    | *unset* | Optional tmpfs size cap for `/tmp` inside the sandbox. |
+| `HARES_SANDBOX_BWRAP_BIN`      | `bwrap` | Override the bwrap binary path (resolved via `PATH`). |
 
 A per-call `timeout` argument always wins over `HARES_DEFAULT_TIMEOUT_SEC`.
 
@@ -74,7 +85,49 @@ export HARES_CPU_LIMIT_SEC=300
 # Stress test — let everything overrun the cap quickly:
 export HARES_RSS_OVERSHOOT_RATIO=1.05  # kill at +5% over cap
 export HARES_RSS_POLL_INTERVAL_SEC=0.5 # check every 500 ms
+
+# Filesystem sandbox — agent only sees /proj/MyRepo + /tmp:
+export HARES_SANDBOX_MODE=bwrap
+export HARES_SANDBOX_RW=/proj/MyRepo:/tmp
+export HARES_SANDBOX_RO=/opt/toolchain         # extra read-only deps
+# Network stays on by default; set HARES_SANDBOX_NETWORK=off to also
+# isolate from the network (useful for offline / hermetic test runs).
 ```
+
+### Filesystem sandbox details
+
+When `HARES_SANDBOX_MODE=bwrap`, every subprocess runs inside a fresh
+mount namespace constructed by [`bubblewrap`](https://github.com/containers/bubblewrap).
+Inside the sandbox the child sees:
+
+- The user's `HARES_SANDBOX_RW` paths bind-mounted read-write at the
+  same host paths (so `cd /proj/MyRepo && pytest` Just Works).
+- The user's `HARES_SANDBOX_RO` paths bind-mounted read-only.
+- Standard system paths bind-mounted read-only: `/usr`, `/etc`, plus
+  symlinks for `/lib`, `/lib64`, `/bin`, `/sbin` (handles merged-usr
+  distros like RHEL 8+/Fedora/Ubuntu transparently).
+- `/proc`, `/dev`, and a fresh tmpfs at `/tmp`, `/run`, `/var/tmp`.
+
+The child does **not** see other host paths (`/home`, the rest of
+`/proj`, the rest of `/var`, etc.). An agent that fires
+`find /home -name conftest.py` simply gets a "no such file or
+directory" — the host directory tree doesn't exist in this namespace.
+
+Resource caps (`RLIMIT_AS`, `RLIMIT_CPU`, CPU affinity) still apply
+inside the sandbox: `bwrap` is the parent process; the limits flow
+to its child through `fork`+`execve`. `--die-with-parent` ensures
+the inner process tree is reaped when bwrap (or Hares) dies, so
+`killpg`-on-timeout still works cleanly.
+
+Requirements:
+
+- `bubblewrap` installed on the host (`apt install bubblewrap`,
+  `dnf install bubblewrap`, or `pacman -S bubblewrap`).
+- Kernel with user namespaces enabled (the default on RHEL 8+,
+  Ubuntu 14.10+, every modern distro).
+
+If `HARES_SANDBOX_MODE=bwrap` is set but `bwrap` is missing from
+`PATH`, Hares fails fast at startup with a clear error.
 
 The same vars can be set in an MCP client's `env:` block (see next section)
 so each MCP-aware tool gets a separate Hares instance with its own limits.
