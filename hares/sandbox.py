@@ -71,10 +71,20 @@ class SandboxConfig:
 
 
 def _split_paths(raw: Optional[str]) -> tuple[str, ...]:
-    """Split a colon-separated env var into a tuple, dropping empties."""
+    """Split a colon-separated env var into a tuple of expanded paths.
+
+    Each entry is run through ``os.path.expandvars`` and ``expanduser`` so
+    callers can write `${HOME}/.gitconfig` or `~/.cache/pip` in their
+    config without the parent process having to pre-expand them. Empty
+    entries are dropped.
+    """
     if not raw:
         return ()
-    return tuple(p for p in raw.split(":") if p)
+    return tuple(
+        os.path.expanduser(os.path.expandvars(p))
+        for p in raw.split(":")
+        if p
+    )
 
 
 def load_sandbox_config(default_cwd: Optional[str] = None) -> SandboxConfig:

@@ -88,6 +88,17 @@ def test_explicit_rw_overrides_default(monkeypatch, tmp_path):
     assert cfg.rw_binds == ("/tmp/a", "/tmp/b")
 
 
+def test_env_var_and_tilde_expansion_in_bind_paths(monkeypatch, tmp_path):
+    """Bind paths support ${VAR} and ~ expansion so the parent process
+    doesn't have to pre-expand them in YAML config."""
+    monkeypatch.setenv("HARES_SANDBOX_MODE", "bwrap")
+    monkeypatch.setenv("MY_TEST_DIR", str(tmp_path))
+    monkeypatch.setenv("HARES_SANDBOX_RO", "${MY_TEST_DIR}/a:~/b")
+    cfg = load_sandbox_config(default_cwd=str(tmp_path))
+    assert cfg.ro_binds[0] == f"{tmp_path}/a", cfg.ro_binds
+    assert cfg.ro_binds[1].startswith(os.path.expanduser("~")), cfg.ro_binds
+
+
 def test_network_off(monkeypatch):
     monkeypatch.setenv("HARES_SANDBOX_MODE", "bwrap")
     monkeypatch.setenv("HARES_SANDBOX_NETWORK", "off")
