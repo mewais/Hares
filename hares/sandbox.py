@@ -96,13 +96,24 @@ def load_sandbox_config(default_cwd: Optional[str] = None) -> SandboxConfig:
         process cwd so by default the agent only sees the directory
         Hares was launched from.
     """
-    mode = os.environ.get("HARES_SANDBOX_MODE", "none").strip().lower()
-    if mode in ("", "none", "off", "false", "0"):
+    # 0.2.0 default flip: bwrap is REQUIRED by default. Operators
+    # opt OUT via HARES_SANDBOX_DISABLED=1 (mac, restricted-userns
+    # containers, debugging). The legacy HARES_SANDBOX_MODE env var
+    # is still consulted for backward compat: HARES_SANDBOX_MODE=none
+    # (or off/false/0) is treated as DISABLED.
+    disabled_raw = os.environ.get("HARES_SANDBOX_DISABLED", "").strip().lower()
+    legacy_mode = os.environ.get("HARES_SANDBOX_MODE", "").strip().lower()
+    if disabled_raw in ("1", "true", "yes", "on"):
         return SandboxConfig(enabled=False)
-    if mode != "bwrap":
+    if legacy_mode in ("none", "off", "false", "0"):
+        # Legacy explicit-disable via HARES_SANDBOX_MODE=none.
+        return SandboxConfig(enabled=False)
+    if legacy_mode and legacy_mode != "bwrap":
         raise ValueError(
-            f"HARES_SANDBOX_MODE={mode!r} not supported; "
-            "expected 'none' or 'bwrap'"
+            f"HARES_SANDBOX_MODE={legacy_mode!r} not supported; "
+            "expected 'bwrap' or 'none'. Note: as of Hares 0.2.0 the "
+            "default is bwrap REQUIRED; use HARES_SANDBOX_DISABLED=1 "
+            "to opt out for non-Linux / debugging / unsandboxed deployments."
         )
 
     bwrap_bin = os.environ.get("HARES_SANDBOX_BWRAP_BIN", "bwrap")

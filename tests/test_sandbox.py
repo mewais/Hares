@@ -56,14 +56,28 @@ needs_bwrap_runtime = pytest.mark.skipif(
 # ── Pure builder tests (don't actually run bwrap) ──────────────────────────
 
 
-def test_disabled_by_default(monkeypatch):
+def test_enabled_by_default_in_0_2(monkeypatch):
+    """0.2.0 default flip: bwrap is REQUIRED by default. Operators
+    opt out via HARES_SANDBOX_DISABLED=1 (mac, restricted-userns
+    containers, debugging)."""
     monkeypatch.delenv("HARES_SANDBOX_MODE", raising=False)
+    monkeypatch.delenv("HARES_SANDBOX_DISABLED", raising=False)
     cfg = load_sandbox_config()
-    assert cfg.enabled is False
+    assert cfg.enabled is True
 
 
-def test_off_aliases(monkeypatch):
-    for v in ("none", "off", "false", "0", ""):
+def test_disabled_via_new_opt_out(monkeypatch):
+    monkeypatch.delenv("HARES_SANDBOX_MODE", raising=False)
+    for v in ("1", "true", "yes", "on"):
+        monkeypatch.setenv("HARES_SANDBOX_DISABLED", v)
+        assert load_sandbox_config().enabled is False
+
+
+def test_legacy_off_aliases_still_disable(monkeypatch):
+    """HARES_SANDBOX_MODE=none/off/false/0 (0.1 explicit-disable) is
+    still honored as DISABLED for backward compat."""
+    monkeypatch.delenv("HARES_SANDBOX_DISABLED", raising=False)
+    for v in ("none", "off", "false", "0"):
         monkeypatch.setenv("HARES_SANDBOX_MODE", v)
         assert load_sandbox_config().enabled is False
 

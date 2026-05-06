@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hares"
-version = "0.1.0"
-description = "Hares (حارس) — resource-aware command-execution MCP server."
+version = "0.2.0"
+description = "Hares (حارس) — guard MCP server: scoped, throttled, sandboxed filesystem + shell tools."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -13,6 +13,7 @@ authors = [{ name = "Mohamed Ewais" }]
 dependencies = [
   "mcp>=1.0",
   "psutil>=5.9",
+  "posix_ipc>=1.1",
 ]
 
 [project.optional-dependencies]
@@ -22,7 +23,7 @@ dev = [
 ]
 
 [project.scripts]
-hares-mcp = "hares.server:main"
+hares-mcp = "hares.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["hares"]

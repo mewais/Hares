@@ -26,12 +26,18 @@ import logging
 import os
 import resource
 import signal
+from dataclasses import replace
+from pathlib import Path
 from typing import Any, Optional
 
 from .inspector import format_rewrite_notice, inspect_command
 from .sandbox import SandboxConfig, build_bwrap_argv
 
 logger = logging.getLogger(__name__)
+
+# Avoid a hard import-time dependency on coordination.py; type-only.
+if False:  # TYPE_CHECKING
+    from .coordination import CrossProcessCoordinator
 
 try:
     import psutil  # type: ignore[import-untyped]
@@ -72,6 +78,7 @@ class Runner:
         pin_cpu: bool = True,
         rewrite_overcommits: bool = True,
         sandbox: Optional[SandboxConfig] = None,
+        coordinator: Optional["CrossProcessCoordinator"] = None,
     ) -> None:
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be >= 1")
@@ -79,7 +86,6 @@ class Runner:
             raise ValueError("mem_limit_mb must be >= 1")
         if cpu_limit_sec < 1:
             raise ValueError("cpu_limit_sec must be >= 1")
-        self._sem = asyncio.Semaphore(max_concurrent)
         self._max_concurrent = max_concurrent
         self._mem_bytes = mem_limit_mb * 1024 * 1024
         self._cpu_sec = cpu_limit_sec
@@ -88,22 +94,83 @@ class Runner:
         self._pin_cpu = pin_cpu and hasattr(os, "sched_setaffinity")
         self._rewrite = rewrite_overcommits
         self._sandbox = sandbox if (sandbox and sandbox.enabled) else None
+        self._coordinator = coordinator
 
-        # Core allocator: pool of currently-free cores from the parent's
-        # affinity set, capped to max_concurrent so we never claim more
-        # cores than the host promised us.
-        cores = _allowed_cores()
-        if cores:
-            self._core_pool = cores[:max_concurrent]
+        # Concurrency: when a coordinator is injected, defer entirely to
+        # it (cross-process semaphore). Else fall back to per-process
+        # asyncio.Semaphore (0.1 behavior).
+        if coordinator is None:
+            self._sem: Optional[asyncio.Semaphore] = asyncio.Semaphore(max_concurrent)
         else:
-            self._core_pool = []
-        # Async lock around the core pool's free/claimed bookkeeping.
+            self._sem = None
+
+        # Core allocator: when a coordinator is injected, claim cores
+        # from it (non-overlapping across sibling Hares processes).
+        # Else fall back to first-N cores (0.1 behavior, overlapping
+        # if multiple Hares processes run side-by-side).
+        if coordinator is not None:
+            self._core_pool = coordinator.claim_cores()
+        else:
+            cores = _allowed_cores()
+            self._core_pool = cores[:max_concurrent] if cores else []
+        # Async lock around the per-Runner free/claimed bookkeeping.
+        # (Note: this is INTRA-process; the coordinator's claim_cores
+        # already partitions cores INTER-process so this Runner only
+        # ever schedules within its own slice.)
         self._core_lock = asyncio.Lock()
         self._core_in_use: set[int] = set()
+
+        # Active-scope state — used to derive the bwrap RW mount list
+        # at execute() time. Set by ``set_active_scope`` when a caller
+        # invokes ``restrict_paths``. None = use self._sandbox as-is
+        # (operator-set HARES_SANDBOX_RW only).
+        self._active_scope_paths: Optional[list[Path]] = None
+        self._active_scope_read_only: bool = False
 
     @property
     def max_concurrent(self) -> int:
         return self._max_concurrent
+
+    def set_active_scope(
+        self,
+        paths: list[Path],
+        *,
+        read_only: bool = False,
+    ) -> None:
+        """Update the active scope used for bwrap mount construction.
+
+        Called by the shell server when a caller invokes
+        ``restrict_paths`` — narrows the bwrap RW mount list
+        to ``paths`` (read-write) under the existing ceiling. With
+        ``read_only=True``, paths are mounted RO instead of RW
+        (subprocess kernel-rejected on writes).
+
+        No-op when ``self._sandbox is None`` (sandbox disabled).
+        Currently-running subprocesses are unaffected — each was
+        spawned with its own bwrap argv at the time it started; only
+        the NEXT execute() call will see the new scope.
+        """
+        self._active_scope_paths = list(paths) if paths else None
+        self._active_scope_read_only = read_only
+
+    def _effective_sandbox(self, cwd: Optional[str]) -> Optional[SandboxConfig]:
+        """Compose the sandbox config for THIS execute() call.
+
+        Operator-set ``HARES_SANDBOX_RW``/``HARES_SANDBOX_RO`` are
+        always included (per the design decision: env-set extras
+        compose with architect-set scope). Active scope (if set) adds
+        either to rw_binds or to ro_binds depending on read_only.
+        """
+        if self._sandbox is None:
+            return None
+        if self._active_scope_paths is None:
+            return self._sandbox
+        extra_paths = tuple(str(p) for p in self._active_scope_paths)
+        if self._active_scope_read_only:
+            new_ro = tuple(self._sandbox.ro_binds) + extra_paths
+            return replace(self._sandbox, ro_binds=new_ro)
+        new_rw = tuple(self._sandbox.rw_binds) + extra_paths
+        return replace(self._sandbox, rw_binds=new_rw)
 
     async def _claim_cores(self, weight: int) -> list[int]:
         """Grab `weight` free cores from the pool. Returns [] if the
@@ -242,26 +309,33 @@ class Runner:
         # carry through, then layer caller-provided overrides.
         child_env = {**os.environ, **(env or {})}
 
-        # Acquire `weight` slots from the semaphore. We acquire one at
-        # a time so cancellation while partially acquired releases what
-        # we got.
+        # Acquire `weight` slots — from the coordinator if present
+        # (cross-process global cap) or from the in-process semaphore
+        # (0.1 fallback). We acquire one at a time so cancellation
+        # while partially acquired releases what we got.
         acquired = 0
         pinned_cores: list[int] = []
         try:
-            for _ in range(weight):
-                await self._sem.acquire()
-                acquired += 1
+            if self._coordinator is not None:
+                await self._coordinator.acquire_subprocess_slot(weight)
+                acquired = weight
+            else:
+                assert self._sem is not None
+                for _ in range(weight):
+                    await self._sem.acquire()
+                    acquired += 1
 
             pinned_cores = await self._claim_cores(weight)
 
-            if self._sandbox is not None:
+            effective_sandbox = self._effective_sandbox(cwd)
+            if effective_sandbox is not None:
                 # Wrap the command in a bwrap invocation. bwrap handles
                 # --chdir internally, so we don't pass cwd to the
                 # subprocess (otherwise bwrap would itself try to
                 # chdir there in the host namespace before mounting,
                 # which is unnecessary and breaks if cwd is a sandbox-
                 # only path).
-                argv = build_bwrap_argv(self._sandbox, command, cwd)
+                argv = build_bwrap_argv(effective_sandbox, command, cwd)
                 proc = await asyncio.create_subprocess_exec(
                     *argv,
                     stdout=asyncio.subprocess.PIPE,
@@ -321,5 +395,10 @@ class Runner:
             }
         finally:
             await self._release_cores(pinned_cores)
-            for _ in range(acquired):
-                self._sem.release()
+            if self._coordinator is not None:
+                if acquired:
+                    await self._coordinator.release_subprocess_slot(acquired)
+            else:
+                assert self._sem is not None
+                for _ in range(acquired):
+                    self._sem.release()
