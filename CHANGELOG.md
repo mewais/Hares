@@ -4,6 +4,46 @@ All notable changes to Hares are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] — 2026-05-06
+
+### Added
+
+* **Sequence-numbered `restrict_paths` (replay-defense for the
+  scope state).** `ActiveScope` gains a monotonic `seq: int` counter
+  that increments by 1 on every successful `restrict_paths` call.
+  Both `restrict_paths` and `get_active_paths` now return the seq
+  alongside `active_paths`. External auditors (e.g. Bunyan's
+  `seal_bundle` cross-check) can track the latest seq they expected
+  and reject any `get_active_paths` reply whose seq is below that
+  threshold — closes the silent-replay window where an attacker
+  with state-file write access could swap a tighter scope back to
+  a stale, looser one between an agent's last `restrict_paths` and
+  the auditor's read.
+
+* **`restrict_paths` `expected_seq` argument (compare-and-swap).**
+  Optional integer kwarg; if provided, the call refuses with a
+  structured `{"error": "scope_seq_mismatch", "expected_seq": …,
+  "current_seq": …}` reply unless the current seq matches. Lets
+  multiple agents sharing one scope race-safely tighten only when
+  no one else has changed it since their last read.
+
+* **`hares.fs.state.ScopeSeqMismatch` exception.** Raised by
+  `ScopeStateStore.set` on CAS failure; the tool dispatcher catches
+  it and returns the structured error response described above.
+
+### Changed
+
+* **State file format bumped to version 2** — adds the `"seq": N`
+  field. Files written by 0.2.0 (version=1) trigger the existing
+  version-mismatch warn-and-rebuild path on first start; agents
+  re-call `restrict_paths` and the new seq begins at 1. No data
+  loss because the active scope was advisory only — the ceiling +
+  bwrap mounts are the kernel-enforced bound.
+
+* **`get_active_paths` reply shape** now includes `"seq"`. Old
+  consumers that only read `"active_paths"` keep working unchanged;
+  new consumers gain replay-defense by checking the seq.
+
 ## [0.2.0] — 2026-05-05
 
 This is a substantial reshape of Hares: one binary now hosts BOTH a

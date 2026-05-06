@@ -36,7 +36,7 @@ from ..path_safety import (
     PathSafetyError,
     resolve_under_ceiling,
 )
-from .state import ScopeStateStore
+from .state import ScopeSeqMismatch, ScopeStateStore
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,18 @@ def restrict_tool_descriptors(scope_id: Optional[str]) -> list[Tool]:
                             "Empty list = no writes/runs allowed."
                         ),
                     },
+                    "expected_seq": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": (
+                            "0.2.1: optional compare-and-swap. If "
+                            "provided, the call refuses unless the "
+                            "current scope's seq equals expected_seq. "
+                            "Lets a caller race-safely tighten only if "
+                            "no other agent has changed the scope since "
+                            "the caller's last get_active_paths read."
+                        ),
+                    },
                 },
                 "required": ["paths"],
             },
@@ -86,9 +98,13 @@ def restrict_tool_descriptors(scope_id: Optional[str]) -> list[Tool]:
         Tool(
             name=_prefixed(GET_ACTIVE_PATHS_TOOL, scope_id),
             description=(
-                "Return the current active scope. Useful for external "
-                "auditors and for agents that want to verify what scope "
-                "they're operating under."
+                "Return the current active scope and its monotonic seq. "
+                "Useful for external auditors and for agents that want "
+                "to verify what scope they're operating under. The seq "
+                "(0.2.1) lets callers detect stale-reply replay: track "
+                "the latest seq you've issued via restrict_paths and "
+                "reject any get_active_paths reply whose seq is below "
+                "that threshold."
             ),
             inputSchema={
                 "type": "object",
@@ -136,6 +152,19 @@ def build_restrict_tool_handlers(
             raise ValueError(
                 f"{RESTRICT_PATHS_TOOL}: 'paths' must be a list of strings"
             )
+        # 0.2.1: optional CAS arg. Validate before doing any disk work
+        # (mkdir-p) so a mismatch fails fast without side effects.
+        expected_seq_raw = args.get("expected_seq")
+        if expected_seq_raw is not None and not isinstance(expected_seq_raw, int):
+            raise ValueError(
+                f"{RESTRICT_PATHS_TOOL}: 'expected_seq' must be an integer "
+                f"or omitted (got {type(expected_seq_raw).__name__})"
+            )
+        if isinstance(expected_seq_raw, int) and expected_seq_raw < 0:
+            raise ValueError(
+                f"{RESTRICT_PATHS_TOOL}: 'expected_seq' must be >= 0 "
+                f"(got {expected_seq_raw})"
+            )
         resolved: list[Path] = []
         for p in raw_paths:
             if not isinstance(p, str) or not p:
@@ -148,10 +177,28 @@ def build_restrict_tool_handlers(
             # paths that don't yet exist on disk).
             target.mkdir(parents=True, exist_ok=True)
             resolved.append(target)
-        new_scope = scope_state.set(resolved)
+        try:
+            new_scope = scope_state.set(
+                resolved, expected_seq=expected_seq_raw,
+            )
+        except ScopeSeqMismatch as exc:
+            # Surface a structured error instead of a 500 — consumers
+            # (Bunyan's seal_bundle) check this exact shape to decide
+            # whether to retry or escalate.
+            logger.warning(
+                "%s: CAS mismatch (expected_seq=%d, current=%d) — "
+                "scope was narrowed by another caller",
+                name_restrict, exc.expected, exc.actual,
+            )
+            return {
+                "error": "scope_seq_mismatch",
+                "expected_seq": exc.expected,
+                "current_seq": exc.actual,
+                "message": str(exc),
+            }
         logger.info(
-            "Active scope updated for %s: %d paths",
-            name_restrict, len(resolved),
+            "Active scope updated for %s: %d paths, seq=%d",
+            name_restrict, len(resolved), new_scope.seq,
         )
         if on_change is not None:
             try:
@@ -161,11 +208,17 @@ def build_restrict_tool_handlers(
                     "on_change callback raised (%s); active scope is "
                     "set but downstream notification failed.", exc,
                 )
-        return {"active_paths": [str(p) for p in new_scope.paths]}
+        return {
+            "active_paths": [str(p) for p in new_scope.paths],
+            "seq": new_scope.seq,
+        }
 
     async def _get_active(args: dict) -> dict:
         cur = scope_state.current()
-        return {"active_paths": [str(p) for p in cur.paths]}
+        return {
+            "active_paths": [str(p) for p in cur.paths],
+            "seq": cur.seq,
+        }
 
     return scope_state, {
         name_restrict: _restrict,

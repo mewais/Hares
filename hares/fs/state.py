@@ -6,16 +6,17 @@ applicable) are allowed to write to. It can be set at runtime via
 the ``restrict_paths`` tool and persists across server restarts
 when ``--state-file`` is provided.
 
-State file format (version: 1):
+State file format (version: 2):
 
     {
-      "version": 1,
+      "version": 2,
       "scope_id": "src",          // or null when the instance is unscoped
       "ceiling": "/work/proj",    // resolved absolute
       "active_paths": [
         "/work/proj/lib/parser",
         "/work/proj/lib/lexer"
       ],
+      "seq": 7,                   // monotonic counter, +1 per restrict_paths
       "last_restrict_at": "2026-05-05T10:30:00Z"
     }
 
@@ -24,6 +25,25 @@ mismatch, scope_id mismatch, or ceiling mismatch, fall back to "no
 active scope" (instance starts with active = the entire ceiling).
 The fallback is logged at WARNING so operators notice; agents
 should re-call ``restrict_paths`` to re-narrow.
+
+Sequence numbering (0.2.1): ``seq`` is a monotonic counter that
+increments by 1 on every successful ``restrict_paths`` call. It lets
+external auditors (e.g. Bunyan's seal_bundle cross-check) detect
+replay attacks: an attacker with state-file write access could
+otherwise swap a tighter scope back to a stale, looser one between
+the agent's last restrict_paths and the auditor's get_active_paths
+read. With seq, the auditor tracks the latest seq it expected and
+rejects any get_active_paths reply whose seq is BELOW that.
+``restrict_paths`` also accepts an optional ``expected_seq`` arg —
+if provided, the call refuses with ScopeSeqMismatch unless the
+current seq matches. Compare-and-swap semantics for race-free
+narrowing.
+
+Backward compat: state files written by 0.2.0 (version=1, no seq
+field) are detected by the version check and the instance starts
+with an empty scope + seq=0. Operators upgrading should expect a
+single warn-and-rebuild on first start under 0.2.1; agents
+re-call restrict_paths and the new seq begins at 1.
 """
 
 from __future__ import annotations
@@ -39,7 +59,24 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-STATE_VERSION = 1
+STATE_VERSION = 2
+
+
+class ScopeSeqMismatch(Exception):
+    """Raised by ``ScopeStateStore.set`` when ``expected_seq`` is provided
+    and doesn't match the current scope's seq. Indicates either a
+    legitimate concurrent narrower (caller should re-read with
+    get_active_paths and decide whether to retry) or a replay attempt
+    against a stale view of the scope."""
+
+    def __init__(self, *, expected: int, actual: int) -> None:
+        super().__init__(
+            f"expected_seq={expected} but current seq={actual} — "
+            f"scope was narrowed by another caller since you last read it; "
+            f"re-read via get_active_paths and decide whether to retry."
+        )
+        self.expected = expected
+        self.actual = actual
 
 
 @dataclass
@@ -56,6 +93,7 @@ class ActiveScope:
     last_restrict_at: Optional[datetime] = None
     scope_id: Optional[str] = None
     ceiling: Optional[Path] = None
+    seq: int = 0
 
 
 class ScopeStateStore:
@@ -94,14 +132,31 @@ class ScopeStateStore:
     def current(self) -> ActiveScope:
         return self._scope
 
-    def set(self, paths: list[Path]) -> ActiveScope:
+    def set(
+        self,
+        paths: list[Path],
+        *,
+        expected_seq: Optional[int] = None,
+    ) -> ActiveScope:
         """Replace the active scope. Persists immediately if a state
-        file was configured. Returns the new ActiveScope."""
+        file was configured. Returns the new ActiveScope.
+
+        ``expected_seq`` (0.2.1): if provided, raise ScopeSeqMismatch
+        unless the current scope's seq equals expected_seq. Lets
+        callers do compare-and-swap narrowing — useful when multiple
+        agents share a scope and you want "tighten only if no one
+        else has changed it since I last read."
+        """
+        if expected_seq is not None and expected_seq != self._scope.seq:
+            raise ScopeSeqMismatch(
+                expected=expected_seq, actual=self._scope.seq,
+            )
         new = ActiveScope(
             paths=[p.resolve(strict=False) for p in paths],
             last_restrict_at=datetime.now(timezone.utc),
             scope_id=self._scope_id,
             ceiling=self._ceiling,
+            seq=self._scope.seq + 1,
         )
         self._scope = new
         if self._state_file is not None:
@@ -181,7 +236,7 @@ class ScopeStateStore:
             return ActiveScope(
                 scope_id=self._scope_id, ceiling=self._ceiling,
             )
-        # Parse paths + timestamp.
+        # Parse paths + timestamp + seq.
         paths = [Path(p).resolve(strict=False) for p in data.get("active_paths", [])]
         ts_raw = data.get("last_restrict_at")
         last_restrict_at: Optional[datetime] = None
@@ -190,16 +245,33 @@ class ScopeStateStore:
                 last_restrict_at = datetime.fromisoformat(ts_raw)
             except ValueError:
                 last_restrict_at = None
+        # 0.2.1: seq was added in STATE_VERSION 2. Defensive int-coerce
+        # in case the file is hand-edited to a non-int value (treat as
+        # 0; the next set() will increment to 1 and re-save).
+        seq_raw = data.get("seq", 0)
+        try:
+            seq = int(seq_raw)
+            if seq < 0:
+                raise ValueError(f"negative seq {seq}")
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "ScopeStateStore: state file %s has malformed seq=%r "
+                "(%s); resetting seq to 0. Replay-defense for this "
+                "scope is degraded until the next restrict_paths call.",
+                self._state_file, seq_raw, exc,
+            )
+            seq = 0
         logger.info(
             "ScopeStateStore: restored active scope from %s "
-            "(scope_id=%r, %d paths)",
-            self._state_file, self._scope_id, len(paths),
+            "(scope_id=%r, %d paths, seq=%d)",
+            self._state_file, self._scope_id, len(paths), seq,
         )
         return ActiveScope(
             paths=paths,
             last_restrict_at=last_restrict_at,
             scope_id=self._scope_id,
             ceiling=self._ceiling,
+            seq=seq,
         )
 
     def _save(self, scope: ActiveScope) -> None:
@@ -212,6 +284,7 @@ class ScopeStateStore:
             "scope_id": self._scope_id,
             "ceiling": str(self._ceiling),
             "active_paths": [str(p) for p in scope.paths],
+            "seq": scope.seq,
             "last_restrict_at": (
                 scope.last_restrict_at.isoformat()
                 if scope.last_restrict_at else None
