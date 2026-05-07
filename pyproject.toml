@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hares"
-version = "0.2.3"
+version = "0.3.0"
 description = "Hares (حارس) — guard MCP server: scoped, throttled, sandboxed filesystem + shell tools."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -69,13 +69,15 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--enable",
-        choices=["shell", "fs", "fs+shell"],
+        choices=["shell", "fs", "fs+shell", "lsf"],
         default="shell",
         help=(
             "Which tool family/families to expose. Default: shell "
             "(0.1-compat). 'fs' exposes the filesystem-server surface; "
             "'fs+shell' exposes both with a shared scope_id and "
-            "active scope."
+            "active scope. 'lsf' exposes the five LSF cluster tools "
+            "(lsf_execute_blocking, lsf_submit, lsf_wait, lsf_cancel, "
+            "lsf_jobs) — no bwrap, no RLIMIT, no active-scope enforcement."
         ),
     )
     parser.add_argument(
@@ -236,6 +238,26 @@ def main(argv: Optional[list[str]] = None) -> None:
     args = _parse_args(argv)
 
     scope_id = _validate_scope_id(args.scope_id)
+
+    # LSF mode: ceiling is optional (used only for cwd pre-submission check).
+    # Skip the mandatory-ceiling validation and the env-path checks that only
+    # apply to bwrap-based modes.
+    if args.enable == "lsf":
+        ceiling: Optional[Path] = None
+        raw = args.ceiling or os.environ.get("HARES_FS_CEILING", "").strip()
+        if raw:
+            expanded = Path(
+                os.path.expanduser(os.path.expandvars(raw))
+            ).resolve(strict=False)
+            try:
+                validate_ceiling(expanded)
+                ceiling = expanded
+            except PathSafetyError as exc:
+                raise SystemExit(f"hares-mcp: invalid --ceiling for LSF mode: {exc}")
+        from .lsf.server import serve as lsf_serve
+        lsf_serve(scope_id=scope_id, ceiling=ceiling)
+        return
+
     ceiling = _resolve_ceiling(args)
     state_file = _validate_state_file(args.state_file, scope_id, ceiling)
     _validate_env_paths()
