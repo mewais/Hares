@@ -4,6 +4,45 @@ All notable changes to Hares are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.2.3] — 2026-05-06
+
+Round-4 reviewer findings against 0.2.2:
+
+### Security
+
+* **Power-loss durability gap (security-engineer M.1 [HIGH]).**
+  ``ScopeStateStore._save`` previously did
+  ``tmp.write → fsync(tmp_fd) → os.replace(tmp, state_file)``
+  without fsyncing the parent directory afterwards. On
+  ext4(data=ordered) and XFS, the rename's directory-entry update
+  can reach disk AFTER the inode data; power loss in that window
+  leaves the parent dir pointing at the OLD inode while both files
+  exist as durable, rolling seq back below what the auditor last
+  observed → false-positive REPLAY alert (or, worse, silent scope
+  widening). 0.2.3 opens the parent dir with O_RDONLY|O_DIRECTORY
+  + fsyncs it after every os.replace. POSIX-compliant, cheap;
+  no-op on platforms without O_DIRECTORY support.
+
+* **Refuse-to-start when stateful without HMAC secret
+  (security-adversarial #3 [MEDIUM]).** Pre-fix
+  ``HARES_STATE_HMAC_SECRET`` was strongly recommended for
+  multi-process / restart-tolerant deployments but not enforced.
+  An attacker who could SIGTERM the Hares process got a
+  wide-open scope window: the new process couldn't verify the
+  prior signed state (different per-process random fallback
+  secret) so it fell back to empty scope (seq=0, no
+  restrictions) until the next restrict_paths call. 0.2.3 makes
+  ``--state-file`` + unset ``HARES_STATE_HMAC_SECRET`` a hard
+  startup error so the misconfigured-deploy case fails loudly
+  instead of silently degrading replay-defense.
+
+### Tests
+
+* `tests/test_round4_durability.py`: structural test asserting
+  `_save` fsyncs the parent-dir fd; subprocess test asserting
+  the CLI refuses to start with --state-file but no HMAC secret;
+  positive test that pinning the secret allows startup.
+
 ## [0.2.2] — 2026-05-06
 
 Closes the round-3 reviewer's HIGH finding against 0.2.1's seq design:

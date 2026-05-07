@@ -175,6 +175,29 @@ def _validate_state_file(
             "isolation.",
             expanded, ceiling,
         )
+    # Round-4 [security-adversarial #3]: --state-file + per-process
+    # random HMAC fallback is a real attack window. An attacker who
+    # SIGTERMs Hares gets a wide-open scope until the next
+    # restrict_paths call — the new process can't verify the prior
+    # signed state (different secret) so it falls back to empty
+    # scope (seq=0, no restrictions). Operators running stateful
+    # deploys MUST pin HARES_STATE_HMAC_SECRET so the new process
+    # can verify the prior file. Fail-closed at startup beats
+    # silently-degraded-replay-defense at runtime.
+    if not (os.environ.get("HARES_STATE_HMAC_SECRET") or "").strip():
+        raise SystemExit(
+            "hares-mcp: --state-file (%s) is configured but "
+            "HARES_STATE_HMAC_SECRET is unset. Stateful deployments "
+            "require an operator-pinned HMAC secret so the state "
+            "file can be verified across process restarts (the "
+            "per-process random fallback can't verify a prior "
+            "process's file → silent empty-scope on every restart, "
+            "which an attacker can trigger with SIGTERM to widen "
+            "the scope window). Set HARES_STATE_HMAC_SECRET to a "
+            "high-entropy value (32+ bytes of base64/hex) and "
+            "re-run, or drop --state-file for in-memory-only mode."
+            % expanded
+        )
     return expanded
 
 

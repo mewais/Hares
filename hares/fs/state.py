@@ -514,3 +514,26 @@ class ScopeStateStore:
         except OSError:
             pass
         os.replace(tmp, self._state_file)
+        # Round-4 [HIGH security-engineer M.1]: fsync the parent
+        # directory after the rename so the directory-entry update
+        # itself is durable. On ext4(data=ordered) and XFS, the
+        # rename's directory-entry update can otherwise reach disk
+        # AFTER the inode data; power loss in that window can leave
+        # the parent dir pointing at the OLD inode while both files
+        # exist as durable, rolling seq back below what the auditor
+        # last observed → false-positive REPLAY alert (or, worse,
+        # silent scope widening). POSIX-compliant + cheap. No-op
+        # when fsync isn't supported (Windows, exotic FSes).
+        try:
+            parent_fd = os.open(
+                str(self._state_file.parent),
+                os.O_RDONLY | os.O_DIRECTORY,
+            )
+        except OSError:
+            return  # platform doesn't support O_DIRECTORY
+        try:
+            os.fsync(parent_fd)
+        except OSError:
+            pass
+        finally:
+            os.close(parent_fd)
