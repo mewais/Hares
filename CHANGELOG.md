@@ -45,14 +45,14 @@ Round-4 reviewer findings against 0.2.2:
 
 ## [0.2.2] — 2026-05-06
 
-Closes the round-3 reviewer's HIGH finding against 0.2.1's seq design:
-the seq counter alone is insufficient because an attacker with state-
-file write access can fast-forward to ``seq=10⁸``, and any external
-auditor expecting ``seq=4`` accepts. 0.2.2 adds an HMAC over the
-canonical (version, scope_id, ceiling, seq, sorted_paths) payload so
-the attacker can't forge a passing (seq, paths) tuple without knowing
-the secret. Auditors (Bunyan) now enforce ``seq == expected_next`` AND
-verify the HMAC.
+Closes a HIGH finding against 0.2.1's seq design: the seq counter
+alone is insufficient because an attacker with state-file write
+access can fast-forward to ``seq=10⁸``, and any consumer expecting
+``seq=4`` accepts. 0.2.2 adds an HMAC over the canonical
+(version, scope_id, ceiling, seq, sorted_paths) payload so the
+attacker can't forge a passing (seq, paths) tuple without knowing
+the secret. Out-of-process verifiers should now enforce
+``seq == expected_next`` AND verify the HMAC.
 
 ### Added
 
@@ -62,23 +62,23 @@ verify the HMAC.
   per-process secret with a one-time WARNING; this defends the
   in-process case but breaks cross-process verification (the next
   process has a fresh secret + can't verify the prior file → falls
-  back to empty scope on load). External auditors (Bunyan) read the
+  back to empty scope on load). Out-of-process verifiers read the
   same env var to verify HMACs received over the MCP protocol.
 * **`get_active_paths` reply now includes `hmac` + `version`** so
-  an external auditor can verify the (paths, seq) tuple is
+  any out-of-process verifier can confirm the (paths, seq) tuple is
   authentic. Use together with strict ``seq == expected_next``
   enforcement for end-to-end replay-and-forge defense.
 * **`restrict_paths` reply now includes `hmac` + `version`** for
   symmetric verifiability of the just-set scope.
 * **WAL recovery on load.** `_save` writes through `state.json.tmp`
   (fsync) then renames to `state.json`. A crash between fsync and
-  rename used to roll the seq back below what the auditor last
-  observed (false-positive replay alert at the next get). The new
-  load preferentially commits the `.tmp` file when its seq is
+  rename used to roll the seq back below what an external consumer
+  last observed (false-positive replay alert at the next get). The
+  new load preferentially commits the `.tmp` file when its seq is
   higher AND its HMAC verifies.
 * **`hares.fs.state.canonical_hmac_payload` + `compute_state_hmac`
-  exposed** so external verifiers can compute the same canonical
-  bytes Hares signs over.
+  exposed** so out-of-process verifiers can compute the same
+  canonical bytes Hares signs over.
 
 ### Changed
 
@@ -95,13 +95,14 @@ verify the HMAC.
 
 ### Security
 
-* **Round-3 [HIGH security-adversarial]: seq fast-forward defense.**
-  Pre-fix the verifier contract was "reject when seq is BELOW
-  expected" — an attacker writing seq=10⁸ fast-forwarded past any
-  expected value. With HMAC signing the attacker can't write any
-  (seq, paths) without the secret, and the documented consumer
-  contract is now ``seq == expected_next`` (strict next-step), not
-  ``seq >= expected``. Bunyan's verifier helper enforces this.
+* **seq fast-forward defense.** Pre-fix the documented consumer
+  contract was "reject when seq is BELOW expected" — an attacker
+  writing seq=10⁸ fast-forwarded past any expected value. With
+  HMAC signing the attacker can't write any (seq, paths) without
+  the secret, and the documented consumer contract is now
+  ``seq == expected_next`` (strict next-step), not
+  ``seq >= expected``. Out-of-process verifiers should enforce
+  the strict-next-step rule alongside HMAC verification.
 
 ## [0.2.1] — 2026-05-06
 
@@ -111,13 +112,15 @@ verify the HMAC.
   scope state).** `ActiveScope` gains a monotonic `seq: int` counter
   that increments by 1 on every successful `restrict_paths` call.
   Both `restrict_paths` and `get_active_paths` now return the seq
-  alongside `active_paths`. External auditors (e.g. Bunyan's
-  `seal_bundle` cross-check) can track the latest seq they expected
-  and reject any `get_active_paths` reply whose seq is below that
-  threshold — closes the silent-replay window where an attacker
-  with state-file write access could swap a tighter scope back to
-  a stale, looser one between an agent's last `restrict_paths` and
-  the auditor's read.
+  alongside `active_paths`. Out-of-process consumers can track the
+  latest seq they expected and reject any `get_active_paths` reply
+  whose seq is below that threshold — closes the silent-replay
+  window where an attacker with state-file write access could swap
+  a tighter scope back to a stale, looser one between an agent's
+  last `restrict_paths` and the consumer's read. (Note: this
+  contract was strengthened in 0.2.2 to ``seq == expected_next``
+  + HMAC verification; the seq-only "below threshold" check
+  documented here was insufficient.)
 
 * **`restrict_paths` `expected_seq` argument (compare-and-swap).**
   Optional integer kwarg; if provided, the call refuses with a

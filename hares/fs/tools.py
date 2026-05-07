@@ -113,10 +113,9 @@ def restrict_tool_descriptors(scope_id: Optional[str]) -> list[Tool]:
                 "lets a caller with the same HARES_STATE_HMAC_SECRET "
                 "verify that the (paths, seq) tuple wasn't forged — "
                 "an attacker with state-file write but no secret "
-                "knowledge cannot produce a passing HMAC. External "
-                "auditors (e.g. Bunyan's seal_bundle cross-check) use "
-                "both signals together for end-to-end replay-and-forge "
-                "defense."
+                "knowledge cannot produce a passing HMAC. Out-of-"
+                "process verifiers use both signals together for "
+                "end-to-end replay-and-forge defense."
             ),
             inputSchema={
                 "type": "object",
@@ -195,8 +194,8 @@ def build_restrict_tool_handlers(
             )
         except ScopeSeqMismatch as exc:
             # Surface a structured error instead of a 500 — consumers
-            # (Bunyan's seal_bundle) check this exact shape to decide
-            # whether to retry or escalate.
+            # check this exact shape to decide whether to retry or
+            # escalate.
             logger.warning(
                 "%s: CAS mismatch (expected_seq=%d, current=%d) — "
                 "scope was narrowed by another caller",
@@ -232,9 +231,10 @@ def build_restrict_tool_handlers(
             "active_paths": sorted_path_strs,
             "seq": new_scope.seq,
             # 0.2.2: HMAC over the canonical (version, scope_id,
-            # ceiling, seq, sorted_paths) payload. External auditors
-            # (Bunyan) verify with the same env var to detect a
-            # tampered state file before trusting the reply.
+            # ceiling, seq, sorted_paths) payload. Out-of-process
+            # verifiers compute the same canonical form with the
+            # shared HARES_STATE_HMAC_SECRET to detect a tampered
+            # state file before trusting the reply.
             "hmac": sig,
             "version": STATE_VERSION,
         }

@@ -39,18 +39,18 @@ external auditor last observed.
 
 Sequence numbering (0.2.1) + HMAC signing (0.2.2):
 ``seq`` is a monotonic counter that increments by 1 on every
-successful ``restrict_paths`` call. It lets external auditors
-(e.g. Bunyan's seal_bundle cross-check) detect replay attacks: an
-attacker with state-file write access could otherwise swap a
-tighter scope back to a stale, looser one between the agent's last
-restrict_paths and the auditor's get_active_paths read. With seq,
-the auditor enforces ``seq == expected_next`` (NOT ``seq >=
-expected``, which the round-3 reviewer flagged: an attacker writing
-seq=10000000 fast-forwards past any expected value). The HMAC
-protects against an attacker who has state-file write access from
-forging a (seq, paths) pair: without the secret they can't compute
-a valid HMAC, so the next load fails verification and falls back
-to seq=0 + empty scope (visible to the auditor as a discontinuity).
+successful ``restrict_paths`` call. It lets any out-of-process
+consumer of ``get_active_paths`` detect replay attacks: an attacker
+with state-file write access could otherwise swap a tighter scope
+back to a stale, looser one between the agent's last
+restrict_paths and the consumer's read. With seq, the consumer
+enforces ``seq == expected_next`` (NOT ``seq >= expected``, which
+an attacker can fast-forward past by writing seq=10000000). The
+HMAC protects against an attacker who has state-file write access
+from forging a (seq, paths) pair: without the secret they can't
+compute a valid HMAC, so the next load fails verification and
+falls back to seq=0 + empty scope (visible to the consumer as a
+discontinuity).
 
 The HMAC secret is operator-pinned via ``HARES_STATE_HMAC_SECRET``
 (env var, expected to be 32+ bytes of base64/hex). When unset, the
@@ -58,9 +58,9 @@ process generates a random secret at startup; this defends the
 in-process case but BREAKS verification across process restarts
 (the new process has a fresh secret + can't verify the old file →
 falls back to empty scope on load). Operators running multi-process
-or restart-tolerant deployments MUST pin the secret. External
-auditors (Bunyan) read the same env var to verify HMACs they
-receive over the MCP protocol.
+or restart-tolerant deployments MUST pin the secret. Out-of-process
+verifiers read the same env var to verify HMACs they receive over
+the MCP protocol.
 
 ``restrict_paths`` also accepts an optional ``expected_seq`` arg —
 if provided, the call refuses with ScopeSeqMismatch unless the
@@ -106,7 +106,7 @@ def _state_hmac_secret() -> bytes:
 
     Prefers ``HARES_STATE_HMAC_SECRET`` env (operator-pinned, restart-
     safe; the only way for verification to outlive a process restart
-    or to be checkable by an external auditor like Bunyan).
+    or to be checkable by an out-of-process verifier).
 
     Falls back to a process-local random secret with a one-time
     WARNING. The fallback defends the in-process case (an attacker
@@ -122,8 +122,8 @@ def _state_hmac_secret() -> bytes:
         logger.warning(
             "HARES_STATE_HMAC_SECRET not set; using a process-local "
             "random key for state-file HMAC. Cross-process verification "
-            "(including Bunyan's seal_bundle replay-defense check) "
-            "will FAIL until the operator pins this env var to a "
+            "(any out-of-process consumer of get_active_paths) will "
+            "FAIL until the operator pins this env var to a "
             "high-entropy value (32+ bytes of base64 / hex). For "
             "single-process dev runs this fallback is fine.",
         )
@@ -138,9 +138,10 @@ def canonical_hmac_payload(
     seq: int,
     sorted_paths: list[str],
 ) -> bytes:
-    """Build the canonical bytes the HMAC signs over. Exposed so external
-    verifiers (Bunyan) can compute the same canonical form. Order +
-    separators are LOCKED IN — any change is a state-version bump."""
+    """Build the canonical bytes the HMAC signs over. Exposed so
+    out-of-process verifiers can compute the same canonical form.
+    Order + separators are LOCKED IN — any change is a state-version
+    bump."""
     # NUL-separated to defeat field-injection attacks (no path can
     # contain NUL on POSIX). version + seq are utf-8 decimal.
     parts = [
