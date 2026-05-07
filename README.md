@@ -1,40 +1,44 @@
 # Hares (حارس)
 
-Hares is **guard** — Arabic for guard / protector. One MCP binary, two
-tool families, uniform scope and permission semantics across both,
-kernel-enforced via [bubblewrap](https://github.com/containers/bubblewrap):
+**Guard MCP server for multi-agent LLM workflows.**
 
-* **Shell** (`execute_command`): subprocess execution, bounded by a bwrap
-  mount namespace + per-process `RLIMIT_AS` / `RLIMIT_CPU` / wall-clock
-  timeouts + a (now optionally cross-process) concurrency semaphore.
-* **Filesystem** (`read_file`, `write_file`, `list_directory`, …): direct
-  file operations, bounded by in-process path validation against a
-  configured **ceiling** and a runtime-narrowable **active scope**.
+When you run multiple LLM agents in parallel — each with shell execution and filesystem
+access — you need something between them and the host. Without limits, one agent's test
+run can OOM the machine, a runaway build saturates every CPU core, and nothing stops an
+agent from writing outside the paths you intended. Automated LLM flows also raise the
+security bar: agents should operate in a constrained, auditable environment, not with the
+same permissions as the operator.
 
-The same five CLI flags mean the same thing on both sides — see
-[Symmetry table](#symmetry-table). The mechanism differs (bwrap mounts
-for shell, in-Python validation for fs); the user-facing semantic does not.
+Hares puts a kernel-enforced guard on every tool call:
 
-> **Migrating from 0.1.x?** Jump to [Migration from 0.1.x](#migration-from-01x).
+- **bwrap mount namespace** — agents physically cannot write outside their declared scope;
+  the kernel rejects it, no policy to bypass
+- **`RLIMIT_AS` / `RLIMIT_CPU`** — per-subprocess memory and CPU caps, kernel-enforced
+- **Wall-clock timeouts + global concurrency semaphore** — N parallel agents share one
+  cap; no single agent starves the rest
+- **Runtime scope narrowing** — an operator or orchestrator calls `restrict_paths` to
+  narrow what each agent can touch, down to the directory level
+- **LSF cluster execution** — offload heavy jobs (simulators, large builds) to an HPC
+  cluster; agents submit, poll, and cancel without touching the local machine
+
+One binary. Three tool families. Uniform scope semantics across all of them.
 
 ---
 
 ## Table of contents
 
 1. [Overview](#overview)
-2. [What's new in 0.2.0](#whats-new-in-020)
-3. [Quick start](#quick-start)
-4. [CLI reference](#cli-reference)
-5. [Tool surface](#tool-surface)
-6. [Env var reference](#env-var-reference)
-7. [System-dir policy](#system-dir-policy)
-8. [Cross-process coordination](#cross-process-coordination)
-9. [Active scope and `restrict_paths`](#active-scope-and-restrict_paths)
-10. [bwrap mechanics](#bwrap-mechanics)
-11. [Multi-instance use under flat-namespace registries](#multi-instance-use-under-flat-namespace-registries)
-12. [Threat model](#threat-model)
-13. [Quirks and edge cases](#quirks-and-edge-cases)
-14. [Migration from 0.1.x](#migration-from-01x)
+2. [Quick start](#quick-start)
+3. [CLI reference](#cli-reference)
+4. [Tool surface](#tool-surface)
+5. [Env var reference](#env-var-reference)
+6. [System-dir policy](#system-dir-policy)
+7. [Cross-process coordination](#cross-process-coordination)
+8. [Active scope and `restrict_paths`](#active-scope-and-restrict_paths)
+9. [bwrap mechanics](#bwrap-mechanics)
+10. [Multi-instance use under flat-namespace registries](#multi-instance-use-under-flat-namespace-registries)
+11. [Threat model](#threat-model)
+12. [Quirks and edge cases](#quirks-and-edge-cases)
 
 ---
 
@@ -42,24 +46,27 @@ for shell, in-Python validation for fs); the user-facing semantic does not.
 
 Every Hares instance has a single **role**: limit what an MCP-using LLM
 can do under a specific budget (filesystem reach, write authority,
-subprocess resource consumption). One binary covers the role for both
-tool families:
+subprocess resource consumption, cluster job access). One binary covers
+the role for all three tool families:
 
 ```
 hares-mcp \
-  --enable {shell, fs, fs+shell}      # which tool family to expose
-  [--scope-id <id>]                   # tool-name prefix; scope identifier
-  --ceiling <path>                    # outer bound; required (CLI or env)
-  [--read-only]                       # observe-only mode
-  [--state-file <path>]               # persist active scope across restarts
+  --enable {shell, fs, fs+shell, lsf}  # which tool family to expose
+  [--scope-id <id>]                    # tool-name prefix; scope identifier
+  --ceiling <path>                     # outer bound; required for shell/fs (CLI or env)
+  [--read-only]                        # observe-only mode
+  [--state-file <path>]                # persist active scope across restarts
 ```
 
 A Hares instance can therefore be:
 
-* a **shell guard** for inspection-class commands,
+* a **shell guard** for inspection-class or build commands,
 * a **filesystem guard** with a per-scope writable view,
 * both at once with **one shared scope** (`fs+shell`), so a single
-  `restrict_paths(['lib/parser'])` call narrows both layers together.
+  `restrict_paths(['lib/parser'])` call narrows both layers together,
+* a **cluster job interface** (`lsf`) for submitting jobs to an HPC
+  scheduler, polling status, and collecting output — without touching
+  the local machine's resource budget.
 
 The same surface — flags, restrict tools, ceiling semantics — is the
 right one whether you're deploying Hares standalone, plugging it into
@@ -68,70 +75,42 @@ orchestrator.
 
 ---
 
-## What's new in 0.2.0
-
-* **Filesystem MCP surface** alongside shell, exposing the standard
-  npm-style `read_file` / `write_file` / `list_directory` / etc.
-  (under a configurable ceiling).
-* **`--scope-id` tool-name prefix** so two instances of Hares can
-  coexist under a flat-namespace MCP registry without colliding.
-* **`--ceiling` is required** for any instance with `--enable` set.
-  Defaults to `$HARES_FS_CEILING` when not on the CLI; missing both
-  fails fast.
-* **`--read-only`** is symmetric across fs and shell. For fs: write
-  tools are not registered. For shell: bwrap mounts the active scope
-  read-only.
-* **Runtime-narrowable active scope** via the always-registered
-  `restrict_paths` and `get_active_paths` tools. State optionally
-  persists to `--state-file`.
-* **Cross-process subprocess throttling** when `HARES_COORDINATION_DIR`
-  is set: a POSIX named semaphore enforces `HARES_MAX_CONCURRENT` as a
-  GLOBAL cap across N Hares processes (instead of per-process). CPU
-  cores are also handed out non-overlappingly across siblings via a
-  shared `core_pool.json` allocator.
-* **bwrap is REQUIRED by default**. Set `HARES_SANDBOX_DISABLED=1` to
-  opt out (non-Linux, restricted userns, debugging). This is the only
-  intentional behavioral break vs 0.1.
-* **System-dir validation** (opt-in, off by default) via
-  `HARES_DISALLOW_SYSTEM_DIRS=1`. Rejects ceilings / mounts / active
-  scope under common system paths (`/etc`, `/proc`, `/dev`, …);
-  extend via `HARES_EXTRA_SYSTEM_DIRS`.
-* **Always-on ceiling guard**: regardless of system-dir config, a
-  ceiling under `.git/` is rejected — version-control internals are
-  never legitimate as a project root.
-* `posix_ipc>=1.1` is now a runtime dep (gracefully optional — falls
-  back to in-process semaphore when unavailable).
-
-See [Migration from 0.1.x](#migration-from-01x) for the upgrade path.
-
----
-
 ## Quick start
 
 ```sh
-# 0.1-compatible shell-only invocation. Only difference vs 0.1: bwrap
-# is required by default (set HARES_SANDBOX_DISABLED=1 to opt out),
-# and HARES_FS_CEILING must be in env (or pass --ceiling).
+pip install hares
+```
+
+```sh
+# Shell guard — resource-capped, bwrap-sandboxed execute_command:
 HARES_FS_CEILING=/work/proj hares-mcp
 
 # Filesystem MCP, read-write under /work/proj:
 HARES_FS_CEILING=/work/proj hares-mcp --enable=fs
 
-# Filesystem MCP, read-only:
+# Filesystem MCP, read-only (observe-only, no write tools registered):
 HARES_FS_CEILING=/work/proj hares-mcp --enable=fs --read-only
 
 # Shell + FS in one process, shared active scope, scoped tool names,
 # state persisted across restarts:
 HARES_FS_CEILING=/work/proj hares-mcp \
   --enable=fs+shell \
-  --scope-id=block_x \
-  --state-file=/tmp/hares-state-block_x.json
+  --scope-id=agent_x \
+  --state-file=/tmp/hares-state-agent_x.json
 
 # Two instances coexisting under a flat-namespace MCP registry
-# (must use unique scope-ids):
+# (unique scope-ids prevent tool name collisions):
 hares-mcp --enable=fs --scope-id=src         --ceiling=/work/proj &
 hares-mcp --enable=fs --scope-id=unit_tests  --ceiling=/work/proj &
+
+# LSF cluster execution — submit jobs, poll, cancel (no ceiling required):
+HARES_LSF_QUEUE=gpu hares-mcp --enable=lsf --scope-id=cluster
 ```
+
+> **Non-Linux / container without user namespaces?** Set
+> `HARES_SANDBOX_DISABLED=1` to skip bwrap. Shell `--read-only` and
+> kernel scope enforcement won't apply, but resource caps and concurrency
+> throttling still work.
 
 ---
 
@@ -139,11 +118,11 @@ hares-mcp --enable=fs --scope-id=unit_tests  --ceiling=/work/proj &
 
 | Flag | Required | Default | Validation |
 |---|---|---|---|
-| `--enable {shell,fs,fs+shell}` | no | `shell` | choices |
+| `--enable {shell,fs,fs+shell,lsf}` | no | `shell` | choices |
 | `--scope-id <id>` | no | unset (no prefix) | `^[a-z][a-z0-9_]*$` |
-| `--ceiling <path>` | **yes** (CLI or env) | `$HARES_FS_CEILING` | abs-resolved; rejected if under `.git/`; rejected if under any blocklist entry when `HARES_DISALLOW_SYSTEM_DIRS=1` |
-| `--read-only` | no | off | flag |
-| `--state-file <path>` | no | unset (in-memory only) | abs-resolved; warning if path is under ceiling |
+| `--ceiling <path>` | **yes for shell/fs** (CLI or env); optional for lsf | `$HARES_FS_CEILING` | abs-resolved; rejected if under `.git/`; rejected if under any blocklist entry when `HARES_DISALLOW_SYSTEM_DIRS=1` |
+| `--read-only` | no | off | flag (shell/fs only; no effect for lsf) |
+| `--state-file <path>` | no | unset (in-memory only) | abs-resolved; warning if path is under ceiling (shell/fs only) |
 
 All flags fail fast at startup with a clear human-readable error. Bare
 `hares-mcp` invocation works as long as `HARES_FS_CEILING` is in env.
@@ -193,16 +172,36 @@ Union of the fs and shell surfaces, sharing **one** active scope. A
 single `<scope>_restrict_paths` call narrows BOTH the fs path
 validator AND the shell bwrap mount list.
 
+### `--enable=lsf`
+
+Five tools for HPC cluster job management via IBM Platform LSF:
+
+* `[<scope>_]lsf_execute_blocking` — submit one job, wait for it, return stdout/stderr/exit_code
+* `[<scope>_]lsf_submit` — submit a list of jobs (non-blocking), return job_ids
+* `[<scope>_]lsf_wait` — wait for a list of job_ids; returns when all reach DONE/EXIT or timeout
+* `[<scope>_]lsf_cancel` — bkill a list of job_ids
+* `[<scope>_]lsf_jobs` — list all jobs submitted in this session with current status
+
+Jobs are submitted via `bsub`. stdout/stderr are captured by an inner shell redirect
+(bypassing LSF's output file headers). Exit codes are written to a separate file and
+read when the job completes.
+
+> **Security note for LSF mode.** See [LSF mode — what does NOT apply](#lsf-mode--what-does-not-apply).
+> bwrap, RLIMIT, and active-scope enforcement do NOT extend to cluster nodes.
+
 ### Symmetry table
 
-| Flag | fs behavior | shell behavior |
-|---|---|---|
-| `--ceiling <path>` | Outer bound for tool-call paths | Outer bound for bwrap mount namespace |
-| `--scope-id <id>` | Tool-name prefix | Tool-name prefix |
-| `--read-only` | Write tools NOT registered | bwrap mounts active scope as RO; subprocess writes kernel-rejected |
-| `--state-file <path>` | Persists active scope | Persists active scope |
+| Flag | `fs` | `shell` | `lsf` |
+|---|---|---|---|
+| `--ceiling` | Outer bound for tool-call paths | Outer bound for bwrap mount namespace | Optional; used for pre-submission cwd check only |
+| `--scope-id` | Tool-name prefix | Tool-name prefix | Tool-name prefix |
+| `--read-only` | Write tools NOT registered | bwrap mounts active scope RO | No effect |
+| `--state-file` | Persists active scope | Persists active scope | Not applicable |
+| bwrap sandbox | No | **Yes** — kernel-enforced | No — cluster node runs unrestricted |
+| RLIMIT_AS/CPU | No | **Yes** — kernel-enforced | No — use LSF `resource_spec` |
+| Concurrency cap | No | **Yes** — semaphore + core pool | No — LSF manages cluster scheduling |
 
-The mechanism differs; the user-facing semantic does not.
+The mechanism differs; the scope semantics are uniform where applicable.
 
 ---
 
@@ -251,6 +250,19 @@ honored as an opt-out for older deploys.
 |---|---|---|
 | `HARES_DISALLOW_SYSTEM_DIRS` | unset | Set to `1` to opt IN to strict mode. When set, every path argument (`--ceiling`, `HARES_SANDBOX_RW/RO`, `restrict_paths` targets) is validated against the system-dir blocklist. **Default is permissive** — operators can use any path. Recommended for production / shared-tenant deployments. |
 | `HARES_EXTRA_SYSTEM_DIRS` | unset | Colon-separated additional dirs added to the blocklist when `HARES_DISALLOW_SYSTEM_DIRS=1`. Operators tune for their environment. Additive only — no override / subtract. |
+
+### Operator-deploy: LSF cluster jobs (`--enable=lsf`)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `HARES_LSF_QUEUE` | unset | LSF queue passed to `bsub -q`. When unset, LSF uses its site default. |
+| `HARES_LSF_DEFAULT_RESOURCE_SPEC` | unset | Default `bsub -R` resource spec applied to every job unless the caller overrides per-job (e.g. `rusage[mem=8192] span[hosts=1]`). |
+| `HARES_LSF_POLL_INTERVAL_SEC` | `10` | How often `lsf_wait` polls `bjobs` for job status. Lower values increase responsiveness at the cost of more bjobs traffic. |
+| `HARES_LSF_DEFAULT_TIMEOUT_SEC` | `86400` | Default timeout for `lsf_wait` and `lsf_execute_blocking` when the caller doesn't pass one. |
+| `HARES_LSF_OUTPUT_DIR` | per-session tempdir | Directory where stdout/stderr/exitcode files are written. Must be on a shared filesystem visible to both the submitting node and cluster nodes. |
+| `HARES_LSF_BSUB_BIN` | `bsub` | Path to the `bsub` binary. Override if LSF is not on `PATH`. |
+| `HARES_LSF_BJOBS_BIN` | `bjobs` | Path to the `bjobs` binary. |
+| `HARES_LSF_BKILL_BIN` | `bkill` | Path to the `bkill` binary. |
 
 ---
 
@@ -311,7 +323,7 @@ cannot be opted out of.
 
 When `HARES_COORDINATION_DIR` is **unset** (the default for standalone
 single-instance deploys), Hares uses an in-process `asyncio.Semaphore`
-and CPU-affinity is the first-N cores per process — same as 0.1.
+and CPU-affinity is the first-N cores per process (no inter-process coordination).
 
 When `HARES_COORDINATION_DIR` **is** set, Hares processes that share
 the dir coordinate via:
@@ -540,7 +552,28 @@ agent with both fs and shell access cannot use the shell to bypass
 the fs scope, because the bwrap mount list is derived from the same
 active scope.
 
-### Out of scope
+### LSF mode — what does NOT apply
+
+`--enable=lsf` has a fundamentally different security model from shell/fs modes.
+The cluster node runs the job with the submitting user's full filesystem permissions;
+Hares has no handle on it.
+
+| Guarantee | shell/fs | lsf |
+|---|---|---|
+| bwrap mount namespace (scope enforcement) | **Yes — kernel** | **No** |
+| RLIMIT_AS / RLIMIT_CPU | **Yes — kernel** | **No** — use `resource_spec` (`-R rusage[mem=N]`, `-W hh:mm`) |
+| Active-scope write enforcement at runtime | **Yes** | **No** |
+| `--ceiling` / `--read-only` | **Yes** | Pre-submission cwd check only (best-effort) |
+| Concurrency semaphore | **Yes** | No — LSF manages cluster scheduling |
+
+The only path-safety measure for LSF is a pre-submission ceiling check on the job's
+working directory (`cwd`). This catches configuration mistakes (pointing a job at the
+wrong directory), not a determined agent that computes paths at runtime.
+
+Resource governance for LSF jobs belongs in the `resource_spec` field (or
+`HARES_LSF_DEFAULT_RESOURCE_SPEC`), not in Hares.
+
+### Out of scope (all modes)
 
 * Kernel exploits (privilege escalation, namespace escape).
 * Side-channel attacks (timing, /proc info disclosure).
@@ -558,9 +591,8 @@ active scope.
 ## Quirks and edge cases
 
 * **Bare `hares-mcp` invocation requires `HARES_FS_CEILING`** in env.
-  This is the migration path from 0.1: set it once in your shell rc.
-  Without it (and without `--ceiling`), startup fails with a clear
-  error.
+  Set it once in your shell rc (`export HARES_FS_CEILING=$PWD`).
+  Without it (and without `--ceiling`), startup fails with a clear error.
 * **State file under ceiling**: warned about but not rejected. An
   agent with write access to the ceiling could corrupt the active
   scope. Move the state file outside the ceiling for tighter
@@ -600,75 +632,6 @@ active scope.
 * **`posix_ipc` not installed + coordination dir set**: falls back
   to in-process semaphore with a logged warning. Multi-instance
   throttling is NOT enforced.
-
----
-
-## Migration from 0.1.x
-
-The only user-visible breaking changes:
-
-1. **bwrap is required by default.** Previously `HARES_SANDBOX_MODE=bwrap`
-   was opt-in. To restore 0.1 behavior, set `HARES_SANDBOX_DISABLED=1`.
-   Legacy `HARES_SANDBOX_MODE={none,off,false,0}` is still honored.
-2. **`--ceiling` is required** for any `--enable` mode. To preserve
-   0.1's CLI-flag-free invocation, set `HARES_FS_CEILING=<path>` in
-   your shell rc.
-3. **Restrict tools are always registered** for any fs/shell
-   instance. They were not present in 0.1. They're zero-cost when
-   no agent has them in its allowlist.
-
-Everything else is backward-compatible:
-
-* The single `execute_command` tool name and signature are unchanged
-  (and still unprefixed when `--scope-id` isn't set).
-* All `HARES_*` env vars from 0.1 work identically.
-* `posix_ipc` is a soft dep — not having it gracefully degrades to
-  in-process semaphore.
-
-### Concrete diff for `~/.bashrc`
-
-```diff
-+ # 0.2 requires bwrap by default; opt out for non-Linux / debug.
-+ # export HARES_SANDBOX_DISABLED=1
-+
-+ # 0.2 requires --ceiling or HARES_FS_CEILING. Set once for all instances:
-+ export HARES_FS_CEILING=$HOME/work
-+
-+ # Optional: opt in to system-dir validation in production.
-+ # export HARES_DISALLOW_SYSTEM_DIRS=1
-+ # export HARES_EXTRA_SYSTEM_DIRS=/opt:/var/log
-+
-+ # Optional: cross-process throttling across N Hares (set this from
-+ # an orchestrator that spawns multiple instances; standalone
-+ # single-instance deploys can leave it unset).
-+ # export HARES_COORDINATION_DIR=/tmp/hares-coord-shared
-
-  # Existing 0.1 vars, all still honored:
-  export HARES_MAX_CONCURRENT=2
-  export HARES_MEM_LIMIT_MB=7168
-  export HARES_CPU_LIMIT_SEC=1200
-- export HARES_SANDBOX_MODE=bwrap        # default in 0.2; redundant
-  export HARES_SANDBOX_RW=$HOME/work:/tmp
-```
-
-### MCP client config diff
-
-For a single-instance shell deploy, no changes needed:
-
-```json
-{
-  "mcpServers": {
-    "shell": {
-      "command": "hares-mcp",
-      "env": { "HARES_FS_CEILING": "/work/proj" }
-    }
-  }
-}
-```
-
-For a multi-instance deploy under an orchestrator, add `--scope-id`
-per instance and have the orchestrator export
-`HARES_COORDINATION_DIR` to all spawned instances.
 
 ---
 
