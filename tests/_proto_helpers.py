@@ -3,7 +3,8 @@
 These tests spawn ``hares-mcp`` as a subprocess and exchange real
 JSON-RPC over stdio via the official ``mcp`` client. We use the
 client to avoid hand-rolling Content-Length framing and to mirror
-how Naseej / claude-code talk to the server.
+how any MCP host (Claude Code, IDE plugins, framework orchestrators)
+talks to the server.
 """
 
 from __future__ import annotations

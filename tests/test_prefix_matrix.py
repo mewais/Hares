@@ -5,7 +5,7 @@ Exercises the matrix:
   * Asserts no unprefixed names leak when a scope-id is set
   * Asserts no prefixed names appear when scope-id is unset
   * Asserts two instances with different scope-ids share no tool names
-    (i.e., would coexist under a flat-namespace registry like Naseej)
+    (i.e., would coexist under any flat-namespace MCP tool registry)
 """
 
 from __future__ import annotations
@@ -46,10 +46,11 @@ async def test_scope_id_prefixes_every_tool(enable, tmp_path):
 
 @pytest.mark.asyncio
 async def test_two_instances_different_scope_ids_no_name_collision(tmp_path):
-    """The whole point of --scope-id: under a flat-namespace registry
-    (Naseej), two instances with distinct scope-ids must expose disjoint
-    tool-name sets. We spawn them serially (one at a time, each in its
-    own client session) and assert the union has no duplicates."""
+    """The whole point of --scope-id: under a flat-namespace MCP tool
+    registry, two instances with distinct scope-ids must expose
+    disjoint tool-name sets. We spawn them serially (one at a time,
+    each in its own client session) and assert the union has no
+    duplicates."""
     a_path = tmp_path / "a"; a_path.mkdir()
     b_path = tmp_path / "b"; b_path.mkdir()
     async with hares_session(enable="fs", scope_id="aaa", ceiling=a_path) as s:

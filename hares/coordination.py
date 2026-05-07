@@ -1,10 +1,11 @@
 """Cross-process resource coordination for multi-instance Hares.
 
-When multiple Hares processes run side-by-side (e.g. Bunyan spawns 5+
-instances per workflow), each process's in-process semaphore plus
-each process's first-N CPU pinning would let total resource use
-balloon to N × the operator-set caps. This module provides shared
-accounting via filesystem coordination so the caps stay GLOBAL.
+When multiple Hares processes run side-by-side (e.g. an umbrella
+orchestrator spawns 5+ instances per workflow), each process's
+in-process semaphore plus each process's first-N CPU pinning would
+let total resource use balloon to N × the operator-set caps. This
+module provides shared accounting via filesystem coordination so
+the caps stay GLOBAL.
 
 Two shared resources:
 
@@ -30,10 +31,10 @@ Lifecycle notes:
   persistent until reboot or explicit ``unlink``. The first Hares
   process to access a coord dir creates the semaphore with
   ``O_CREAT | O_EXCL`` race-safely; subsequent processes open the
-  existing one. Cleanup happens when the umbrella process (Bunyan or
-  whoever orchestrates the run) removes the coord dir + calls
-  ``unlink_semaphore``. Hares processes themselves don't unlink on
-  exit because we don't know whether siblings are still running.
+  existing one. Cleanup happens when the umbrella orchestrator
+  removes the coord dir + calls ``unlink_semaphore``. Hares
+  processes themselves don't unlink on exit because we don't know
+  whether siblings are still running.
 
 * **Stale capacity mismatch** — if a previous run left a semaphore
   sized to a different ``HARES_MAX_CONCURRENT`` and the operator
@@ -74,7 +75,8 @@ except ImportError:  # pragma: no cover — soft dep, falls back to in-process
         "posix_ipc not installed — cross-process subprocess concurrency "
         "coordination disabled; falling back to per-process semaphore. "
         "Install posix_ipc>=1.1 for shared throttling under multi-instance "
-        "deployments (e.g. Bunyan).",
+        "deployments (any orchestrator that spawns multiple Hares "
+        "processes against a shared coordination dir).",
     )
 
 

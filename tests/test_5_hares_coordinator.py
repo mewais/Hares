@@ -8,7 +8,7 @@ processes at 2 — not 5×2=10.
 
 This is the load-bearing property added in 0.2: cross-process
 throttling via POSIX named semaphore. Without it, deploying 5 Hares
-under Bunyan would multiply the resource budget by 5.
+under any orchestrator would multiply the resource budget by 5.
 
 Skipped when ``posix_ipc`` isn't installed (the in-process fallback
 makes the global cap impossible).
