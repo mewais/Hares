@@ -54,8 +54,9 @@ def test_seq_round_trips_via_state_file(tmp_path):
     store1.set([p])
     store1.set([p])  # seq now 2
     saved = json.loads(state_file.read_text())
-    assert saved["version"] == STATE_VERSION == 2
+    assert saved["version"] == STATE_VERSION == 3  # 0.2.2 bump
     assert saved["seq"] == 2
+    assert "hmac" in saved  # 0.2.2: signed payload
     # Reload sees seq=2.
     store2 = ScopeStateStore(
         scope_id="src", ceiling=tmp_path, state_file=state_file,
@@ -87,6 +88,10 @@ def test_expected_seq_match_succeeds(tmp_path):
 
 
 def test_malformed_seq_in_state_file_resets_to_zero(tmp_path, caplog):
+    """0.2.2: malformed seq is now a hard reject (was: reset seq to 0
+    while keeping paths). v3 makes seq mandatory + signed; a hand-
+    edited file with a non-int seq fails parsing and the load returns
+    None → empty scope."""
     state_file = tmp_path / "state.json"
     p = tmp_path / "x"; p.mkdir()
     state_file.write_text(json.dumps({
@@ -95,12 +100,14 @@ def test_malformed_seq_in_state_file_resets_to_zero(tmp_path, caplog):
         "ceiling": str(tmp_path.resolve()),
         "active_paths": [str(p.resolve())],
         "seq": "not-an-int",
+        "hmac": "0" * 64,  # not actually verified — parse fails first
         "last_restrict_at": None,
     }))
     store = ScopeStateStore(
         scope_id="src", ceiling=tmp_path, state_file=state_file,
     )
     assert store.current().seq == 0
+    assert store.current().paths == []
     assert any("malformed seq" in r.message for r in caplog.records)
 
 
@@ -113,6 +120,7 @@ def test_negative_seq_in_state_file_resets_to_zero(tmp_path, caplog):
         "ceiling": str(tmp_path.resolve()),
         "active_paths": [str(p.resolve())],
         "seq": -5,
+        "hmac": "0" * 64,
         "last_restrict_at": None,
     }))
     store = ScopeStateStore(

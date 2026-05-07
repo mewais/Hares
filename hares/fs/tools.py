@@ -36,7 +36,12 @@ from ..path_safety import (
     PathSafetyError,
     resolve_under_ceiling,
 )
-from .state import ScopeSeqMismatch, ScopeStateStore
+from .state import (
+    ScopeSeqMismatch,
+    ScopeStateStore,
+    STATE_VERSION,
+    compute_state_hmac,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,13 +103,20 @@ def restrict_tool_descriptors(scope_id: Optional[str]) -> list[Tool]:
         Tool(
             name=_prefixed(GET_ACTIVE_PATHS_TOOL, scope_id),
             description=(
-                "Return the current active scope and its monotonic seq. "
-                "Useful for external auditors and for agents that want "
-                "to verify what scope they're operating under. The seq "
-                "(0.2.1) lets callers detect stale-reply replay: track "
-                "the latest seq you've issued via restrict_paths and "
-                "reject any get_active_paths reply whose seq is below "
-                "that threshold."
+                "Return the current active scope, its monotonic seq, "
+                "and an HMAC over the canonical (version, scope_id, "
+                "ceiling, seq, sorted_paths) payload. The seq (0.2.1) "
+                "lets callers detect stale-reply replay: track the "
+                "latest seq you've issued via restrict_paths and "
+                "enforce reply.seq == expected_next (NOT >=, which "
+                "an attacker can fast-forward past). The HMAC (0.2.2) "
+                "lets a caller with the same HARES_STATE_HMAC_SECRET "
+                "verify that the (paths, seq) tuple wasn't forged — "
+                "an attacker with state-file write but no secret "
+                "knowledge cannot produce a passing HMAC. External "
+                "auditors (e.g. Bunyan's seal_bundle cross-check) use "
+                "both signals together for end-to-end replay-and-forge "
+                "defense."
             ),
             inputSchema={
                 "type": "object",
@@ -208,16 +220,40 @@ def build_restrict_tool_handlers(
                     "on_change callback raised (%s); active scope is "
                     "set but downstream notification failed.", exc,
                 )
+        sorted_path_strs = sorted(str(p) for p in new_scope.paths)
+        sig = compute_state_hmac(
+            version=STATE_VERSION,
+            scope_id=scope_state.scope_id,
+            ceiling=str(scope_state.ceiling),
+            seq=new_scope.seq,
+            sorted_paths=sorted_path_strs,
+        )
         return {
-            "active_paths": [str(p) for p in new_scope.paths],
+            "active_paths": sorted_path_strs,
             "seq": new_scope.seq,
+            # 0.2.2: HMAC over the canonical (version, scope_id,
+            # ceiling, seq, sorted_paths) payload. External auditors
+            # (Bunyan) verify with the same env var to detect a
+            # tampered state file before trusting the reply.
+            "hmac": sig,
+            "version": STATE_VERSION,
         }
 
     async def _get_active(args: dict) -> dict:
         cur = scope_state.current()
+        sorted_path_strs = sorted(str(p) for p in cur.paths)
+        sig = compute_state_hmac(
+            version=STATE_VERSION,
+            scope_id=scope_state.scope_id,
+            ceiling=str(scope_state.ceiling),
+            seq=cur.seq,
+            sorted_paths=sorted_path_strs,
+        )
         return {
-            "active_paths": [str(p) for p in cur.paths],
+            "active_paths": sorted_path_strs,
             "seq": cur.seq,
+            "hmac": sig,
+            "version": STATE_VERSION,
         }
 
     return scope_state, {

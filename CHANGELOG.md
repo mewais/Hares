@@ -4,6 +4,66 @@ All notable changes to Hares are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.2.2] — 2026-05-06
+
+Closes the round-3 reviewer's HIGH finding against 0.2.1's seq design:
+the seq counter alone is insufficient because an attacker with state-
+file write access can fast-forward to ``seq=10⁸``, and any external
+auditor expecting ``seq=4`` accepts. 0.2.2 adds an HMAC over the
+canonical (version, scope_id, ceiling, seq, sorted_paths) payload so
+the attacker can't forge a passing (seq, paths) tuple without knowing
+the secret. Auditors (Bunyan) now enforce ``seq == expected_next`` AND
+verify the HMAC.
+
+### Added
+
+* **Per-process HMAC signing for the state file.** New
+  ``HARES_STATE_HMAC_SECRET`` env var (operator-pinned; expected to
+  be 32+ bytes of base64/hex). When unset, Hares generates a random
+  per-process secret with a one-time WARNING; this defends the
+  in-process case but breaks cross-process verification (the next
+  process has a fresh secret + can't verify the prior file → falls
+  back to empty scope on load). External auditors (Bunyan) read the
+  same env var to verify HMACs received over the MCP protocol.
+* **`get_active_paths` reply now includes `hmac` + `version`** so
+  an external auditor can verify the (paths, seq) tuple is
+  authentic. Use together with strict ``seq == expected_next``
+  enforcement for end-to-end replay-and-forge defense.
+* **`restrict_paths` reply now includes `hmac` + `version`** for
+  symmetric verifiability of the just-set scope.
+* **WAL recovery on load.** `_save` writes through `state.json.tmp`
+  (fsync) then renames to `state.json`. A crash between fsync and
+  rename used to roll the seq back below what the auditor last
+  observed (false-positive replay alert at the next get). The new
+  load preferentially commits the `.tmp` file when its seq is
+  higher AND its HMAC verifies.
+* **`hares.fs.state.canonical_hmac_payload` + `compute_state_hmac`
+  exposed** so external verifiers can compute the same canonical
+  bytes Hares signs over.
+
+### Changed
+
+* **State file format bumped to version 3** — adds mandatory
+  ``hmac`` field and makes ``seq`` mandatory (previously
+  ``data.get("seq", 0)`` defaulted to 0 when missing, silently
+  degrading replay-defense; round-3 [security-engineer D.3]).
+  Files written by 0.2.0 / 0.2.1 trigger the existing version-
+  mismatch warn-and-rebuild on first start.
+* **`active_paths` is now sorted** before HMAC + persistence so
+  the canonical bytes don't depend on insertion order. Already-
+  sorted output is also nicer for human inspection of the state
+  file.
+
+### Security
+
+* **Round-3 [HIGH security-adversarial]: seq fast-forward defense.**
+  Pre-fix the verifier contract was "reject when seq is BELOW
+  expected" — an attacker writing seq=10⁸ fast-forwarded past any
+  expected value. With HMAC signing the attacker can't write any
+  (seq, paths) without the secret, and the documented consumer
+  contract is now ``seq == expected_next`` (strict next-step), not
+  ``seq >= expected``. Bunyan's verifier helper enforces this.
+
 ## [0.2.1] — 2026-05-06
 
 ### Added
