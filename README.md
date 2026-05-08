@@ -23,22 +23,28 @@ Hares puts a kernel-enforced guard on every tool call:
 
 One binary. Three tool families. Uniform scope semantics across all of them.
 
+Hares is also a **Python library** — non-LLM code (test runners, CI, framework
+code) can import the same engine and get the same kernel-enforced caps without
+an MCP wrapper. Both surfaces honor `HARES_COORDINATION_DIR`, so library
+callers and MCP servers share one global concurrency cap.
+
 ---
 
 ## Table of contents
 
 1. [Overview](#overview)
 2. [Quick start](#quick-start)
-3. [CLI reference](#cli-reference)
-4. [Tool surface](#tool-surface)
-5. [Env var reference](#env-var-reference)
-6. [System-dir policy](#system-dir-policy)
-7. [Cross-process coordination](#cross-process-coordination)
-8. [Active scope and `restrict_paths`](#active-scope-and-restrict_paths)
-9. [bwrap mechanics](#bwrap-mechanics)
-10. [Multi-instance use under flat-namespace registries](#multi-instance-use-under-flat-namespace-registries)
-11. [Threat model](#threat-model)
-12. [Quirks and edge cases](#quirks-and-edge-cases)
+3. [Python library usage](#python-library-usage)
+4. [CLI reference](#cli-reference)
+5. [Tool surface](#tool-surface)
+6. [Env var reference](#env-var-reference)
+7. [System-dir policy](#system-dir-policy)
+8. [Cross-process coordination](#cross-process-coordination)
+9. [Active scope and `restrict_paths`](#active-scope-and-restrict_paths)
+10. [bwrap mechanics](#bwrap-mechanics)
+11. [Multi-instance use under flat-namespace registries](#multi-instance-use-under-flat-namespace-registries)
+12. [Threat model](#threat-model)
+13. [Quirks and edge cases](#quirks-and-edge-cases)
 
 ---
 
@@ -111,6 +117,89 @@ HARES_LSF_QUEUE=gpu hares-mcp --enable=lsf --scope-id=cluster
 > `HARES_SANDBOX_DISABLED=1` to skip bwrap. Shell `--read-only` and
 > kernel scope enforcement won't apply, but resource caps and concurrency
 > throttling still work.
+
+---
+
+## Python library usage
+
+Hares ships as both an `hares-mcp` binary and an importable Python package.
+Static code (test runners, CI scripts, framework code, anything that wants
+sandboxed subprocess without going through MCP) can use the same engine
+directly.
+
+### Local subprocess (`Runner`)
+
+```python
+import asyncio, os
+from hares.runner import Runner
+from hares.sandbox import load_sandbox_config
+
+# One Runner per process — owns the semaphore + core pool.
+_runner = Runner(
+    max_concurrent=2,
+    mem_limit_mb=7000,
+    cpu_limit_sec=1800,
+    sandbox=load_sandbox_config(default_cwd=os.getcwd()),
+)
+
+# Async caller:
+result = await _runner.execute("pytest -q tests/", timeout=300)
+
+# Sync caller (gets the same caps; one extra call):
+result = asyncio.run(_runner.execute("pytest -q tests/", timeout=300))
+
+# result == {
+#   "exit_code":      int,
+#   "stdout":         str,
+#   "stderr":         str,
+#   "killed_reason":  None | "timeout" | "rss_exceeded" | "cpu_exceeded",
+#   "rewrites":       [...],   # any pre-flight overcommit edits applied
+# }
+```
+
+`load_sandbox_config()` reads the same `HARES_SANDBOX_*` env vars as the
+MCP server, so behavior is consistent across both surfaces. Pass
+`sandbox=None` to skip bwrap while keeping RLIMITs and concurrency caps.
+
+### LSF cluster jobs (`LsfExecutor`)
+
+```python
+from hares.lsf import LsfExecutor, JobSpec, load_lsf_config
+
+_executor = LsfExecutor(cfg=load_lsf_config())
+
+# Submit one job and wait:
+result = await _executor.execute_blocking(
+    JobSpec(command="verilator --build sim.v",
+            resource_spec="rusage[mem=8192]"),
+    timeout_sec=3600,
+)
+
+# Submit several jobs to run in parallel on the cluster:
+jobs = await _executor.submit([
+    JobSpec(command="sim_config_1", resource_spec="rusage[mem=4096]"),
+    JobSpec(command="sim_config_2", resource_spec="rusage[mem=4096]"),
+])
+results = await _executor.wait([j["job_id"] for j in jobs], timeout_sec=7200)
+```
+
+### Coordination across MCP and library callers
+
+When `HARES_COORDINATION_DIR` is set, both library `Runner` instances and
+`hares-mcp` server processes share one POSIX semaphore + one core-pool
+allocator. A workflow that mixes LLM agents (calling MCP tools) with static
+framework code (calling `Runner` directly) gets one global concurrency cap
+across all of them — no agent or library caller can blow past
+`HARES_MAX_CONCURRENT` while another is running.
+
+Use cases:
+
+- Test runners and CI systems that want resource caps on subprocess
+- Framework / orchestration code that needs the same kernel-enforced
+  caps as the LLM-driven side of the system
+- Any sync code that occasionally needs a sandboxed subprocess
+- Hybrid deploys where LLM agents and static Python coexist and must
+  share a single host budget
 
 ---
 
