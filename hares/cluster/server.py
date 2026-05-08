@@ -30,6 +30,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+from ..audit import Auditor, audited, load_auditor
 from .base import ClusterExecutor, JobSpec
 from .lsf import LsfExecutor, load_lsf_config
 from .slurm import SlurmExecutor, load_slurm_config
@@ -92,6 +93,7 @@ def build_server(
     *,
     scheduler: str,
     scope_id: Optional[str] = None,
+    auditor: Optional[Auditor] = None,
 ) -> Server:
     """Build an MCP Server exposing the five cluster tools for one backend."""
     server: Server = Server(f"hares-{scheduler}")
@@ -263,6 +265,7 @@ def build_server(
         ]
 
     @server.call_tool()
+    @audited(auditor, scope_id=scope_id)
     async def _call_tool(name: str, arguments: dict) -> list[TextContent]:
         if name not in ALL_TOOLS:
             raise ValueError(f"Unknown tool: {name!r}")
@@ -336,7 +339,10 @@ async def _serve_lsf_async(
         cfg.output_dir,
     )
     executor = LsfExecutor(cfg=cfg, ceiling=ceiling)
-    server = build_server(executor, scheduler="lsf", scope_id=scope_id)
+    auditor = load_auditor()
+    if auditor is not None:
+        logger.info("Audit log enabled: dest=%r", auditor.dest)
+    server = build_server(executor, scheduler="lsf", scope_id=scope_id, auditor=auditor)
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())
 
@@ -360,7 +366,10 @@ async def _serve_slurm_async(
         cfg.output_dir,
     )
     executor = SlurmExecutor(cfg=cfg, ceiling=ceiling)
-    server = build_server(executor, scheduler="slurm", scope_id=scope_id)
+    auditor = load_auditor()
+    if auditor is not None:
+        logger.info("Audit log enabled: dest=%r", auditor.dest)
+    server = build_server(executor, scheduler="slurm", scope_id=scope_id, auditor=auditor)
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())
 

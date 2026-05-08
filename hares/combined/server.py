@@ -31,6 +31,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+from ..audit import Auditor, audited, load_auditor
 from ..config import load_config
 from ..coordination import CrossProcessCoordinator, install_atexit_cleanup
 from ..fs.operations import READ_OPS, WRITE_OPS
@@ -55,6 +56,7 @@ def _build_server(
     read_only: bool,
     state_file: Optional[Path],
     runner: Runner,
+    auditor: Optional[Auditor] = None,
 ) -> Server:
     server: Server = Server("hares-combined")
 
@@ -144,6 +146,7 @@ def _build_server(
         return tool_descriptors
 
     @server.call_tool()
+    @audited(auditor, scope_id=scope_id)
     async def _call_tool(name: str, arguments: dict) -> list[TextContent]:
         entry = handlers.get(name)
         if entry is None:
@@ -199,12 +202,16 @@ async def _serve_async(
         cfg.coordination_dir,
         "bwrap" if cfg.sandbox.enabled else "off",
     )
+    auditor = load_auditor()
+    if auditor is not None:
+        logger.info("Audit log enabled: dest=%r", auditor.dest)
     server = _build_server(
         scope_id=scope_id,
         ceiling=ceiling,
         read_only=read_only,
         state_file=state_file,
         runner=runner,
+        auditor=auditor,
     )
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())

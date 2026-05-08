@@ -23,6 +23,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+from ..audit import Auditor, audited, load_auditor
 from .operations import READ_OPS, WRITE_OPS
 from .state import ScopeStateStore
 
@@ -39,6 +40,7 @@ def _build_server(
     ceiling: Path,
     read_only: bool,
     state_file: Optional[Path],
+    auditor: Optional[Auditor] = None,
 ) -> Server:
     """Build the MCP server. The ``ScopeStateStore`` instance owns the
     active scope; restrict-tool calls mutate it; fs-op handlers read
@@ -90,6 +92,7 @@ def _build_server(
         return tool_descriptors
 
     @server.call_tool()
+    @audited(auditor, scope_id=scope_id)
     async def _call_tool(name: str, arguments: dict) -> list[TextContent]:
         handler = handlers.get(name)
         if handler is None:
@@ -136,11 +139,15 @@ async def _serve_async(
         "Hares fs starting: scope_id=%r ceiling=%s read_only=%s state_file=%s",
         scope_id, ceiling, read_only, state_file,
     )
+    auditor = load_auditor()
+    if auditor is not None:
+        logger.info("Audit log enabled: dest=%r", auditor.dest)
     server = _build_server(
         scope_id=scope_id,
         ceiling=ceiling,
         read_only=read_only,
         state_file=state_file,
+        auditor=auditor,
     )
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())
