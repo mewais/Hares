@@ -33,9 +33,9 @@ Hares fixes all three at the layer where it actually matters: the kernel.
 | **`RLIMIT_AS` + `RLIMIT_CPU` + wall-clock timeout** | Every subprocess is memory-, CPU-, and time-capped at the kernel level. A runaway agent burns its allotment and dies; the host stays alive. |
 | **Global concurrency semaphore** | N parallel Hares processes share **one** subprocess cap and **one** core-pool allocator. Five agents with a budget of six subprocesses run six total — not thirty. |
 | **Runtime scope narrowing** | An orchestrator calls `restrict_paths(['lib/parser'])` mid-session to shrink an agent's writable surface to a single subdirectory. Both the fs validator and the bwrap mount list re-arm together. |
-| **LSF cluster bridge** | Submit, poll, cancel HPC jobs from MCP. No one gets a shell on the cluster; jobs are tracked per-session and reaped on disconnect. |
+| **LSF + SLURM cluster bridge** | Submit, poll, cancel HPC jobs from MCP — backed by `bsub`/`bjobs`/`bkill` or `sbatch`/`squeue`/`scancel`. No one gets a shell on the cluster; jobs are tracked per-session and reaped on disconnect. |
 
-**One binary**, **three tool families** (`shell`, `fs`, `lsf`), **uniform scope semantics** across all of them.
+**One binary**, **four tool families** (`shell`, `fs`, `lsf`, `slurm`), **uniform scope semantics** across all of them.
 
 Hares is also an **importable Python library** — your test runners, CI scripts, and framework code get the same kernel-enforced caps without going through MCP. Library callers and MCP servers share a single concurrency budget via `HARES_COORDINATION_DIR`, so a hybrid deploy of agents and static code can't blow past the host budget either.
 
@@ -68,7 +68,7 @@ the role for all three tool families:
 
 ```
 hares-mcp \
-  --enable {shell, fs, fs+shell, lsf}  # which tool family to expose
+  --enable {shell, fs, fs+shell, lsf, slurm}  # which tool family to expose
   [--scope-id <id>]                    # tool-name prefix; scope identifier
   --ceiling <path>                     # outer bound; required for shell/fs (CLI or env)
   [--read-only]                        # observe-only mode
@@ -81,9 +81,9 @@ A Hares instance can therefore be:
 * a **filesystem guard** with a per-scope writable view,
 * both at once with **one shared scope** (`fs+shell`), so a single
   `restrict_paths(['lib/parser'])` call narrows both layers together,
-* a **cluster job interface** (`lsf`) for submitting jobs to an HPC
-  scheduler, polling status, and collecting output — without touching
-  the local machine's resource budget.
+* a **cluster job interface** (`lsf` or `slurm`) for submitting jobs
+  to an HPC scheduler, polling status, and collecting output — without
+  touching the local machine's resource budget.
 
 The same surface — flags, restrict tools, ceiling semantics — is the
 right one whether you're deploying Hares standalone, plugging it into
@@ -122,6 +122,9 @@ hares-mcp --enable=fs --scope-id=unit_tests  --ceiling=/work/proj &
 
 # LSF cluster execution — submit jobs, poll, cancel (no ceiling required):
 HARES_LSF_QUEUE=gpu hares-mcp --enable=lsf --scope-id=cluster
+
+# SLURM cluster execution — same surface, different scheduler:
+HARES_SLURM_PARTITION=gpu hares-mcp --enable=slurm --scope-id=cluster
 ```
 
 > **Non-Linux / container without user namespaces?** Set
@@ -172,12 +175,20 @@ result = asyncio.run(_runner.execute("pytest -q tests/", timeout=300))
 MCP server, so behavior is consistent across both surfaces. Pass
 `sandbox=None` to skip bwrap while keeping RLIMITs and concurrency caps.
 
-### LSF cluster jobs (`LsfExecutor`)
+### LSF / SLURM cluster jobs (`LsfExecutor` / `SlurmExecutor`)
+
+Both backends share one async core (`hares.cluster.ClusterExecutor`)
+and expose an identical Python API. Pick the import that matches
+your cluster:
 
 ```python
-from hares.lsf import LsfExecutor, JobSpec, load_lsf_config
+from hares.cluster.lsf   import LsfExecutor,   load_lsf_config
+from hares.cluster.slurm import SlurmExecutor, load_slurm_config
+from hares.cluster       import JobSpec
 
 _executor = LsfExecutor(cfg=load_lsf_config())
+# or:
+_executor = SlurmExecutor(cfg=load_slurm_config())
 
 # Submit one job and wait:
 result = await _executor.execute_blocking(
@@ -218,10 +229,10 @@ Use cases:
 
 | Flag | Required | Default | Validation |
 |---|---|---|---|
-| `--enable {shell,fs,fs+shell,lsf}` | no | `shell` | choices |
+| `--enable {shell,fs,fs+shell,lsf,slurm}` | no | `shell` | choices |
 | `--scope-id <id>` | no | unset (no prefix) | `^[a-z][a-z0-9_]*$` |
-| `--ceiling <path>` | **yes for shell/fs** (CLI or env); optional for lsf | `$HARES_FS_CEILING` | abs-resolved; rejected if under `.git/`; rejected if under any blocklist entry when `HARES_DISALLOW_SYSTEM_DIRS=1` |
-| `--read-only` | no | off | flag (shell/fs only; no effect for lsf) |
+| `--ceiling <path>` | **yes for shell/fs** (CLI or env); optional for lsf/slurm | `$HARES_FS_CEILING` | abs-resolved; rejected if under `.git/`; rejected if under any blocklist entry when `HARES_DISALLOW_SYSTEM_DIRS=1` |
+| `--read-only` | no | off | flag (shell/fs only; no effect for lsf/slurm) |
 | `--state-file <path>` | no | unset (in-memory only) | abs-resolved; warning if path is under ceiling (shell/fs only) |
 
 All flags fail fast at startup with a clear human-readable error. Bare
@@ -272,34 +283,55 @@ Union of the fs and shell surfaces, sharing **one** active scope. A
 single `<scope>_restrict_paths` call narrows BOTH the fs path
 validator AND the shell bwrap mount list.
 
-### `--enable=lsf`
+### `--enable=lsf` and `--enable=slurm`
 
-Five tools for HPC cluster job management via IBM Platform LSF:
+Five tools per scheduler for HPC cluster job management. Tool names
+follow the pattern `[<scope>_]<scheduler>_<verb>` so an org with both
+schedulers can run two Hares instances side by side without name
+collisions.
 
-* `[<scope>_]lsf_execute_blocking` — submit one job, wait for it, return stdout/stderr/exit_code
-* `[<scope>_]lsf_submit` — submit a list of jobs (non-blocking), return job_ids
-* `[<scope>_]lsf_wait` — wait for a list of job_ids; returns when all reach DONE/EXIT or timeout
-* `[<scope>_]lsf_cancel` — bkill a list of job_ids
-* `[<scope>_]lsf_jobs` — list all jobs submitted in this session with current status
+| Verb | Returns |
+|---|---|
+| `[<scope>_]<scheduler>_execute_blocking` | Submit one job, wait for it, return stdout/stderr/exit_code |
+| `[<scope>_]<scheduler>_submit` | Submit a list of jobs (non-blocking), return job_ids |
+| `[<scope>_]<scheduler>_wait` | Wait for job_ids; returns when all reach DONE/EXIT or timeout |
+| `[<scope>_]<scheduler>_cancel` | Cancel a list of job_ids |
+| `[<scope>_]<scheduler>_jobs` | List all jobs submitted in this session with current status |
 
-Jobs are submitted via `bsub`. stdout/stderr are captured by an inner shell redirect
-(bypassing LSF's output file headers). Exit codes are written to a separate file and
-read when the job completes.
+Both backends share one async core (poll loop, output capture, timeout,
+session-job map, cancel bookkeeping). Differences are confined to
+argv builders and status parsers:
 
-> **Security note for LSF mode.** See [LSF mode — what does NOT apply](#lsf-mode--what-does-not-apply).
-> bwrap, RLIMIT, and active-scope enforcement do NOT extend to cluster nodes.
+| | LSF | SLURM |
+|---|---|---|
+| Submit binary | `bsub` | `sbatch --parsable` |
+| Status query | `bjobs -noheader <id>` | `squeue -h -j <id> -o '%T'`, fall back to exitcode file when empty |
+| Cancel binary | `bkill` | `scancel` |
+| `resource_spec` | Contents of `-R` (e.g. `rusage[mem=8192]`) | Free-form sbatch flags, shlex-split (e.g. `--mem=8192 --cpus-per-task=4 --time=01:00:00`) |
+| Federation | n/a | `--parsable` returns `JOBID;CLUSTER`; the suffix is stripped |
+
+In both cases stdout/stderr are captured by an inner shell redirect
+(bypassing the scheduler's own output-file headers). Exit codes are
+written to a separate file and read when the job completes — this
+works on SLURM clusters that don't have `slurmdbd` accounting
+enabled.
+
+> **Security note for cluster modes.** See
+> [Cluster modes — what does NOT apply](#cluster-modes--what-does-not-apply).
+> bwrap, RLIMIT, and active-scope enforcement do NOT extend to cluster
+> nodes for either backend.
 
 ### Symmetry table
 
-| Flag | `fs` | `shell` | `lsf` |
+| Flag | `fs` | `shell` | `lsf` / `slurm` |
 |---|---|---|---|
 | `--ceiling` | Outer bound for tool-call paths | Outer bound for bwrap mount namespace | Optional; used for pre-submission cwd check only |
 | `--scope-id` | Tool-name prefix | Tool-name prefix | Tool-name prefix |
 | `--read-only` | Write tools NOT registered | bwrap mounts active scope RO | No effect |
 | `--state-file` | Persists active scope | Persists active scope | Not applicable |
 | bwrap sandbox | No | **Yes** — kernel-enforced | No — cluster node runs unrestricted |
-| RLIMIT_AS/CPU | No | **Yes** — kernel-enforced | No — use LSF `resource_spec` |
-| Concurrency cap | No | **Yes** — semaphore + core pool | No — LSF manages cluster scheduling |
+| RLIMIT_AS/CPU | No | **Yes** — kernel-enforced | No — use scheduler `resource_spec` |
+| Concurrency cap | No | **Yes** — semaphore + core pool | No — scheduler manages cluster scheduling |
 
 The mechanism differs; the scope semantics are uniform where applicable.
 
@@ -363,6 +395,20 @@ honored as an opt-out for older deploys.
 | `HARES_LSF_BSUB_BIN` | `bsub` | Path to the `bsub` binary. Override if LSF is not on `PATH`. |
 | `HARES_LSF_BJOBS_BIN` | `bjobs` | Path to the `bjobs` binary. |
 | `HARES_LSF_BKILL_BIN` | `bkill` | Path to the `bkill` binary. |
+
+### Operator-deploy: SLURM cluster jobs (`--enable=slurm`)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `HARES_SLURM_PARTITION` | unset | SLURM partition passed to `sbatch --partition`. When unset, SLURM uses the cluster's default partition. |
+| `HARES_SLURM_ACCOUNT` | unset | Account passed to `sbatch --account`. Required by some clusters for accounting/billing. |
+| `HARES_SLURM_DEFAULT_RESOURCE_SPEC` | unset | Default `sbatch` flags applied to every job unless the caller overrides per-job. Free-form, shlex-split (e.g. `--mem=8192 --cpus-per-task=4 --time=01:00:00 --gres=gpu:1`). |
+| `HARES_SLURM_POLL_INTERVAL_SEC` | `10` | How often `slurm_wait` polls `squeue` for job status. |
+| `HARES_SLURM_DEFAULT_TIMEOUT_SEC` | `86400` | Default timeout for `slurm_wait` and `slurm_execute_blocking` when the caller doesn't pass one. |
+| `HARES_SLURM_OUTPUT_DIR` | per-session tempdir | Directory where stdout/stderr/exitcode files are written. Must be on a shared filesystem visible to both the submitting node and cluster nodes. |
+| `HARES_SLURM_SBATCH_BIN` | `sbatch` | Path to the `sbatch` binary. Override if SLURM is not on `PATH`. |
+| `HARES_SLURM_SQUEUE_BIN` | `squeue` | Path to the `squeue` binary. |
+| `HARES_SLURM_SCANCEL_BIN` | `scancel` | Path to the `scancel` binary. |
 
 ---
 
@@ -652,26 +698,28 @@ agent with both fs and shell access cannot use the shell to bypass
 the fs scope, because the bwrap mount list is derived from the same
 active scope.
 
-### LSF mode — what does NOT apply
+### Cluster modes — what does NOT apply
 
-`--enable=lsf` has a fundamentally different security model from shell/fs modes.
-The cluster node runs the job with the submitting user's full filesystem permissions;
-Hares has no handle on it.
+`--enable=lsf` and `--enable=slurm` have a fundamentally different security
+model from shell/fs modes. The cluster node runs the job with the submitting
+user's full filesystem permissions; Hares has no handle on it.
 
-| Guarantee | shell/fs | lsf |
+| Guarantee | shell/fs | lsf / slurm |
 |---|---|---|
 | bwrap mount namespace (scope enforcement) | **Yes — kernel** | **No** |
-| RLIMIT_AS / RLIMIT_CPU | **Yes — kernel** | **No** — use `resource_spec` (`-R rusage[mem=N]`, `-W hh:mm`) |
+| RLIMIT_AS / RLIMIT_CPU | **Yes — kernel** | **No** — use scheduler `resource_spec` (LSF `-R rusage[mem=N]`, SLURM `--mem=N --time=hh:mm`) |
 | Active-scope write enforcement at runtime | **Yes** | **No** |
 | `--ceiling` / `--read-only` | **Yes** | Pre-submission cwd check only (best-effort) |
-| Concurrency semaphore | **Yes** | No — LSF manages cluster scheduling |
+| Concurrency semaphore | **Yes** | No — scheduler manages cluster scheduling |
 
-The only path-safety measure for LSF is a pre-submission ceiling check on the job's
-working directory (`cwd`). This catches configuration mistakes (pointing a job at the
-wrong directory), not a determined agent that computes paths at runtime.
+The only path-safety measure for cluster modes is a pre-submission
+ceiling check on the job's working directory (`cwd`). This catches
+configuration mistakes (pointing a job at the wrong directory), not a
+determined agent that computes paths at runtime.
 
-Resource governance for LSF jobs belongs in the `resource_spec` field (or
-`HARES_LSF_DEFAULT_RESOURCE_SPEC`), not in Hares.
+Resource governance for cluster jobs belongs in the `resource_spec`
+field (or `HARES_LSF_DEFAULT_RESOURCE_SPEC` /
+`HARES_SLURM_DEFAULT_RESOURCE_SPEC`), not in Hares.
 
 ### Out of scope (all modes)
 
@@ -739,7 +787,7 @@ Resource governance for LSF jobs belongs in the `resource_spec` field (or
 
 Hares is **0.3.x — beta**. The MCP and Python-library APIs are stable enough to build on, but minor versions may still tweak env-var names and tool signatures. Pin the minor version in production.
 
-The bwrap, RLIMIT, and concurrency layers are tested on Linux (RHEL 8+, Ubuntu 20.04+, Fedora). LSF mode requires IBM Platform LSF (`bsub` / `bjobs` / `bkill` on `PATH`) and a shared filesystem visible to both submit and execute hosts.
+The bwrap, RLIMIT, and concurrency layers are tested on Linux (RHEL 8+, Ubuntu 20.04+, Fedora). Cluster modes require either IBM Platform LSF (`bsub` / `bjobs` / `bkill`) or SLURM (`sbatch` / `squeue` / `scancel`) on `PATH`, and a shared filesystem visible to both submit and execute hosts.
 
 ## Contributing
 

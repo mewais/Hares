@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hares"
-version = "0.3.0"
+version = "0.4.0"
 description = "Hares (حارس) — the guard MCP server: kernel-capped, bwrap-sandboxed filesystem, shell, and cluster tools for LLM agents."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 authors = [{ name = "Mohammad Ewais", email = "mohammad.a.ewais@gmail.com" }]
-keywords = ["mcp", "llm", "agents", "sandbox", "security", "guard", "bwrap", "lsf", "hpc"]
+keywords = ["mcp", "llm", "agents", "sandbox", "security", "guard", "bwrap", "lsf", "slurm", "hpc"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",

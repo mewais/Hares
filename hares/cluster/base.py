@@ -1,32 +1,28 @@
-"""LSF job executor.
+"""Shared base for cluster-job executors (LSF, SLURM, future backends).
 
-Design decisions:
-  - bsub wraps the command in a shell script that redirects stdout
-    and stderr to Hares-managed files. This avoids LSF's own output
-    file headers (whose format varies by site config and version)
-    and gives us a clean exit-code file.
-  - _run() is a thin asyncio.create_subprocess_exec wrapper. Tests
-    monkeypatch it to simulate bsub/bjobs/bkill without touching the
-    real scheduler.
-  - All mutable job state is guarded by a single asyncio.Lock so
-    multiple concurrent lsf_wait polls don't race.
-  - lsf_execute_blocking is a thin wrapper: submit([spec]) + wait([id]).
-    No duplicate logic.
-  - wait() returns TIMEOUT for jobs that don't finish in time; the
-    jobs continue running. Caller must lsf_cancel to stop them.
+Design:
+  - ClusterExecutor is an abstract base. It owns the parts that don't
+    care which scheduler is on the other end: the async poll loop,
+    timeout enforcement, output capture via inner shell redirect,
+    session-job map, cancel bookkeeping.
+  - Backends override five small methods: argv builders for submit /
+    status / cancel, plus parsers for submit-output and status-output.
+  - All backend status strings are normalized to a canonical set:
+    PEND, RUN, DONE, EXIT, UNKWN. The wait loop only needs to know
+    DONE and EXIT are terminal; backends do the translation.
 
-Security note (documented in module docstring and tool descriptions):
-  - Ceiling check on cwd is pre-submission only. The cluster node
-    has no Hares process; path enforcement after bsub is impossible.
-  - No RLIMIT, no bwrap, no active-scope enforcement for LSF tools.
+Security model is identical across all backends and identical to the
+pre-refactor LSF docstring: cluster nodes run jobs with the submitting
+user's full filesystem permissions. bwrap, RLIMIT, and active-scope
+enforcement do not extend to them. The only guard applied here is a
+pre-submission ceiling check on the job's working directory.
 """
 
 from __future__ import annotations
 
+import abc
 import asyncio
 import logging
-import os
-import re
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -36,68 +32,26 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-# LSF terminal statuses — wait loop exits on these.
-_TERMINAL = frozenset({"DONE", "EXIT"})
+# Canonical statuses every backend must map onto. Wait loop exits on
+# anything in TERMINAL.
+PEND = "PEND"
+RUN = "RUN"
+DONE = "DONE"
+EXIT = "EXIT"
+UNKWN = "UNKWN"
 
-# bsub output: "Job <12345678> is submitted to queue <gpu>."
-_BSUB_ID_RE = re.compile(r"Job\s+<(\d+)>")
+TERMINAL = frozenset({DONE, EXIT})
 
-
-# ── Config ──────────────────────────────────────────────────────────────────
-
-@dataclass(frozen=True)
-class LsfConfig:
-    """All knobs for LSF submission. Built from HARES_LSF_* env vars."""
-    queue: Optional[str]               # HARES_LSF_QUEUE
-    default_resource_spec: Optional[str]  # HARES_LSF_DEFAULT_RESOURCE_SPEC
-    poll_interval_sec: float           # HARES_LSF_POLL_INTERVAL_SEC
-    default_timeout_sec: float         # HARES_LSF_DEFAULT_TIMEOUT_SEC
-    output_dir: Path                   # HARES_LSF_OUTPUT_DIR (or tempdir)
-    bsub_bin: str                      # HARES_LSF_BSUB_BIN
-    bjobs_bin: str                     # HARES_LSF_BJOBS_BIN
-    bkill_bin: str                     # HARES_LSF_BKILL_BIN
-
-
-def load_lsf_config(session_tmp: Optional[Path] = None) -> LsfConfig:
-    """Build LsfConfig from HARES_LSF_* environment variables.
-
-    Args:
-      session_tmp: Fallback output dir when HARES_LSF_OUTPUT_DIR is
-        unset. Caller should pass a per-session tempdir so output
-        files have a predictable lifetime.
-    """
-    queue = os.environ.get("HARES_LSF_QUEUE", "").strip() or None
-    default_resource_spec = (
-        os.environ.get("HARES_LSF_DEFAULT_RESOURCE_SPEC", "").strip() or None
-    )
-    poll_interval = float(os.environ.get("HARES_LSF_POLL_INTERVAL_SEC", "10"))
-    default_timeout = float(
-        os.environ.get("HARES_LSF_DEFAULT_TIMEOUT_SEC", "86400")
-    )
-    out_raw = os.environ.get("HARES_LSF_OUTPUT_DIR", "").strip()
-    if out_raw:
-        output_dir = Path(os.path.expandvars(os.path.expanduser(out_raw))).resolve()
-    else:
-        output_dir = session_tmp or Path(
-            tempfile.mkdtemp(prefix="hares-lsf-")
-        )
-    return LsfConfig(
-        queue=queue,
-        default_resource_spec=default_resource_spec,
-        poll_interval_sec=max(1.0, poll_interval),
-        default_timeout_sec=max(1.0, default_timeout),
-        output_dir=output_dir,
-        bsub_bin=os.environ.get("HARES_LSF_BSUB_BIN", "bsub"),
-        bjobs_bin=os.environ.get("HARES_LSF_BJOBS_BIN", "bjobs"),
-        bkill_bin=os.environ.get("HARES_LSF_BKILL_BIN", "bkill"),
-    )
-
-
-# ── Job data ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class JobSpec:
-    """Caller-supplied description of one LSF job."""
+    """Caller-supplied description of one cluster job.
+
+    Fields are deliberately scheduler-agnostic. ``resource_spec`` is
+    free-form text passed verbatim to the backend's submit command:
+      - LSF: contents of ``-R`` (e.g. ``rusage[mem=8192]``).
+      - SLURM: extra ``sbatch`` flags (e.g. ``--mem=8192 --time=01:00:00``).
+    """
     command: str
     resource_spec: Optional[str] = None
     name: Optional[str] = None
@@ -106,7 +60,7 @@ class JobSpec:
 
 
 class JobRecord:
-    """Mutable per-job state tracked by LsfExecutor."""
+    """Mutable per-job state tracked by an executor."""
 
     __slots__ = (
         "job_id", "name", "command", "submitted_at",
@@ -131,7 +85,7 @@ class JobRecord:
         self.stdout_file = stdout_file
         self.stderr_file = stderr_file
         self.exitcode_file = exitcode_file
-        self.status = "PEND"
+        self.status = PEND
         self.result: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -147,24 +101,36 @@ class JobRecord:
         return d
 
 
-# ── Executor ─────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class ClusterConfigBase:
+    """Common knobs every backend's config inherits from.
 
-class LsfExecutor:
-    """Session-scoped LSF job manager.
+    Backend-specific dataclasses (LsfConfig, SlurmConfig) extend this
+    with binary paths and scheduler-specific defaults.
+    """
+    poll_interval_sec: float
+    default_timeout_sec: float
+    output_dir: Path
+
+
+class ClusterExecutor(abc.ABC):
+    """Session-scoped cluster job manager — abstract base.
 
     One instance per hares-mcp process. Tracks all jobs submitted in
-    this session (in-memory only — not persisted). Thread/task safe
-    via an asyncio.Lock on the jobs dict.
+    this session in-memory only (not persisted across restarts).
+    Thread/task safe via an asyncio.Lock on the jobs dict.
 
-    Security: no bwrap, no RLIMIT, no active-scope enforcement. The
-    cluster node runs the job with the submitting user's permissions.
-    The only guard applied here is a pre-submission ceiling check on
-    the job's working directory (best-effort, not kernel-enforced).
+    Backends supply argv builders + status parsers; the base owns
+    submit/wait/cancel/jobs and the polling loop.
     """
+
+    # Human-readable scheduler name used in error messages and logs.
+    # Backends override.
+    SCHEDULER_NAME = "cluster"
 
     def __init__(
         self,
-        cfg: LsfConfig,
+        cfg: ClusterConfigBase,
         ceiling: Optional[Path] = None,
     ) -> None:
         self._cfg = cfg
@@ -173,16 +139,51 @@ class LsfExecutor:
         self._jobs: dict[str, JobRecord] = {}
         cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Internal helpers ────────────────────────────────────────────────────
+    # ── Hooks backends MUST implement ───────────────────────────────────────
 
-    async def _run(
+    @abc.abstractmethod
+    def _build_submit_argv(
         self,
-        argv: list[str],
-    ) -> tuple[int, str, str]:
-        """Run an LSF CLI command, return (returncode, stdout, stderr).
+        spec: JobSpec,
+        stdout_file: Path,
+        stderr_file: Path,
+        exitcode_file: Path,
+        job_name: str,
+    ) -> list[str]:
+        """argv for one submit invocation. The inner shell script
+        captures stdout/stderr/exitcode; backends should not pass the
+        scheduler's own ``-o``/``-e`` flags."""
+
+    @abc.abstractmethod
+    def _parse_submit_output(self, stdout: str) -> Optional[str]:
+        """Extract the job_id from submit-command stdout. Return None
+        on parse failure — caller surfaces a structured error."""
+
+    @abc.abstractmethod
+    def _build_status_argv(self, job_id: str) -> list[str]:
+        """argv for querying one job's current status."""
+
+    @abc.abstractmethod
+    def _parse_status(
+        self,
+        job_id: str,
+        rc: int,
+        stdout: str,
+        stderr: str,
+    ) -> str:
+        """Parse status-query output and return one of PEND/RUN/DONE/EXIT/UNKWN."""
+
+    @abc.abstractmethod
+    def _build_cancel_argv(self, job_id: str) -> list[str]:
+        """argv for cancelling one job."""
+
+    # ── Internal helpers (shared) ───────────────────────────────────────────
+
+    async def _run(self, argv: list[str]) -> tuple[int, str, str]:
+        """Run a scheduler CLI command, return (returncode, stdout, stderr).
 
         Separated for testability — tests monkeypatch this method to
-        simulate bsub/bjobs/bkill responses without a real scheduler.
+        simulate the scheduler without bsub/squeue/etc on PATH.
 
         Returns (1, "", error_message) instead of raising when the
         binary is not found or exec fails — callers treat non-zero
@@ -217,10 +218,10 @@ class LsfExecutor:
     def _validate_cwd(self, cwd: Optional[str]) -> None:
         """Best-effort ceiling check on the job's working directory.
 
-        This is a pre-submission sanity guard — NOT a security
-        guarantee. The cluster node runs the job unrestricted;
-        a command that computes paths at runtime can still access
-        any path the user has cluster-level permission to.
+        Pre-submission sanity guard — NOT a security guarantee. The
+        cluster node runs the job unrestricted; a command that
+        computes paths at runtime can still access any path the user
+        has cluster-level permission to.
         """
         if cwd is None or self._ceiling is None:
             return
@@ -234,87 +235,9 @@ class LsfExecutor:
                 "kernel-level enforcement applies on the cluster node."
             )
 
-    def _build_bsub_argv(
-        self,
-        spec: JobSpec,
-        stdout_file: Path,
-        stderr_file: Path,
-        exitcode_file: Path,
-        job_name: str,
-    ) -> list[str]:
-        """Build the bsub argv for one JobSpec.
-
-        stdout/stderr/exitcode are captured by the inner shell script
-        rather than by bsub's -o/-e flags. This avoids LSF's output
-        file header (format varies by site config and LSF version).
-        The inner script is:
-
-            export K=V; ...; COMMAND >STDOUT 2>STDERR; echo $? >EXIT
-
-        bsub's own stdout (submission acknowledgment) is captured by
-        _run(); bsub's stderr goes to its own stderr (also captured).
-        """
-        argv: list[str] = [self._cfg.bsub_bin]
-
-        if self._cfg.queue:
-            argv += ["-q", self._cfg.queue]
-
-        resource_spec = spec.resource_spec or self._cfg.default_resource_spec
-        if resource_spec:
-            argv += ["-R", resource_spec]
-
-        argv += ["-J", job_name]
-
-        if spec.cwd:
-            argv += ["-cwd", spec.cwd]
-
-        # Build the inner shell script.
-        env_prefix = ""
-        if spec.env:
-            exports = "; ".join(
-                f"export {k}={_shell_quote(v)}"
-                for k, v in spec.env.items()
-            )
-            env_prefix = exports + "; "
-
-        inner = (
-            f"{env_prefix}"
-            f"{spec.command} "
-            f">{_shell_quote(str(stdout_file))} "
-            f"2>{_shell_quote(str(stderr_file))}; "
-            f"echo $? >{_shell_quote(str(exitcode_file))}"
-        )
-        argv += ["/bin/sh", "-c", inner]
-        return argv
-
-    async def _poll_status(self, job_id: str) -> str:
-        """Query bjobs for one job. Returns an LSF status string.
-
-        LSF statuses: PEND, RUN, DONE, EXIT, SSUSP, USUSP, PSUSP,
-        WAIT, ZOMBI, UNKWN.
-
-        bjobs exits non-zero and prints "is not found" when the job
-        has passed LSF's completion-record retention period. We treat
-        that as DONE (conservative — if it's gone, it finished).
-        """
-        rc, stdout, stderr = await self._run([
-            self._cfg.bjobs_bin, "-noheader", job_id,
-        ])
-        combined = (stdout + stderr).lower()
-        if rc != 0:
-            if "not found" in combined or "no unfinished job found" in combined:
-                return "DONE"
-            return "UNKWN"
-        lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
-        if not lines:
-            return "UNKWN"
-        # bjobs -noheader columns: JOBID USER STAT QUEUE FROM_HOST EXEC_HOST ...
-        parts = lines[0].split()
-        if len(parts) < 3:
-            return "UNKWN"
-        return parts[2].upper()
-
-    async def _collect_result(self, record: JobRecord, status: str) -> dict[str, Any]:
+    async def _collect_result(
+        self, record: JobRecord, status: str,
+    ) -> dict[str, Any]:
         """Read stdout/stderr/exitcode files after a job reaches terminal state."""
         stdout_content = _read_file_safe(Path(record.stdout_file))
         stderr_content = _read_file_safe(Path(record.stderr_file))
@@ -322,8 +245,8 @@ class LsfExecutor:
         try:
             exit_code = int(exit_raw)
         except (ValueError, TypeError):
-            # Exitcode file missing or malformed: job likely killed by LSF.
-            exit_code = -1 if status == "EXIT" else 0
+            # Exitcode file missing or malformed: job likely killed by scheduler.
+            exit_code = -1 if status == EXIT else 0
 
         return {
             "job_id": record.job_id,
@@ -334,14 +257,28 @@ class LsfExecutor:
             "stderr": stderr_content,
         }
 
+    def _exitcode_file_terminal_status(self, exitcode_file: Path) -> str:
+        """Helper for backends whose status query returns 'job no longer
+        in queue'. Reads the exitcode file and returns DONE or EXIT.
+        Returns UNKWN if the file is missing/malformed (job may have
+        been killed before the inner shell wrote it).
+        """
+        raw = _read_file_safe(exitcode_file).strip()
+        if not raw:
+            return UNKWN
+        try:
+            return DONE if int(raw) == 0 else EXIT
+        except ValueError:
+            return UNKWN
+
     # ── Public API ──────────────────────────────────────────────────────────
 
     async def submit(self, specs: list[JobSpec]) -> list[dict[str, Any]]:
-        """Submit one or more jobs to LSF.
+        """Submit one or more jobs.
 
-        Returns a list of dicts (one per spec). Each dict contains
-        either a ``job_id`` and metadata, or an ``error`` string if
-        submission failed. Failed specs do not block other specs.
+        Returns one dict per spec. Each dict has either a ``job_id``
+        and metadata, or an ``error`` string if submission failed.
+        Failed specs do not block other specs.
         """
         results: list[dict[str, Any]] = []
         for spec in specs:
@@ -359,16 +296,16 @@ class LsfExecutor:
             stdout_file, stderr_file, exitcode_file = self._output_paths(uid)
             job_name = (spec.name or f"hares-{uid}").strip()
 
-            argv = self._build_bsub_argv(
+            argv = self._build_submit_argv(
                 spec, stdout_file, stderr_file, exitcode_file, job_name,
             )
-            logger.info("bsub: %s", " ".join(argv))
+            logger.info("%s submit: %s", self.SCHEDULER_NAME, " ".join(argv))
             rc, stdout, stderr = await self._run(argv)
 
             if rc != 0:
                 results.append({
                     "error": (
-                        f"bsub failed (exit {rc}): "
+                        f"{self.SCHEDULER_NAME} submit failed (exit {rc}): "
                         f"{(stderr.strip() or stdout.strip())!r}"
                     ),
                     "job_id": None,
@@ -376,19 +313,18 @@ class LsfExecutor:
                 })
                 continue
 
-            m = _BSUB_ID_RE.search(stdout)
-            if not m:
+            job_id = self._parse_submit_output(stdout)
+            if not job_id:
                 results.append({
                     "error": (
-                        f"bsub succeeded but job ID not found in output: "
-                        f"{stdout.strip()!r}"
+                        f"{self.SCHEDULER_NAME} submit succeeded but job ID "
+                        f"not found in output: {stdout.strip()!r}"
                     ),
                     "job_id": None,
                     "name": job_name,
                 })
                 continue
 
-            job_id = m.group(1)
             now = datetime.now(timezone.utc).isoformat()
             record = JobRecord(
                 job_id=job_id,
@@ -402,11 +338,14 @@ class LsfExecutor:
             async with self._lock:
                 self._jobs[job_id] = record
 
-            logger.info("LSF job %s submitted (%s)", job_id, job_name)
+            logger.info(
+                "%s job %s submitted (%s)",
+                self.SCHEDULER_NAME, job_id, job_name,
+            )
             results.append({
                 "job_id": job_id,
                 "name": job_name,
-                "status": "PEND",
+                "status": PEND,
                 "submitted_at": now,
             })
 
@@ -419,17 +358,13 @@ class LsfExecutor:
     ) -> dict[str, dict[str, Any]]:
         """Wait for all listed jobs to reach a terminal state (DONE or EXIT).
 
-        Polls bjobs every HARES_LSF_POLL_INTERVAL_SEC seconds. Returns
-        as soon as all jobs finish or timeout_sec elapses, whichever
-        comes first.
+        Polls every ``poll_interval_sec``. Returns when all jobs finish
+        or ``timeout_sec`` elapses. Timed-out jobs keep running on the
+        cluster — call ``cancel`` to stop them.
 
-        Return value: mapping job_id → result dict. Each result dict
-        contains: job_id, name, status, exit_code, stdout, stderr.
-        Jobs that time out have status=TIMEOUT; they keep running on
-        the cluster — call lsf_cancel to stop them.
-
-        Jobs not known to this session return an ERROR entry. They may
-        have been submitted by a different hares-mcp process.
+        Return value: mapping job_id → result dict. Each result has
+        job_id, name, status, exit_code, stdout, stderr. Jobs not
+        known to this session return an ERROR entry.
         """
         pending: set[str] = set()
         results: dict[str, dict[str, Any]] = {}
@@ -444,7 +379,8 @@ class LsfExecutor:
                         "error": (
                             f"Job {job_id!r} is not known to this Hares session. "
                             "It may have been submitted by a different process. "
-                            "Use lsf_jobs to list jobs submitted in this session."
+                            f"Use {self.SCHEDULER_NAME}_jobs to list jobs "
+                            "submitted in this session."
                         ),
                     }
                     continue
@@ -467,8 +403,9 @@ class LsfExecutor:
                         "error": (
                             f"Timed out after {timeout_sec:.0f}s waiting for "
                             f"job {job_id}. The job is still running on the "
-                            "cluster. Call lsf_cancel to stop it, or call "
-                            "lsf_wait again with a longer timeout."
+                            f"cluster. Call {self.SCHEDULER_NAME}_cancel to "
+                            f"stop it, or call {self.SCHEDULER_NAME}_wait "
+                            "again with a longer timeout."
                         ),
                     }
                 break
@@ -486,12 +423,11 @@ class LsfExecutor:
                     continue
                 status: str = status_or_exc
 
-                # Update record status.
                 async with self._lock:
                     if job_id in self._jobs:
                         self._jobs[job_id].status = status
 
-                if status in _TERMINAL:
+                if status in TERMINAL:
                     async with self._lock:
                         rec = self._jobs.get(job_id)
                     if rec is not None:
@@ -500,7 +436,10 @@ class LsfExecutor:
                             self._jobs[job_id].result = result
                         results[job_id] = result
                     pending.discard(job_id)
-                    logger.info("LSF job %s reached %s", job_id, status)
+                    logger.info(
+                        "%s job %s reached %s",
+                        self.SCHEDULER_NAME, job_id, status,
+                    )
 
             if pending:
                 sleep_for = min(
@@ -512,22 +451,27 @@ class LsfExecutor:
 
         return results
 
-    async def cancel(self, job_ids: list[str]) -> dict[str, dict[str, Any]]:
-        """Cancel jobs via bkill.
+    async def _poll_status(self, job_id: str) -> str:
+        """Run the backend's status query and parse the result."""
+        argv = self._build_status_argv(job_id)
+        rc, stdout, stderr = await self._run(argv)
+        return self._parse_status(job_id, rc, stdout, stderr)
 
-        Returns a mapping job_id → {job_id, cancelled, message}.
-        bkill exit code determines ``cancelled``. The session record
-        is updated to CANCELED regardless (bkill may report success
-        even for already-finished jobs).
+    async def cancel(self, job_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Cancel jobs.
+
+        Returns a mapping job_id → {job_id, cancelled, message}. The
+        session record is updated to CANCELED regardless of the
+        backend's response (the cancel binary may report success even
+        for already-finished jobs).
         """
         results: dict[str, dict[str, Any]] = {}
         for job_id in job_ids:
-            rc, stdout, stderr = await self._run(
-                [self._cfg.bkill_bin, job_id]
-            )
+            argv = self._build_cancel_argv(job_id)
+            rc, stdout, stderr = await self._run(argv)
             cancelled = rc == 0
             msg = (stdout.strip() or stderr.strip()) or (
-                "OK" if cancelled else f"bkill exit {rc}"
+                "OK" if cancelled else f"cancel exit {rc}"
             )
             async with self._lock:
                 if job_id in self._jobs:
@@ -537,7 +481,10 @@ class LsfExecutor:
                 "cancelled": cancelled,
                 "message": msg,
             }
-            logger.info("bkill %s: rc=%d msg=%r", job_id, rc, msg)
+            logger.info(
+                "%s cancel %s: rc=%d msg=%r",
+                self.SCHEDULER_NAME, job_id, rc, msg,
+            )
         return results
 
     async def jobs(self) -> list[dict[str, Any]]:
@@ -553,8 +500,6 @@ class LsfExecutor:
         """Submit one job and wait for it synchronously.
 
         Thin wrapper around submit([spec]) + wait([job_id], timeout_sec).
-        Use this for single sequential jobs. Use lsf_submit + lsf_wait
-        when you have multiple independent jobs to run in parallel.
         """
         submitted = await self.submit([spec])
         sub = submitted[0]
@@ -570,7 +515,7 @@ class LsfExecutor:
         return results[sub["job_id"]]
 
 
-# ── Utilities ────────────────────────────────────────────────────────────────
+# ── Utilities (shared by backends) ─────────────────────────────────────────
 
 def _read_file_safe(path: Path) -> str:
     """Read a file, returning empty string on any error."""
@@ -580,6 +525,41 @@ def _read_file_safe(path: Path) -> str:
         return ""
 
 
-def _shell_quote(s: str) -> str:
-    """Minimal single-quote escaping for embedding in /bin/sh -c scripts."""
+def shell_quote(s: str) -> str:
+    """Single-quote escaping for embedding in /bin/sh -c scripts."""
     return "'" + s.replace("'", "'\\''") + "'"
+
+
+def build_inner_shell(
+    spec: JobSpec,
+    stdout_file: Path,
+    stderr_file: Path,
+    exitcode_file: Path,
+) -> str:
+    """Build the inner shell script that captures stdout/stderr/exitcode.
+
+    Same pattern across all backends: explicit redirect + ``echo $?``
+    to a separate file. Avoids depending on the scheduler's own output
+    capture (whose format varies by site config and version).
+    """
+    env_prefix = ""
+    if spec.env:
+        exports = "; ".join(
+            f"export {k}={shell_quote(v)}"
+            for k, v in spec.env.items()
+        )
+        env_prefix = exports + "; "
+    return (
+        f"{env_prefix}"
+        f"{spec.command} "
+        f">{shell_quote(str(stdout_file))} "
+        f"2>{shell_quote(str(stderr_file))}; "
+        f"echo $? >{shell_quote(str(exitcode_file))}"
+    )
+
+
+def default_output_dir(scheduler: str, session_tmp: Optional[Path]) -> Path:
+    """Pick a default output dir for a backend's load_*_config function."""
+    if session_tmp is not None:
+        return session_tmp
+    return Path(tempfile.mkdtemp(prefix=f"hares-{scheduler}-"))

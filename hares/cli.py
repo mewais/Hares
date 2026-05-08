@@ -69,15 +69,17 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--enable",
-        choices=["shell", "fs", "fs+shell", "lsf"],
+        choices=["shell", "fs", "fs+shell", "lsf", "slurm"],
         default="shell",
         help=(
             "Which tool family/families to expose. Default: shell "
             "(0.1-compat). 'fs' exposes the filesystem-server surface; "
             "'fs+shell' exposes both with a shared scope_id and "
-            "active scope. 'lsf' exposes the five LSF cluster tools "
-            "(lsf_execute_blocking, lsf_submit, lsf_wait, lsf_cancel, "
-            "lsf_jobs) — no bwrap, no RLIMIT, no active-scope enforcement."
+            "active scope. 'lsf' / 'slurm' expose the five cluster-job "
+            "tools (PFX_execute_blocking, PFX_submit, PFX_wait, "
+            "PFX_cancel, PFX_jobs where PFX is the scheduler name) — "
+            "no bwrap, no RLIMIT, no active-scope enforcement; "
+            "resource governance via per-job resource_spec."
         ),
     )
     parser.add_argument(
@@ -239,10 +241,10 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     scope_id = _validate_scope_id(args.scope_id)
 
-    # LSF mode: ceiling is optional (used only for cwd pre-submission check).
-    # Skip the mandatory-ceiling validation and the env-path checks that only
-    # apply to bwrap-based modes.
-    if args.enable == "lsf":
+    # Cluster modes (lsf, slurm): ceiling is optional (used only for cwd
+    # pre-submission check). Skip the mandatory-ceiling validation and the
+    # env-path checks that only apply to bwrap-based modes.
+    if args.enable in {"lsf", "slurm"}:
         ceiling: Optional[Path] = None
         raw = args.ceiling or os.environ.get("HARES_FS_CEILING", "").strip()
         if raw:
@@ -253,9 +255,14 @@ def main(argv: Optional[list[str]] = None) -> None:
                 validate_ceiling(expanded)
                 ceiling = expanded
             except PathSafetyError as exc:
-                raise SystemExit(f"hares-mcp: invalid --ceiling for LSF mode: {exc}")
-        from .lsf.server import serve as lsf_serve
-        lsf_serve(scope_id=scope_id, ceiling=ceiling)
+                raise SystemExit(
+                    f"hares-mcp: invalid --ceiling for {args.enable} mode: {exc}"
+                )
+        from .cluster.server import serve_lsf, serve_slurm
+        if args.enable == "lsf":
+            serve_lsf(scope_id=scope_id, ceiling=ceiling)
+        else:
+            serve_slurm(scope_id=scope_id, ceiling=ceiling)
         return
 
     ceiling = _resolve_ceiling(args)

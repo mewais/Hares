@@ -1,4 +1,4 @@
-"""Tests for hares.lsf.executor — LsfExecutor and LsfConfig.
+"""Tests for the LSF backend (hares.cluster.lsf).
 
 All tests monkeypatch LsfExecutor._run to avoid requiring a real LSF
 scheduler. This lets the full submit/wait/cancel/jobs logic run in CI
@@ -7,17 +7,16 @@ without bsub/bjobs/bkill on PATH.
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
-from hares.lsf.executor import (
+from hares.cluster.base import shell_quote
+from hares.cluster.lsf import (
     JobSpec,
     LsfConfig,
     LsfExecutor,
-    _shell_quote,
     load_lsf_config,
 )
 
@@ -26,11 +25,11 @@ from hares.lsf.executor import (
 
 def make_config(tmp_path: Path, **overrides) -> LsfConfig:
     defaults = dict(
-        queue="test_queue",
-        default_resource_spec=None,
-        poll_interval_sec=0.01,   # fast for tests
+        poll_interval_sec=0.01,
         default_timeout_sec=10.0,
         output_dir=tmp_path / "lsf-out",
+        queue="test_queue",
+        default_resource_spec=None,
         bsub_bin="bsub",
         bjobs_bin="bjobs",
         bkill_bin="bkill",
@@ -43,7 +42,6 @@ def make_executor(tmp_path: Path, ceiling: Path | None = None, **cfg_kw) -> LsfE
     return LsfExecutor(cfg=make_config(tmp_path, **cfg_kw), ceiling=ceiling)
 
 
-# Fake bsub success response.
 def bsub_ok(job_id: str = "12345678") -> tuple[int, str, str]:
     return 0, f"Job <{job_id}> is submitted to queue <test_queue>.\n", ""
 
@@ -79,14 +77,14 @@ def test_load_lsf_config_env_overrides(tmp_path, monkeypatch):
     assert cfg.bsub_bin == "/opt/lsf/bin/bsub"
 
 
-# ── _shell_quote ──────────────────────────────────────────────────────────────
+# ── shell_quote (shared helper) ──────────────────────────────────────────────
 
 def test_shell_quote_plain():
-    assert _shell_quote("hello world") == "'hello world'"
+    assert shell_quote("hello world") == "'hello world'"
 
 
 def test_shell_quote_with_single_quotes():
-    assert _shell_quote("it's fine") == "'it'\\''s fine'"
+    assert shell_quote("it's fine") == "'it'\\''s fine'"
 
 
 # ── submit ────────────────────────────────────────────────────────────────────
@@ -105,7 +103,6 @@ async def test_submit_single_job(tmp_path):
 
 @pytest.mark.asyncio
 async def test_submit_multiple_jobs(tmp_path):
-    job_ids = iter(["11", "22", "33"])
     ex = make_executor(tmp_path)
     ex._run = AsyncMock(side_effect=[bsub_ok(jid) for jid in ["11", "22", "33"]])
     results = await ex.submit([
@@ -132,7 +129,8 @@ async def test_submit_bsub_failure_returns_error(tmp_path):
     ex._run = AsyncMock(return_value=(1, "", "queue not found"))
     results = await ex.submit([JobSpec(command="echo hi")])
     assert results[0]["job_id"] is None
-    assert "bsub failed" in results[0]["error"]
+    # Error message uses scheduler-name-prefixed wording from base.
+    assert "lsf submit failed" in results[0]["error"]
 
 
 @pytest.mark.asyncio
@@ -221,7 +219,7 @@ async def test_submit_mixed_success_and_failure(tmp_path):
     results = await ex.submit([JobSpec(command="ok"), JobSpec(command="bad")])
     assert results[0]["job_id"] == "10"
     assert results[1]["job_id"] is None
-    assert "bsub failed" in results[1]["error"]
+    assert "lsf submit failed" in results[1]["error"]
 
 
 # ── jobs ──────────────────────────────────────────────────────────────────────
@@ -259,13 +257,11 @@ async def test_wait_job_done_immediately(tmp_path):
     ex._run = AsyncMock(return_value=bsub_ok("30"))
     await ex.submit([JobSpec(command="echo done")])
 
-    # Write fake output files (executor uses uid from submit, so find them).
     rec = ex._jobs["30"]
     Path(rec.stdout_file).write_text("hello output\n")
     Path(rec.stderr_file).write_text("")
     Path(rec.exitcode_file).write_text("0\n")
 
-    # bjobs says DONE on first poll.
     ex._run = AsyncMock(return_value=(0, "30 user DONE queue host host\n", ""))
     results = await ex.wait(["30"], timeout_sec=5.0)
     assert results["30"]["status"] == "DONE"
@@ -323,7 +319,6 @@ async def test_wait_bjobs_not_found_treated_as_done(tmp_path):
     Path(rec.stderr_file).write_text("")
     Path(rec.exitcode_file).write_text("0\n")
 
-    # bjobs returns non-zero "not found" — past retention period.
     ex._run = AsyncMock(return_value=(255, "", "Job <60> is not found"))
     results = await ex.wait(["60"], timeout_sec=5.0)
     assert results["60"]["status"] == "DONE"
@@ -335,18 +330,16 @@ async def test_wait_timeout_returns_timeout_status(tmp_path):
     ex._run = AsyncMock(return_value=bsub_ok("70"))
     await ex.submit([JobSpec(command="sleep 999")])
 
-    # bjobs always returns RUN (never finishes).
     ex._run = AsyncMock(return_value=(0, "70 user RUN queue host host\n", ""))
     results = await ex.wait(["70"], timeout_sec=0.05)
     assert results["70"]["status"] == "TIMEOUT"
+    # Error message references the scheduler-prefixed cancel tool.
     assert "lsf_cancel" in results["70"]["error"]
 
 
 @pytest.mark.asyncio
 async def test_wait_multiple_parallel_jobs(tmp_path):
     ex = make_executor(tmp_path)
-
-    call_count = {"n": 0}
     ex._run = AsyncMock(side_effect=[bsub_ok("80"), bsub_ok("81")])
     await ex.submit([JobSpec(command="echo 1"), JobSpec(command="echo 2")])
 
@@ -378,10 +371,8 @@ async def test_wait_already_collected_skips_poll(tmp_path):
     Path(rec.exitcode_file).write_text("0\n")
 
     ex._run = AsyncMock(return_value=(0, "90 user DONE queue host host\n", ""))
-    # First wait collects result.
     await ex.wait(["90"], timeout_sec=5.0)
 
-    # Second wait returns cached result without polling.
     ex._run = AsyncMock()
     results = await ex.wait(["90"], timeout_sec=5.0)
     assert results["90"]["status"] == "DONE"
@@ -432,26 +423,17 @@ async def test_cancel_multiple(tmp_path):
 async def test_execute_blocking_success(tmp_path):
     ex = make_executor(tmp_path)
     ex._run = AsyncMock(return_value=bsub_ok("200"))
-    # After submit, _run is called again for bjobs poll.
-    rec_holder = {}
 
-    original_submit = ex.submit
-    async def submit_and_capture(specs):
-        result = await original_submit(specs)
-        rec_holder.update(ex._jobs)
-        return result
-    ex.submit = submit_and_capture
-
-    # We need to write output files after submit resolves.
-    # Patch wait to do that.
     original_wait = ex.wait
+
     async def patched_wait(job_ids, timeout_sec):
-        for jid, rec in ex._jobs.items():
+        for _, rec in ex._jobs.items():
             Path(rec.stdout_file).write_text("blocking output\n")
             Path(rec.stderr_file).write_text("")
             Path(rec.exitcode_file).write_text("0\n")
         ex._run = AsyncMock(return_value=(0, "200 user DONE queue host host\n", ""))
         return await original_wait(job_ids, timeout_sec)
+
     ex.wait = patched_wait
 
     result = await ex.execute_blocking(JobSpec(command="echo blocking"), timeout_sec=5.0)

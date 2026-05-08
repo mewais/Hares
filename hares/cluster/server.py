@@ -1,14 +1,16 @@
-"""Hares LSF MCP server — exposes the five LSF tools.
+"""Hares cluster MCP server — exposes the five cluster-scheduler tools.
 
-Tool surface:
+Parameterized by scheduler so LSF and SLURM share one server module.
+The tool-name prefix (``lsf`` or ``slurm``) and the descriptions vary;
+the dispatch logic does not.
 
-  <prefix>lsf_execute_blocking  Submit one job and wait for it.
-  <prefix>lsf_submit            Submit one or more jobs (non-blocking).
-  <prefix>lsf_wait              Wait for a list of jobs to finish.
-  <prefix>lsf_cancel            Cancel a list of jobs via bkill.
-  <prefix>lsf_jobs              List all jobs submitted in this session.
+Tool surface (with PFX = scheduler name):
 
-<prefix> is ``<scope_id>_`` when --scope-id is supplied, empty otherwise.
+  <scope_>PFX_execute_blocking  Submit one job and wait for it.
+  <scope_>PFX_submit            Submit one or more jobs (non-blocking).
+  <scope_>PFX_wait              Wait for a list of jobs to finish.
+  <scope_>PFX_cancel            Cancel a list of jobs.
+  <scope_>PFX_jobs              List all jobs submitted in this session.
 
 Security note printed in every tool description: no bwrap, no RLIMIT,
 no active-scope enforcement. The cluster node runs jobs unrestricted.
@@ -20,7 +22,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -29,7 +30,9 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-from .executor import JobSpec, LsfExecutor, load_lsf_config
+from .base import ClusterExecutor, JobSpec
+from .lsf import LsfExecutor, load_lsf_config
+from .slurm import SlurmExecutor, load_slurm_config
 
 logger = logging.getLogger(__name__)
 
@@ -46,20 +49,52 @@ def _p(name: str, scope_id: Optional[str]) -> str:
     return f"{scope_id}_{name}" if scope_id else name
 
 
-def _build_server(
-    executor: LsfExecutor,
+def _resource_spec_help(scheduler: str) -> str:
+    if scheduler == "lsf":
+        return (
+            "LSF resource specification passed to bsub -R "
+            "(e.g. 'rusage[mem=8192] span[hosts=1]'). "
+            "Overrides HARES_LSF_DEFAULT_RESOURCE_SPEC for this job."
+        )
+    if scheduler == "slurm":
+        return (
+            "SLURM resource flags appended to sbatch verbatim "
+            "(e.g. '--mem=8192 --cpus-per-task=4 --time=01:00:00'). "
+            "Overrides HARES_SLURM_DEFAULT_RESOURCE_SPEC for this job."
+        )
+    return "Scheduler-specific resource specification."
+
+
+def _name_flag_help(scheduler: str) -> str:
+    flag = "bsub -J" if scheduler == "lsf" else "sbatch --job-name"
+    return f"Human-readable job name ({flag}). Auto-generated if omitted."
+
+
+def build_server(
+    executor: ClusterExecutor,
     *,
+    scheduler: str,
     scope_id: Optional[str] = None,
 ) -> Server:
-    server: Server = Server("hares-lsf")
+    """Build an MCP Server exposing the five cluster tools for one backend."""
+    server: Server = Server(f"hares-{scheduler}")
 
     # Pre-compute all tool names once.
-    T_BLOCKING = _p("lsf_execute_blocking", scope_id)
-    T_SUBMIT   = _p("lsf_submit",           scope_id)
-    T_WAIT     = _p("lsf_wait",             scope_id)
-    T_CANCEL   = _p("lsf_cancel",           scope_id)
-    T_JOBS     = _p("lsf_jobs",             scope_id)
+    T_BLOCKING = _p(f"{scheduler}_execute_blocking", scope_id)
+    T_SUBMIT   = _p(f"{scheduler}_submit",           scope_id)
+    T_WAIT     = _p(f"{scheduler}_wait",             scope_id)
+    T_CANCEL   = _p(f"{scheduler}_cancel",           scope_id)
+    T_JOBS     = _p(f"{scheduler}_jobs",             scope_id)
     ALL_TOOLS  = {T_BLOCKING, T_SUBMIT, T_WAIT, T_CANCEL, T_JOBS}
+
+    timeout_env = (
+        "HARES_LSF_DEFAULT_TIMEOUT_SEC" if scheduler == "lsf"
+        else "HARES_SLURM_DEFAULT_TIMEOUT_SEC"
+    )
+    poll_env = (
+        "HARES_LSF_POLL_INTERVAL_SEC" if scheduler == "lsf"
+        else "HARES_SLURM_POLL_INTERVAL_SEC"
+    )
 
     @server.list_tools()
     async def _list_tools() -> list[Tool]:
@@ -72,15 +107,11 @@ def _build_server(
                 },
                 "resource_spec": {
                     "type": "string",
-                    "description": (
-                        "LSF resource specification passed to bsub -R "
-                        "(e.g. 'rusage[mem=8192] span[hosts=1]'). "
-                        "Overrides HARES_LSF_DEFAULT_RESOURCE_SPEC for this job."
-                    ),
+                    "description": _resource_spec_help(scheduler),
                 },
                 "name": {
                     "type": "string",
-                    "description": "Human-readable job name (bsub -J). Auto-generated if omitted.",
+                    "description": _name_flag_help(scheduler),
                 },
                 "cwd": {
                     "type": "string",
@@ -103,11 +134,12 @@ def _build_server(
             Tool(
                 name=T_BLOCKING,
                 description=(
-                    "Submit a single job to LSF and wait (blocking) until it "
-                    "completes. Returns stdout, stderr, exit_code, and status. "
-                    "Use this for single sequential jobs. Use lsf_submit + "
-                    "lsf_wait when you have multiple independent jobs to run "
-                    "in parallel. " + _SECURITY_NOTE
+                    f"Submit a single job to {scheduler.upper()} and wait "
+                    "(blocking) until it completes. Returns stdout, stderr, "
+                    f"exit_code, and status. Use this for single sequential jobs. "
+                    f"Use {scheduler}_submit + {scheduler}_wait when you have "
+                    "multiple independent jobs to run in parallel. "
+                    + _SECURITY_NOTE
                 ),
                 inputSchema={
                     "type": "object",
@@ -116,9 +148,10 @@ def _build_server(
                         "timeout_sec": {
                             "type": "number",
                             "description": (
-                                "Maximum seconds to wait for the job to finish. "
-                                "Defaults to HARES_LSF_DEFAULT_TIMEOUT_SEC (86400). "
-                                "On timeout the job keeps running; call lsf_cancel to stop it."
+                                f"Maximum seconds to wait for the job to finish. "
+                                f"Defaults to ${timeout_env} (86400). "
+                                "On timeout the job keeps running; call "
+                                f"{scheduler}_cancel to stop it."
                             ),
                         },
                     },
@@ -128,11 +161,11 @@ def _build_server(
             Tool(
                 name=T_SUBMIT,
                 description=(
-                    "Submit one or more jobs to LSF without waiting. Returns a "
-                    "job_id for each submitted job. Call lsf_wait with the "
-                    "returned job_ids to collect results. Submitting multiple "
-                    "jobs in one call allows them to run in parallel on the "
-                    "cluster. " + _SECURITY_NOTE
+                    f"Submit one or more jobs to {scheduler.upper()} without "
+                    "waiting. Returns a job_id for each submitted job. Call "
+                    f"{scheduler}_wait with the returned job_ids to collect "
+                    "results. Submitting multiple jobs in one call allows them "
+                    "to run in parallel on the cluster. " + _SECURITY_NOTE
                 ),
                 inputSchema={
                     "type": "object",
@@ -150,11 +183,11 @@ def _build_server(
             Tool(
                 name=T_WAIT,
                 description=(
-                    "Wait for one or more LSF jobs (by job_id) to finish. "
-                    "Polls bjobs every HARES_LSF_POLL_INTERVAL_SEC seconds. "
+                    f"Wait for one or more {scheduler.upper()} jobs (by "
+                    f"job_id) to finish. Polls every ${poll_env} seconds. "
                     "Returns as soon as all listed jobs reach a terminal state "
-                    "(DONE or EXIT) or timeout_sec elapses. Timed-out jobs "
-                    "keep running on the cluster — call lsf_cancel to stop them."
+                    "or timeout_sec elapses. Timed-out jobs keep running on "
+                    f"the cluster — call {scheduler}_cancel to stop them."
                 ),
                 inputSchema={
                     "type": "object",
@@ -162,14 +195,17 @@ def _build_server(
                         "job_ids": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Job IDs returned by lsf_submit or lsf_execute_blocking.",
+                            "description": (
+                                f"Job IDs returned by {scheduler}_submit or "
+                                f"{scheduler}_execute_blocking."
+                            ),
                             "minItems": 1,
                         },
                         "timeout_sec": {
                             "type": "number",
                             "description": (
-                                "Maximum seconds to wait. "
-                                "Defaults to HARES_LSF_DEFAULT_TIMEOUT_SEC (86400)."
+                                f"Maximum seconds to wait. "
+                                f"Defaults to ${timeout_env} (86400)."
                             ),
                         },
                     },
@@ -179,9 +215,10 @@ def _build_server(
             Tool(
                 name=T_CANCEL,
                 description=(
-                    "Cancel one or more LSF jobs via bkill. Returns a per-job "
-                    "result indicating whether bkill succeeded. Jobs that have "
-                    "already finished are silently ignored by bkill."
+                    f"Cancel one or more {scheduler.upper()} jobs. Returns a "
+                    "per-job result indicating whether the cancel succeeded. "
+                    "Jobs that have already finished are typically silently "
+                    "ignored by the scheduler."
                 ),
                 inputSchema={
                     "type": "object",
@@ -199,10 +236,10 @@ def _build_server(
             Tool(
                 name=T_JOBS,
                 description=(
-                    "List all LSF jobs submitted in this Hares session with "
-                    "their current status. Useful for recovering job_ids if "
-                    "they were lost from context, or for auditing what is "
-                    "running on the cluster."
+                    f"List all {scheduler.upper()} jobs submitted in this "
+                    "Hares session with their current status. Useful for "
+                    "recovering job_ids if they were lost from context, or "
+                    "for auditing what is running on the cluster."
                 ),
                 inputSchema={"type": "object", "properties": {}},
             ),
@@ -262,7 +299,9 @@ def _build_server(
     return server
 
 
-async def _serve_async(
+# ── Per-scheduler entry points ───────────────────────────────────────────────
+
+async def _serve_lsf_async(
     *,
     scope_id: Optional[str] = None,
     ceiling: Optional[Path] = None,
@@ -280,18 +319,54 @@ async def _serve_async(
         cfg.output_dir,
     )
     executor = LsfExecutor(cfg=cfg, ceiling=ceiling)
-    server = _build_server(executor, scope_id=scope_id)
+    server = build_server(executor, scheduler="lsf", scope_id=scope_id)
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())
 
 
-def serve(
+async def _serve_slurm_async(
     *,
     scope_id: Optional[str] = None,
     ceiling: Optional[Path] = None,
 ) -> None:
-    """Synchronous entry — called by the CLI dispatcher."""
+    session_tmp = Path(tempfile.mkdtemp(prefix="hares-slurm-out-"))
+    cfg = load_slurm_config(session_tmp=session_tmp)
+    logger.info(
+        "Hares SLURM starting: scope_id=%r ceiling=%r partition=%r account=%r "
+        "poll_interval=%.1fs default_timeout=%.0fs output_dir=%s",
+        scope_id,
+        str(ceiling) if ceiling else None,
+        cfg.partition,
+        cfg.account,
+        cfg.poll_interval_sec,
+        cfg.default_timeout_sec,
+        cfg.output_dir,
+    )
+    executor = SlurmExecutor(cfg=cfg, ceiling=ceiling)
+    server = build_server(executor, scheduler="slurm", scope_id=scope_id)
+    async with stdio_server() as (read, write):
+        await server.run(read, write, server.create_initialization_options())
+
+
+def serve_lsf(
+    *,
+    scope_id: Optional[str] = None,
+    ceiling: Optional[Path] = None,
+) -> None:
+    """Synchronous entry — called by the CLI dispatcher for --enable=lsf."""
     try:
-        asyncio.run(_serve_async(scope_id=scope_id, ceiling=ceiling))
+        asyncio.run(_serve_lsf_async(scope_id=scope_id, ceiling=ceiling))
     except KeyboardInterrupt:
         logger.info("Hares LSF shutting down (KeyboardInterrupt)")
+
+
+def serve_slurm(
+    *,
+    scope_id: Optional[str] = None,
+    ceiling: Optional[Path] = None,
+) -> None:
+    """Synchronous entry — called by the CLI dispatcher for --enable=slurm."""
+    try:
+        asyncio.run(_serve_slurm_async(scope_id=scope_id, ceiling=ceiling))
+    except KeyboardInterrupt:
+        logger.info("Hares SLURM shutting down (KeyboardInterrupt)")

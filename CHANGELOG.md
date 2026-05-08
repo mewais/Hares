@@ -4,6 +4,75 @@ All notable changes to Hares are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-05-08
+
+Adds SLURM as a second cluster-scheduler backend and refactors the
+LSF code into a shared `hares.cluster` package. Same security model
+applies to both schedulers (no bwrap, no RLIMIT, no active-scope
+enforcement on cluster nodes — resource governance is the
+scheduler's job via per-job `resource_spec`).
+
+### Added
+
+* **`--enable=slurm` CLI mode** — exposes five tools
+  (`slurm_execute_blocking`, `slurm_submit`, `slurm_wait`,
+  `slurm_cancel`, `slurm_jobs`) backed by `sbatch --parsable`,
+  `squeue`, and `scancel`. Status query strategy: `squeue` first;
+  on empty output (job left the queue) fall back to reading the
+  exitcode file written by the inner shell — portable across SLURM
+  configs that don't have `slurmdbd` accounting set up.
+* **`HARES_SLURM_*` env vars**: `PARTITION`, `ACCOUNT`,
+  `DEFAULT_RESOURCE_SPEC` (free-form sbatch flags, shlex-split),
+  `POLL_INTERVAL_SEC`, `DEFAULT_TIMEOUT_SEC`, `OUTPUT_DIR`,
+  `SBATCH_BIN`, `SQUEUE_BIN`, `SCANCEL_BIN`.
+* **`hares.cluster` package** with importable `LsfExecutor`,
+  `SlurmExecutor`, `JobSpec`, `LsfConfig`, `SlurmConfig`,
+  `load_lsf_config`, `load_slurm_config`. Shared `ClusterExecutor`
+  base owns the async poll loop, output capture, timeout
+  enforcement, session-job map, and cancel bookkeeping; backends
+  supply only argv builders and status parsers.
+* **Federation-aware SLURM job-ID parsing** — `sbatch --parsable`
+  returns `JOBID;CLUSTER` in federated mode; the `;CLUSTER` suffix
+  is stripped before tracking.
+
+### Changed
+
+* **Library import paths moved.** Pre-0.4: `from hares.lsf import
+  LsfExecutor`. Post-0.4: `from hares.cluster.lsf import
+  LsfExecutor` (or `from hares.cluster import LsfExecutor`). MCP
+  tool names and CLI flags are unchanged.
+* **Submit-error wording prefixed by scheduler name.** The
+  structured `error` string in submit results now reads
+  `"lsf submit failed (exit N): ..."` / `"slurm submit failed
+  (exit N): ..."` instead of `"bsub failed"`.
+
+### Removed
+
+* **`hares/lsf/` package layout.** Replaced by `hares/cluster/`.
+  External callers using `from hares.lsf.executor import ...` must
+  update to `from hares.cluster.lsf import ...`. MCP tool names
+  (`lsf_execute_blocking` etc.) and the `--enable=lsf` flag are
+  unchanged — this break only affects direct Python-library users
+  of the LSF executor.
+
+### Tests
+
+* `tests/test_cluster_lsf.py` — ports the previous
+  `test_lsf_executor.py` to the new module layout.
+* `tests/test_cluster_slurm.py` — parallel SLURM coverage
+  (`load_slurm_config` defaults + env, submit success/failure,
+  `--parsable` enforcement, federation job-ID parsing,
+  `--chdir=PATH` cwd, `--output=/dev/null` suppression of sbatch's
+  own output files, free-form `resource_spec` shlex-split, status
+  parsing across SLURM's PENDING/RUNNING/COMPLETING/FAILED
+  states, exitcode-file fallback when squeue returns empty,
+  `Invalid job id` non-zero squeue handling, missing-exitcode-file
+  → UNKWN behavior, cancel via scancel).
+* `tests/test_cluster_server_proto.py` — protocol-level tests
+  parametrized over `["lsf", "slurm"]` covering tool listing,
+  scope-id prefix, schema shape, security-note presence, jobs/wait
+  on unknown IDs, and missing-binary error shapes.
+
 ## [0.2.3] — 2026-05-06
 
 Round-4 reviewer findings against 0.2.2:

@@ -7,7 +7,7 @@ into any MCP-aware client as a drop-in replacement for an
 unconstrained shell tool.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from .runner import Runner
 
