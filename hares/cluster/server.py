@@ -50,17 +50,34 @@ def _p(name: str, scope_id: Optional[str]) -> str:
 
 
 def _resource_spec_help(scheduler: str) -> str:
+    sizing_guidance = (
+        "RIGHT-SIZE THIS PER JOB. Schedulers prioritize jobs whose "
+        "resource asks fit in current cluster slack — small asks "
+        "(e.g. 512 MB / 5 min for a smoke test) start almost "
+        "immediately, while over-allocated jobs wait in the queue "
+        "for matching nodes to free up. Estimate from the actual "
+        "command: a unit-test run is not a multi-GPU training job. "
+        "When omitted, the operator-configured default applies, "
+        "which is typically sized for the largest expected job."
+    )
     if scheduler == "lsf":
         return (
-            "LSF resource specification passed to bsub -R "
-            "(e.g. 'rusage[mem=8192] span[hosts=1]'). "
-            "Overrides HARES_LSF_DEFAULT_RESOURCE_SPEC for this job."
+            "LSF resource specification passed to bsub -R. "
+            "Examples: 'rusage[mem=512]' for a small test, "
+            "'rusage[mem=8192] span[hosts=1]' for a single-node build, "
+            "'rusage[mem=32768,ngpus_excl_p=1]' for GPU work. "
+            "Overrides HARES_LSF_DEFAULT_RESOURCE_SPEC for this job. "
+            + sizing_guidance
         )
     if scheduler == "slurm":
         return (
             "SLURM resource flags appended to sbatch verbatim "
-            "(e.g. '--mem=8192 --cpus-per-task=4 --time=01:00:00'). "
-            "Overrides HARES_SLURM_DEFAULT_RESOURCE_SPEC for this job."
+            "(shlex-split). Examples: "
+            "'--mem=512 --time=00:05:00' for a smoke test, "
+            "'--mem=8192 --cpus-per-task=4 --time=01:00:00' for a "
+            "single-node build, '--mem=32768 --gres=gpu:1 --time=04:00:00' "
+            "for GPU work. Overrides HARES_SLURM_DEFAULT_RESOURCE_SPEC "
+            "for this job. " + sizing_guidance
         )
     return "Scheduler-specific resource specification."
 
