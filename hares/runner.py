@@ -196,12 +196,23 @@ class Runner:
             for c in cores:
                 self._core_in_use.discard(c)
 
-    def _make_preexec(self, pinned_cores: list[int]):
+    def _make_preexec(
+        self,
+        pinned_cores: list[int],
+        *,
+        mem_bytes: Optional[int] = None,
+        cpu_sec: Optional[int] = None,
+    ):
         """Build a fork-side initializer that applies all caps for one
         specific subprocess. Captured cores are baked into the closure
-        so we don't need shared state inside the child."""
-        mem_bytes = self._mem_bytes
-        cpu_sec = self._cpu_sec
+        so we don't need shared state inside the child.
+
+        ``mem_bytes`` / ``cpu_sec`` override the Runner's defaults for
+        this one call (used by the per-call resource-spec path). When
+        None, falls back to the instance-level limits.
+        """
+        mem_bytes = mem_bytes if mem_bytes is not None else self._mem_bytes
+        cpu_sec = cpu_sec if cpu_sec is not None else self._cpu_sec
         pin_cpu = self._pin_cpu
         cores = list(pinned_cores)
 
@@ -217,7 +228,13 @@ class Runner:
 
         return _preexec
 
-    async def _monitor_rss(self, pid: int, kill_flag: dict[str, Any]) -> None:
+    async def _monitor_rss(
+        self,
+        pid: int,
+        kill_flag: dict[str, Any],
+        *,
+        mem_bytes: Optional[int] = None,
+    ) -> None:
         """Belt-and-suspenders RSS monitor.
 
         RLIMIT_AS caps the virtual address space of a single process,
@@ -226,6 +243,11 @@ class Runner:
         across the whole tree and SIGKILL it if the sum exceeds the
         per-process cap by `rss_overshoot_ratio` (default 1.2× as a
         small allowance for shared mappings).
+
+        ``mem_bytes`` overrides the Runner's default for this call —
+        the threshold is computed against the per-call cap so a
+        right-sized small command isn't allowed to balloon up to the
+        global default. Falls back to the instance-level limit when None.
 
         Sets kill_flag["reason"] = "rss_exceeded" so the caller can
         report it accurately.
@@ -236,7 +258,8 @@ class Runner:
             parent = psutil.Process(pid)
         except psutil.NoSuchProcess:
             return
-        threshold = int(self._mem_bytes * self._rss_overshoot)
+        effective_mem = mem_bytes if mem_bytes is not None else self._mem_bytes
+        threshold = int(effective_mem * self._rss_overshoot)
         while not kill_flag.get("done"):
             try:
                 procs = [parent, *parent.children(recursive=True)]
@@ -263,6 +286,8 @@ class Runner:
         env: Optional[dict[str, str]] = None,
         timeout: float = 300.0,
         weight: int = 1,
+        mem_limit_mb: Optional[int] = None,
+        cpu_limit_sec: Optional[int] = None,
     ) -> dict[str, Any]:
         """Run `command` in a shell, return stdout/stderr/exit_code/killed_reason.
 
@@ -276,6 +301,15 @@ class Runner:
             of cores to pin to). Heavy commands (parallel pytest, builds)
             can pass weight=2 to reserve more capacity. Capped at
             max_concurrent.
+          mem_limit_mb: Optional per-call RLIMIT_AS override (and RSS-
+            overshoot threshold). Clamped to the Runner's instance
+            default — callers can request LESS memory than the global
+            default but never more (operator's HARES_MEM_LIMIT_MB is
+            the hard ceiling). Useful for right-sizing known-small
+            commands so failures surface earlier and the kill happens
+            at the intended budget instead of the system default.
+          cpu_limit_sec: Same idea for RLIMIT_CPU. Clamped to the
+            instance default.
 
         Returns:
           dict with keys: exit_code, stdout, stderr, killed_reason,
@@ -286,6 +320,19 @@ class Runner:
         if not command:
             raise ValueError("command must be non-empty")
         weight = max(1, min(int(weight), self._max_concurrent))
+
+        # Per-call resource overrides clamp DOWN to the operator's
+        # defaults — callers can ask for less, never more. Lets an
+        # agent right-size known-small commands without giving it the
+        # ability to exceed the operator's policy.
+        effective_mem_bytes: Optional[int] = None
+        if mem_limit_mb is not None:
+            requested = max(1, int(mem_limit_mb)) * 1024 * 1024
+            effective_mem_bytes = min(requested, self._mem_bytes)
+        effective_cpu_sec: Optional[int] = None
+        if cpu_limit_sec is not None:
+            requested_cpu = max(1, int(cpu_limit_sec))
+            effective_cpu_sec = min(requested_cpu, self._cpu_sec)
 
         # Pre-flight: rewrite known overcommit patterns BEFORE spawning.
         rewrite_notice = ""
@@ -342,7 +389,11 @@ class Runner:
                     stderr=asyncio.subprocess.PIPE,
                     cwd=None,
                     env=child_env,
-                    preexec_fn=self._make_preexec(pinned_cores),
+                    preexec_fn=self._make_preexec(
+                        pinned_cores,
+                        mem_bytes=effective_mem_bytes,
+                        cpu_sec=effective_cpu_sec,
+                    ),
                 )
             else:
                 proc = await asyncio.create_subprocess_shell(
@@ -351,11 +402,17 @@ class Runner:
                     stderr=asyncio.subprocess.PIPE,
                     cwd=cwd,
                     env=child_env,
-                    preexec_fn=self._make_preexec(pinned_cores),
+                    preexec_fn=self._make_preexec(
+                        pinned_cores,
+                        mem_bytes=effective_mem_bytes,
+                        cpu_sec=effective_cpu_sec,
+                    ),
                 )
 
             kill_flag: dict[str, Any] = {}
-            monitor = asyncio.create_task(self._monitor_rss(proc.pid, kill_flag))
+            monitor = asyncio.create_task(self._monitor_rss(
+                proc.pid, kill_flag, mem_bytes=effective_mem_bytes,
+            ))
             try:
                 stdout, stderr = await asyncio.wait_for(
                     proc.communicate(), timeout=timeout,

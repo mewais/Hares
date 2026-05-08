@@ -146,6 +146,31 @@ def _build_server(
                             ),
                             "minimum": 1,
                         },
+                        "mem_limit_mb": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": (
+                                "Per-call RLIMIT_AS override (MB). RIGHT-SIZE THIS — "
+                                "small inspection commands (ls, cat, grep) need 64-256 MB; "
+                                "test runs and small builds 1024-4096 MB; large compiles "
+                                "or simulators 8192+ MB. Clamped to HARES_MEM_LIMIT_MB "
+                                "(operator hard ceiling). Setting it lower means the "
+                                "kernel kill fires earlier if the command unexpectedly "
+                                "balloons — better debugging signal than letting it "
+                                "consume the global default. Defaults to HARES_MEM_LIMIT_MB."
+                            ),
+                        },
+                        "cpu_limit_sec": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": (
+                                "Per-call RLIMIT_CPU override (seconds of CPU time, "
+                                "not wall-clock — see 'timeout' for that). Clamped to "
+                                "HARES_CPU_LIMIT_SEC. Use a tight value for inspection "
+                                "commands so a runaway loop dies via SIGXCPU instead of "
+                                "the wall-clock fallback. Defaults to HARES_CPU_LIMIT_SEC."
+                            ),
+                        },
                     },
                     "required": ["command"],
                 },
@@ -164,6 +189,8 @@ def _build_server(
                 env=arguments.get("env"),
                 timeout=float(arguments.get("timeout", 300.0)),
                 weight=int(arguments.get("weight", 1)),
+                mem_limit_mb=arguments.get("mem_limit_mb"),
+                cpu_limit_sec=arguments.get("cpu_limit_sec"),
             )
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
         if name in restrict_handlers:

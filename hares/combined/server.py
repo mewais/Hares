@@ -109,7 +109,8 @@ def _build_server(
             "Run a shell command under Hares's resource caps + bwrap "
             "sandbox. The bwrap mount list narrows to the active scope "
             "(set via restrict_paths); subprocess writes outside "
-            "the scope are kernel-rejected."
+            "the scope are kernel-rejected. Per-call mem_limit_mb / "
+            "cpu_limit_sec override the operator defaults (clamped down)."
         ),
         inputSchema={
             "type": "object",
@@ -122,6 +123,20 @@ def _build_server(
                 },
                 "timeout": {"type": "number"},
                 "weight": {"type": "integer", "minimum": 1},
+                "mem_limit_mb": {
+                    "type": "integer", "minimum": 1,
+                    "description": (
+                        "Per-call RLIMIT_AS override (MB). Right-size for "
+                        "the command — clamped to HARES_MEM_LIMIT_MB."
+                    ),
+                },
+                "cpu_limit_sec": {
+                    "type": "integer", "minimum": 1,
+                    "description": (
+                        "Per-call RLIMIT_CPU override (CPU seconds, not "
+                        "wall-clock). Clamped to HARES_CPU_LIMIT_SEC."
+                    ),
+                },
             },
             "required": ["command"],
         },
@@ -163,6 +178,8 @@ def _build_server(
                 env=arguments.get("env"),
                 timeout=float(arguments.get("timeout", 300.0)),
                 weight=int(arguments.get("weight", 1)),
+                mem_limit_mb=arguments.get("mem_limit_mb"),
+                cpu_limit_sec=arguments.get("cpu_limit_sec"),
             )
         elif kind == "restrict":
             result = await handler(arguments)

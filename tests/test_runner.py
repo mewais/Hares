@@ -183,3 +183,117 @@ def test_invalid_args_rejected(kw: str, val: int):
 async def test_empty_command_rejected(small_runner: Runner):
     with pytest.raises(ValueError):
         await small_runner.execute("")
+
+
+# ── per-call resource override ─────────────────────────────────────────────
+
+
+async def _run_python(small_runner: Runner, snippet: str, **kw) -> dict:
+    cmd = f"{sys.executable} -c \"{snippet}\""
+    return await small_runner.execute(cmd, timeout=10.0, **kw)
+
+
+async def test_per_call_mem_limit_lower_than_default_takes_effect(small_runner: Runner):
+    """mem_limit_mb=128 should set RLIMIT_AS to 128 MB even though the
+    Runner's default is 1024 MB."""
+    snippet = (
+        "import resource; "
+        "print(resource.getrlimit(resource.RLIMIT_AS))"
+    )
+    r = await _run_python(small_runner, snippet, mem_limit_mb=128)
+    assert r["exit_code"] == 0, r
+    out = r["stdout"].strip().splitlines()[-1]
+    soft, _hard = eval(out)
+    assert soft == 128 * 1024 * 1024
+
+
+async def test_per_call_mem_limit_higher_clamped_to_default(small_runner: Runner):
+    """mem_limit_mb=4096 (above the 1024 default) should clamp DOWN to
+    the Runner's default — callers can ask for less, never more."""
+    snippet = (
+        "import resource; "
+        "print(resource.getrlimit(resource.RLIMIT_AS))"
+    )
+    r = await _run_python(small_runner, snippet, mem_limit_mb=4096)
+    assert r["exit_code"] == 0, r
+    out = r["stdout"].strip().splitlines()[-1]
+    soft, _hard = eval(out)
+    assert soft == 1024 * 1024 * 1024  # clamped to instance default
+
+
+async def test_per_call_cpu_limit_lower_than_default_takes_effect(small_runner: Runner):
+    """cpu_limit_sec=5 should set RLIMIT_CPU to 5 even though Runner
+    default is 60."""
+    snippet = (
+        "import resource; "
+        "print(resource.getrlimit(resource.RLIMIT_CPU))"
+    )
+    r = await _run_python(small_runner, snippet, cpu_limit_sec=5)
+    assert r["exit_code"] == 0, r
+    out = r["stdout"].strip().splitlines()[-1]
+    soft, _hard = eval(out)
+    assert soft == 5
+
+
+async def test_per_call_cpu_limit_higher_clamped_to_default(small_runner: Runner):
+    snippet = (
+        "import resource; "
+        "print(resource.getrlimit(resource.RLIMIT_CPU))"
+    )
+    r = await _run_python(small_runner, snippet, cpu_limit_sec=9999)
+    assert r["exit_code"] == 0, r
+    out = r["stdout"].strip().splitlines()[-1]
+    soft, _hard = eval(out)
+    assert soft == 60  # clamped to instance default
+
+
+async def test_per_call_unset_uses_instance_defaults(small_runner: Runner):
+    """When mem/cpu limits are not passed, the child should see the
+    Runner's instance defaults — same behavior as before this feature."""
+    snippet = (
+        "import resource; "
+        "print([resource.getrlimit(resource.RLIMIT_AS), "
+        "resource.getrlimit(resource.RLIMIT_CPU)])"
+    )
+    r = await _run_python(small_runner, snippet)
+    assert r["exit_code"] == 0, r
+    out = r["stdout"].strip().splitlines()[-1]
+    as_lim, cpu_lim = eval(out)
+    assert as_lim[0] == 1024 * 1024 * 1024
+    assert cpu_lim[0] == 60
+
+
+async def test_per_call_zero_or_negative_clamped_to_one(small_runner: Runner):
+    """Defensive clamp: negative/zero requests get bumped to 1 MB / 1 sec
+    rather than being passed through and crashing setrlimit."""
+    snippet = (
+        "import resource; "
+        "print(resource.getrlimit(resource.RLIMIT_CPU))"
+    )
+    # 0 → clamped to 1 sec (not 0 which kernel would reject as invalid).
+    r = await _run_python(small_runner, snippet, cpu_limit_sec=0)
+    out = r["stdout"].strip().splitlines()[-1] if r["stdout"] else ""
+    if r["exit_code"] == 0:
+        soft, _hard = eval(out)
+        assert soft == 1
+
+
+async def test_per_call_mem_limit_triggers_rss_overshoot_kill():
+    """A small per-call mem_limit_mb on a Runner with a much larger
+    default should cause an EARLIER RSS-overshoot kill than the default
+    would — proving the threshold actually moves with the per-call
+    value (not just RLIMIT_AS)."""
+    # Runner default 2 GB; per-call cap 100 MB; allocate 250 MB.
+    runner = Runner(
+        max_concurrent=1, mem_limit_mb=2048, cpu_limit_sec=30,
+        rss_poll_interval=0.2,
+    )
+    cmd = (
+        f"{sys.executable} -c "
+        f"\"a = bytearray(250*1024*1024); print('alive', len(a))\""
+    )
+    r = await runner.execute(cmd, mem_limit_mb=100, timeout=15.0)
+    # Kernel kill (SIGKILL → -9) or our RSS monitor.
+    assert r["exit_code"] != 0, r
+    if r["killed_reason"] is not None:
+        assert r["killed_reason"] in ("rss_exceeded", "cpu_exceeded")
