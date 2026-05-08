@@ -46,9 +46,80 @@ Hares is also an **importable Python library** — your test runners, CI scripts
 - You want HPC cluster access from agents without handing them the cluster.
 - You're tired of "the agent ran `rm -rf` somewhere it shouldn't have" being a thing that can happen.
 
+## Try it (3 paths)
+
+Pick the one that matches your setup. Each is a few minutes to wire up and reversible in one line.
+
+**Claude Code user?** Hares slots in as an MCP server. Native `Read` / `Write` / `Edit` / `Glob` / `Grep` keep working unchanged — only shell is routed through Hares for the kernel-enforced sandbox + resource caps. Two small config files, fully reversible.
+→ [Claude Code setup](#claude-code-lose-nothing-gain-a-lot)
+
+**Already using an MCP filesystem (Cline, Roo Code, Continue, custom Anthropic SDK app)?** You're already paying MCP cost for fs ops. Swapping to Hares is free at that point and gains you kernel-enforced scope plus defense against the [CVE-2025-53109](https://nvd.nist.gov/vuln/detail/CVE-2025-53109) / [53110](https://nvd.nist.gov/vuln/detail/CVE-2025-53110) class of path-validation bugs.
+→ [Drop-in for existing MCP filesystem servers](#drop-in-for-existing-mcp-filesystem-servers)
+
+**Building a custom agent in Python?** Import the engine directly, skip the MCP layer entirely. Same kernel-enforced caps; one shared concurrency budget with any MCP-side Hares instances via `HARES_COORDINATION_DIR`.
+→ [Python library usage](#python-library-usage)
+
 ---
 
-## Use with Claude Code (lose nothing, gain a lot)
+## Table of contents
+
+- [Quick start](#quick-start) · [Integrations](#integrations) · [Python library usage](#python-library-usage)
+- [CLI reference](#cli-reference) · [Tool surface](#tool-surface) · [Env var reference](#env-var-reference)
+- [System-dir policy](#system-dir-policy) · [Cross-process coordination](#cross-process-coordination)
+- [Active scope and `restrict_paths`](#active-scope-and-restrict_paths) · [bwrap mechanics](#bwrap-mechanics)
+- [Multi-instance use under flat-namespace registries](#multi-instance-use-under-flat-namespace-registries)
+- [Threat model](#threat-model) · [Quirks and edge cases](#quirks-and-edge-cases)
+- [Project status](#project-status) · [Contributing](#contributing) · [License](#license)
+
+---
+
+## Quick start
+
+```sh
+pip install hares
+```
+
+```sh
+# Shell guard — resource-capped, bwrap-sandboxed execute_command:
+HARES_FS_CEILING=/work/proj hares-mcp
+
+# Filesystem MCP, read-write under /work/proj:
+HARES_FS_CEILING=/work/proj hares-mcp --enable=fs
+
+# Filesystem MCP, read-only (observe-only, no write tools registered):
+HARES_FS_CEILING=/work/proj hares-mcp --enable=fs --read-only
+
+# Shell + FS in one process, shared active scope, scoped tool names,
+# state persisted across restarts:
+HARES_FS_CEILING=/work/proj hares-mcp \
+  --enable=fs+shell \
+  --scope-id=agent_x \
+  --state-file=/tmp/hares-state-agent_x.json
+
+# Two instances coexisting under a flat-namespace MCP registry
+# (unique scope-ids prevent tool name collisions):
+hares-mcp --enable=fs --scope-id=src         --ceiling=/work/proj &
+hares-mcp --enable=fs --scope-id=unit_tests  --ceiling=/work/proj &
+
+# LSF cluster execution — submit jobs, poll, cancel (no ceiling required):
+HARES_LSF_QUEUE=gpu hares-mcp --enable=lsf --scope-id=cluster
+
+# SLURM cluster execution — same surface, different scheduler:
+HARES_SLURM_PARTITION=gpu hares-mcp --enable=slurm --scope-id=cluster
+```
+
+> **Non-Linux / container without user namespaces?** Set
+> `HARES_SANDBOX_DISABLED=1` to skip bwrap. Shell `--read-only` and
+> kernel scope enforcement won't apply, but resource caps and concurrency
+> throttling still work.
+
+---
+
+## Integrations
+
+Hares plugs into the major MCP-aware coding agents and orchestrators. Each subsection below is independent — pick the one that matches your setup. All are fully reversible: drop the deny rules / config block and you're back to the agent's defaults.
+
+### Claude Code (lose nothing, gain a lot)
 
 Drop Hares into your Claude Code setup with two small config files. **You lose nothing** — Claude Code's native `Read` / `Write` / `Edit` / `Glob` / `Grep` keep working unchanged, with zero MCP round-trip latency and zero extra tokens spent on tool schemas. Only shell execution is swapped, which is also where every "Claude broke my dev box" story comes from.
 
@@ -59,8 +130,6 @@ What you gain:
 - 🪢 **Cross-session concurrency cap** — N parallel Claude windows share **one** subprocess budget instead of N independent ones. Five Claude sessions with `HARES_MAX_CONCURRENT=6` run six commands total, not thirty.
 - 🛰️ **HPC cluster access from inside Claude** — submit, poll, and cancel LSF or SLURM jobs without giving Claude a shell on the cluster head node. Each job's `resource_spec` is right-sized by Claude per submission.
 - 🎯 **Mid-session scope narrowing** — call `restrict_paths(['lib/parser'])` to shrink Claude's writable surface to one directory for the rest of the session. No edit anywhere else can succeed, kernel-enforced.
-
-### Setup (3 minutes, fully reversible)
 
 **1. Register Hares in `.mcp.json`** (project root) or `~/.claude.json` (user-wide):
 
@@ -116,7 +185,7 @@ That's it. Cost: ~50–100 ms per shell call vs native (MCP round-trip). Reversi
 
 > **Multi-session bonus:** add `"HARES_COORDINATION_DIR": "/tmp/hares-claude"` to the env block and every Claude window using this config will share **one** concurrency cap. No coordination needed in your prompts; the kernel does it.
 
-### Maximum security mode: route filesystem through Hares too
+### Claude Code — maximum security mode (route filesystem through Hares too)
 
 The default setup above keeps Claude's native file tools because for most users the latency and token cost aren't worth it. **For some users they absolutely are.** If any of these is true, swap the filesystem layer too:
 
@@ -166,9 +235,7 @@ Add a one-liner to `CLAUDE.md` so Claude knows to reach for the MCP file tools (
 
 > Note: `Glob` and `Grep` aren't routed by Hares (they're search tools, not write tools, and the threat model doesn't require it). Leave them allowed; you keep fast filesystem search.
 
----
-
-## Already using an MCP filesystem? Swap to Hares.
+### Drop-in for existing MCP filesystem servers
 
 If your agent setup (Cline, Roo Code, Continue, custom Anthropic SDK app, OpenHands, anything else) is already plugging in `@modelcontextprotocol/server-filesystem` or a fork of it — **you're already paying the MCP latency and token cost.** Swapping to Hares' fs is free at that point and gains you:
 
@@ -199,92 +266,6 @@ Drop-in replacement in your agent's MCP config:
 ```
 
 Add `--read-only` if the agent only needs to observe. Add `--scope-id=<name>` if you're running multiple Hares instances behind a flat-namespace MCP gateway.
-
----
-
-## Table of contents
-
-- [Use with Claude Code](#use-with-claude-code-lose-nothing-gain-a-lot) · [Already using an MCP filesystem? Swap to Hares.](#already-using-an-mcp-filesystem-swap-to-hares) · [Quick start](#quick-start) · [Python library usage](#python-library-usage) · [CLI reference](#cli-reference) · [Tool surface](#tool-surface)
-- [Env var reference](#env-var-reference) · [System-dir policy](#system-dir-policy) · [Cross-process coordination](#cross-process-coordination)
-- [Active scope and `restrict_paths`](#active-scope-and-restrict_paths) · [bwrap mechanics](#bwrap-mechanics)
-- [Multi-instance use under flat-namespace registries](#multi-instance-use-under-flat-namespace-registries)
-- [Threat model](#threat-model) · [Quirks and edge cases](#quirks-and-edge-cases)
-- [Project status](#project-status) · [Contributing](#contributing) · [License](#license)
-
----
-
-## Overview
-
-Every Hares instance has a single **role**: limit what an MCP-using LLM
-can do under a specific budget (filesystem reach, write authority,
-subprocess resource consumption, cluster job access). One binary covers
-the role for all three tool families:
-
-```
-hares-mcp \
-  --enable {shell, fs, fs+shell, lsf, slurm}  # which tool family to expose
-  [--scope-id <id>]                    # tool-name prefix; scope identifier
-  --ceiling <path>                     # outer bound; required for shell/fs (CLI or env)
-  [--read-only]                        # observe-only mode
-  [--state-file <path>]                # persist active scope across restarts
-```
-
-A Hares instance can therefore be:
-
-* a **shell guard** for inspection-class or build commands,
-* a **filesystem guard** with a per-scope writable view,
-* both at once with **one shared scope** (`fs+shell`), so a single
-  `restrict_paths(['lib/parser'])` call narrows both layers together,
-* a **cluster job interface** (`lsf` or `slurm`) for submitting jobs
-  to an HPC scheduler, polling status, and collecting output — without
-  touching the local machine's resource budget.
-
-The same surface — flags, restrict tools, ceiling semantics — is the
-right one whether you're deploying Hares standalone, plugging it into
-an MCP gateway, or running multiple instances under a workflow
-orchestrator.
-
----
-
-## Quick start
-
-```sh
-pip install hares
-```
-
-```sh
-# Shell guard — resource-capped, bwrap-sandboxed execute_command:
-HARES_FS_CEILING=/work/proj hares-mcp
-
-# Filesystem MCP, read-write under /work/proj:
-HARES_FS_CEILING=/work/proj hares-mcp --enable=fs
-
-# Filesystem MCP, read-only (observe-only, no write tools registered):
-HARES_FS_CEILING=/work/proj hares-mcp --enable=fs --read-only
-
-# Shell + FS in one process, shared active scope, scoped tool names,
-# state persisted across restarts:
-HARES_FS_CEILING=/work/proj hares-mcp \
-  --enable=fs+shell \
-  --scope-id=agent_x \
-  --state-file=/tmp/hares-state-agent_x.json
-
-# Two instances coexisting under a flat-namespace MCP registry
-# (unique scope-ids prevent tool name collisions):
-hares-mcp --enable=fs --scope-id=src         --ceiling=/work/proj &
-hares-mcp --enable=fs --scope-id=unit_tests  --ceiling=/work/proj &
-
-# LSF cluster execution — submit jobs, poll, cancel (no ceiling required):
-HARES_LSF_QUEUE=gpu hares-mcp --enable=lsf --scope-id=cluster
-
-# SLURM cluster execution — same surface, different scheduler:
-HARES_SLURM_PARTITION=gpu hares-mcp --enable=slurm --scope-id=cluster
-```
-
-> **Non-Linux / container without user namespaces?** Set
-> `HARES_SANDBOX_DISABLED=1` to skip bwrap. Shell `--read-only` and
-> kernel scope enforcement won't apply, but resource caps and concurrency
-> throttling still work.
 
 ---
 
