@@ -36,9 +36,10 @@ def test_help_works():
 
 
 def test_version_works():
+    from hares import __version__
     rc, out = _run(["--version"])
     assert rc == 0
-    assert "0.3" in out
+    assert __version__ in out
 
 
 def test_missing_ceiling_fails(tmp_path, monkeypatch):
