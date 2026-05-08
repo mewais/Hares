@@ -1,50 +1,61 @@
-# Hares (حارس)
+# Hares - حَارِس
 
-**Guard MCP server for multi-agent LLM workflows.**
+> **The kernel-enforced guard for multi-agent LLM workflows.**
+> One binary stands between your LLM agents and your machine — capping what they can run, how much they can consume, and where they can write.
 
-When you run multiple LLM agents in parallel — each with shell execution and filesystem
-access — you need something between them and the host. Without limits, one agent's test
-run can OOM the machine, a runaway build saturates every CPU core, and nothing stops an
-agent from writing outside the paths you intended. Automated LLM flows also raise the
-security bar: agents should operate in a constrained, auditable environment, not with the
-same permissions as the operator.
+[![PyPI](https://img.shields.io/pypi/v/hares.svg)](https://pypi.org/project/hares/)
+[![Python](https://img.shields.io/pypi/pyversions/hares.svg)](https://pypi.org/project/hares/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-linux-lightgrey.svg)]()
 
-Hares puts a kernel-enforced guard on every tool call:
+---
 
-- **bwrap mount namespace** — agents physically cannot write outside their declared scope;
-  the kernel rejects it, no policy to bypass
-- **`RLIMIT_AS` / `RLIMIT_CPU`** — per-subprocess memory and CPU caps, kernel-enforced
-- **Wall-clock timeouts + global concurrency semaphore** — N parallel agents share one
-  cap; no single agent starves the rest
-- **Runtime scope narrowing** — an operator or orchestrator calls `restrict_paths` to
-  narrow what each agent can touch, down to the directory level
-- **LSF cluster execution** — offload heavy jobs (simulators, large builds) to an HPC
-  cluster; agents submit, poll, and cancel without touching the local machine
+## Why Hares exists
 
-One binary. Three tool families. Uniform scope semantics across all of them.
+The moment you let LLM agents touch a real shell — and especially the moment you run several at once with a human mostly out of the loop — three things break:
 
-Hares is also a **Python library** — non-LLM code (test runners, CI, framework
-code) can import the same engine and get the same kernel-enforced caps without
-an MCP wrapper. Both surfaces honor `HARES_COORDINATION_DIR`, so library
-callers and MCP servers share one global concurrency cap.
+**1. Every agent thinks it owns the machine.**
+Spin up five parallel agents and each one happily forks a `pytest -j$(nproc)`, a `cargo build --release`, or a `make -j`. None of them know the others exist. Your box becomes a space heater, the OOM killer starts making decisions for you, and the "concurrent agents" dream collapses into one big serial queue of crashes.
+
+**2. The dev box can't run the heavy stuff.**
+Simulators, large synthesis runs, big builds — they belong on the cluster, not your laptop. But you don't want agents shelling onto LSF head nodes, juggling `bsub` flags, or leaving zombie jobs behind every time a session crashes.
+
+**3. "Please don't write outside this directory" isn't a security policy.**
+It's a suggestion. With humans out of the loop, your isolation is only as strong as the kernel makes it — not as strong as your prompt asks for it.
+
+Hares fixes all three at the layer where it actually matters: the kernel.
+
+## What Hares does
+
+| | |
+|---|---|
+| **bwrap mount namespace** | Agents *physically cannot* write outside their declared scope. The kernel rejects it — no policy to argue with, no jailbreak prompt that helps. |
+| **`RLIMIT_AS` + `RLIMIT_CPU` + wall-clock timeout** | Every subprocess is memory-, CPU-, and time-capped at the kernel level. A runaway agent burns its allotment and dies; the host stays alive. |
+| **Global concurrency semaphore** | N parallel Hares processes share **one** subprocess cap and **one** core-pool allocator. Five agents with a budget of six subprocesses run six total — not thirty. |
+| **Runtime scope narrowing** | An orchestrator calls `restrict_paths(['lib/parser'])` mid-session to shrink an agent's writable surface to a single subdirectory. Both the fs validator and the bwrap mount list re-arm together. |
+| **LSF cluster bridge** | Submit, poll, cancel HPC jobs from MCP. No one gets a shell on the cluster; jobs are tracked per-session and reaped on disconnect. |
+
+**One binary**, **three tool families** (`shell`, `fs`, `lsf`), **uniform scope semantics** across all of them.
+
+Hares is also an **importable Python library** — your test runners, CI scripts, and framework code get the same kernel-enforced caps without going through MCP. Library callers and MCP servers share a single concurrency budget via `HARES_COORDINATION_DIR`, so a hybrid deploy of agents and static code can't blow past the host budget either.
+
+## Who this is for
+
+- You're building agentic systems that fan out across multiple LLM sessions and need them to coexist on one box.
+- You run automated LLM flows where a human isn't reviewing every tool call.
+- You want HPC cluster access from agents without handing them the cluster.
+- You're tired of "the agent ran `rm -rf` somewhere it shouldn't have" being a thing that can happen.
 
 ---
 
 ## Table of contents
 
-1. [Overview](#overview)
-2. [Quick start](#quick-start)
-3. [Python library usage](#python-library-usage)
-4. [CLI reference](#cli-reference)
-5. [Tool surface](#tool-surface)
-6. [Env var reference](#env-var-reference)
-7. [System-dir policy](#system-dir-policy)
-8. [Cross-process coordination](#cross-process-coordination)
-9. [Active scope and `restrict_paths`](#active-scope-and-restrict_paths)
-10. [bwrap mechanics](#bwrap-mechanics)
-11. [Multi-instance use under flat-namespace registries](#multi-instance-use-under-flat-namespace-registries)
-12. [Threat model](#threat-model)
-13. [Quirks and edge cases](#quirks-and-edge-cases)
+- [Quick start](#quick-start) · [Python library usage](#python-library-usage) · [CLI reference](#cli-reference) · [Tool surface](#tool-surface)
+- [Env var reference](#env-var-reference) · [System-dir policy](#system-dir-policy) · [Cross-process coordination](#cross-process-coordination)
+- [Active scope and `restrict_paths`](#active-scope-and-restrict_paths) · [bwrap mechanics](#bwrap-mechanics)
+- [Multi-instance use under flat-namespace registries](#multi-instance-use-under-flat-namespace-registries)
+- [Threat model](#threat-model) · [Quirks and edge cases](#quirks-and-edge-cases)
+- [Project status](#project-status) · [Contributing](#contributing) · [License](#license)
 
 ---
 
@@ -724,6 +735,16 @@ Resource governance for LSF jobs belongs in the `resource_spec` field (or
 
 ---
 
+## Project status
+
+Hares is **0.3.x — beta**. The MCP and Python-library APIs are stable enough to build on, but minor versions may still tweak env-var names and tool signatures. Pin the minor version in production.
+
+The bwrap, RLIMIT, and concurrency layers are tested on Linux (RHEL 8+, Ubuntu 20.04+, Fedora). LSF mode requires IBM Platform LSF (`bsub` / `bjobs` / `bkill` on `PATH`) and a shared filesystem visible to both submit and execute hosts.
+
+## Contributing
+
+Bug reports, feature requests, and PRs are all welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and the test workflow. Security issues — please email rather than file a public issue (details in CONTRIBUTING).
+
 ## License
 
-Apache-2.0.
+Apache-2.0. See [LICENSE](LICENSE).
