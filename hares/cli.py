@@ -58,6 +58,11 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
+            "Subcommands:\n"
+            "  hares-mcp doctor     Diagnose the local environment\n"
+            "                       (bwrap, user namespaces, deps, ceiling,\n"
+            "                       cluster binaries). Run this first when\n"
+            "                       something doesn't work.\n\n"
             "Backward compat: bare ``hares-mcp`` (no flags) preserves "
             "the 0.1 shell-only behavior with bwrap required by default "
             "(set HARES_SANDBOX_DISABLED=1 to opt out for non-Linux / "
@@ -237,6 +242,14 @@ def main(argv: Optional[list[str]] = None) -> None:
         format="%(asctime)s %(levelname)-5s hares: %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # Subcommands consumed before argparse so the existing flag-only surface
+    # stays intact for the bare 'hares-mcp' / 'hares-mcp --enable=...' case.
+    raw_argv = sys.argv[1:] if argv is None else argv
+    if raw_argv and raw_argv[0] == "doctor":
+        from .doctor import run as doctor_run
+        sys.exit(doctor_run(raw_argv[1:]))
+
     args = _parse_args(argv)
 
     scope_id = _validate_scope_id(args.scope_id)
