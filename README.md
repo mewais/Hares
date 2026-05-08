@@ -48,9 +48,163 @@ Hares is also an **importable Python library** — your test runners, CI scripts
 
 ---
 
+## Use with Claude Code (lose nothing, gain a lot)
+
+Drop Hares into your Claude Code setup with two small config files. **You lose nothing** — Claude Code's native `Read` / `Write` / `Edit` / `Glob` / `Grep` keep working unchanged, with zero MCP round-trip latency and zero extra tokens spent on tool schemas. Only shell execution is swapped, which is also where every "Claude broke my dev box" story comes from.
+
+What you gain:
+
+- 🛡️ **Kernel-enforced shell sandbox** — every command Claude runs goes through bwrap. No more wondering whether `rm -rf` could touch the wrong path; the kernel rejects writes outside the declared scope.
+- 🔥 **Resource caps that actually fire** — `RLIMIT_AS` + `RLIMIT_CPU` + RSS-overshoot kill stop a runaway `pytest -n auto` or `make -j$(nproc)` from OOM-ing your machine. Claude can still ask for too much; it just won't *get* too much.
+- 🪢 **Cross-session concurrency cap** — N parallel Claude windows share **one** subprocess budget instead of N independent ones. Five Claude sessions with `HARES_MAX_CONCURRENT=6` run six commands total, not thirty.
+- 🛰️ **HPC cluster access from inside Claude** — submit, poll, and cancel LSF or SLURM jobs without giving Claude a shell on the cluster head node. Each job's `resource_spec` is right-sized by Claude per submission.
+- 🎯 **Mid-session scope narrowing** — call `restrict_paths(['lib/parser'])` to shrink Claude's writable surface to one directory for the rest of the session. No edit anywhere else can succeed, kernel-enforced.
+
+### Setup (3 minutes, fully reversible)
+
+**1. Register Hares in `.mcp.json`** (project root) or `~/.claude.json` (user-wide):
+
+```json
+{
+  "mcpServers": {
+    "hares": {
+      "command": "hares-mcp",
+      "args": ["--enable=shell", "--scope-id=hares"],
+      "env": {
+        "HARES_FS_CEILING": "/path/to/your/project",
+        "HARES_MAX_CONCURRENT": "2",
+        "HARES_MEM_LIMIT_MB": "8000",
+        "HARES_CPU_LIMIT_SEC": "1800"
+      }
+    },
+    "hares-slurm": {
+      "command": "hares-mcp",
+      "args": ["--enable=slurm", "--scope-id=hpc"],
+      "env": { "HARES_SLURM_PARTITION": "your-partition" }
+    }
+  }
+}
+```
+
+(Drop the `hares-slurm` block if you don't have a cluster. Swap `slurm` → `lsf` and `HARES_SLURM_PARTITION` → `HARES_LSF_QUEUE` for LSF.)
+
+**2. Deny native Bash in `.claude/settings.json`** so Claude is forced to use Hares for shell:
+
+```json
+{
+  "permissions": {
+    "deny":  ["Bash"],
+    "allow": ["mcp__hares__*", "mcp__hares-slurm__*"]
+  }
+}
+```
+
+**3. Point Claude at the alternative in `CLAUDE.md`:**
+
+```md
+## Shell execution
+Native Bash is denied. Use `mcp__hares__hares_execute_command` for all
+shell work — it gives you bwrap sandbox + RLIMIT + a global concurrency
+cap shared across any other Claude session running in parallel.
+
+For HPC jobs use `mcp__hares-slurm__hpc_slurm_*` (or `mcp__hares-lsf__*`
+if your cluster uses LSF). Right-size each job's `resource_spec` —
+small asks queue faster.
+```
+
+That's it. Cost: ~50–100 ms per shell call vs native (MCP round-trip). Reversible in one line — drop `"Bash"` from `deny` and you're back to native instantly.
+
+> **Multi-session bonus:** add `"HARES_COORDINATION_DIR": "/tmp/hares-claude"` to the env block and every Claude window using this config will share **one** concurrency cap. No coordination needed in your prompts; the kernel does it.
+
+### Maximum security mode: route filesystem through Hares too
+
+The default setup above keeps Claude's native file tools because for most users the latency and token cost aren't worth it. **For some users they absolutely are.** If any of these is true, swap the filesystem layer too:
+
+- 🔐 **Claude is touching sensitive paths** (production configs, customer data, SSH keys, anything with consequences). The native file tools enforce paths at the policy layer; Hares enforces them at the *kernel* layer. Different threat model, different defense weight.
+- 🤖 **You're running Claude unattended** (CI loops, automated PR review, scheduled tasks, autonomous agents). When a human isn't reviewing every tool call, you need guardrails the LLM can't talk its way around. Prompt injection becomes a real concern; only the kernel ignores prompts.
+- 🏢 **Multi-tenant or shared box** where another user's files are reachable from Claude's process. Hares' bwrap mount namespace makes those paths *invisible* to the subprocess, not just denied.
+- 🎯 **You want `restrict_paths` to actually restrict edits, not just shell.** With native fs tools, narrowing the scope mid-session only tightens shell commands; Claude's `Edit` and `Write` ignore it. With Hares fs, one `restrict_paths(['lib/parser'])` call locks BOTH layers.
+- 🧱 **You've been bitten by the CVE-2025-53109 / 53110 class** (symlink escape, prefix-match bypass) in another MCP filesystem server. Hares canonicalizes paths and validates against the resolved tree, not the input string.
+
+**Cost is real and you should know it:**
+- ~5–10K extra prompt tokens for the 12 filesystem tool schemas (paid once per session, then cached).
+- ~50–100 ms per file op, same as the shell case.
+- Claude Code's inline diff renderer doesn't trigger for MCP edits — you'll see JSON tool output instead of the pretty side-by-side view.
+
+If those costs are worth the kernel-enforced filesystem boundary for your use case, the swap is two edits:
+
+**1. Switch the Hares server to `fs+shell`** (one shared scope across both layers):
+
+```json
+{
+  "mcpServers": {
+    "hares": {
+      "command": "hares-mcp",
+      "args": ["--enable=fs+shell", "--scope-id=hares"],
+      "env": {
+        "HARES_FS_CEILING": "/path/to/your/project",
+        "HARES_MAX_CONCURRENT": "2",
+        "HARES_MEM_LIMIT_MB": "8000"
+      }
+    }
+  }
+}
+```
+
+**2. Deny native file tools** in `.claude/settings.json` (in addition to `Bash`):
+
+```json
+{
+  "permissions": {
+    "deny":  ["Bash", "Read", "Write", "Edit"],
+    "allow": ["mcp__hares__*"]
+  }
+}
+```
+
+Add a one-liner to `CLAUDE.md` so Claude knows to reach for the MCP file tools (`hares_read_file`, `hares_write_file`, `hares_edit_file`, etc.). Same reversibility — remove the deny entries to get the native tools back.
+
+> Note: `Glob` and `Grep` aren't routed by Hares (they're search tools, not write tools, and the threat model doesn't require it). Leave them allowed; you keep fast filesystem search.
+
+---
+
+## Already using an MCP filesystem? Swap to Hares.
+
+If your agent setup (Cline, Roo Code, Continue, custom Anthropic SDK app, OpenHands, anything else) is already plugging in `@modelcontextprotocol/server-filesystem` or a fork of it — **you're already paying the MCP latency and token cost.** Swapping to Hares' fs is free at that point and gains you:
+
+- **Kernel-enforced scope** instead of policy-layer path validation. The reference filesystem MCP and most forks have shipped CVEs in this class ([CVE-2025-53109 symlink escape](https://nvd.nist.gov/vuln/detail/CVE-2025-53109), [CVE-2025-53110 prefix-match bypass](https://nvd.nist.gov/vuln/detail/CVE-2025-53110)) because path-string validation is brittle. Hares canonicalizes via the kernel's own resolver and rejects what doesn't resolve under the ceiling — no string-prefix logic to bypass.
+- **One shared scope across fs and shell** if you also run `--enable=fs+shell`. A single `restrict_paths` call narrows both layers; an agent with both can't use the shell to escape the fs scope.
+- **Cross-process concurrency cap** when you run multiple agents — set `HARES_COORDINATION_DIR` and N agents share one budget.
+- **Same tool surface** as the reference server (`read_file`, `write_file`, `edit_file`, `list_directory`, `search_files`, `get_file_info`, etc.) — your agent's existing prompts and tool-use patterns keep working.
+
+Drop-in replacement in your agent's MCP config:
+
+```jsonc
+// before:
+{
+  "filesystem": {
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/project"]
+  }
+}
+
+// after:
+{
+  "hares-fs": {
+    "command": "hares-mcp",
+    "args": ["--enable=fs"],
+    "env": { "HARES_FS_CEILING": "/path/to/project" }
+  }
+}
+```
+
+Add `--read-only` if the agent only needs to observe. Add `--scope-id=<name>` if you're running multiple Hares instances behind a flat-namespace MCP gateway.
+
+---
+
 ## Table of contents
 
-- [Quick start](#quick-start) · [Python library usage](#python-library-usage) · [CLI reference](#cli-reference) · [Tool surface](#tool-surface)
+- [Use with Claude Code](#use-with-claude-code-lose-nothing-gain-a-lot) · [Already using an MCP filesystem? Swap to Hares.](#already-using-an-mcp-filesystem-swap-to-hares) · [Quick start](#quick-start) · [Python library usage](#python-library-usage) · [CLI reference](#cli-reference) · [Tool surface](#tool-surface)
 - [Env var reference](#env-var-reference) · [System-dir policy](#system-dir-policy) · [Cross-process coordination](#cross-process-coordination)
 - [Active scope and `restrict_paths`](#active-scope-and-restrict_paths) · [bwrap mechanics](#bwrap-mechanics)
 - [Multi-instance use under flat-namespace registries](#multi-instance-use-under-flat-namespace-registries)
