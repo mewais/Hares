@@ -42,6 +42,12 @@ UNKWN = "UNKWN"
 
 TERMINAL = frozenset({DONE, EXIT})
 
+# In-memory job-record retention cap. Once exceeded, oldest TERMINAL
+# records are evicted FIFO; PEND/RUN are never evicted. Module-level
+# constant — not exposed as an env var until someone files an issue
+# saying 1000 is the wrong number for their workload.
+MAX_RETAINED_JOBS = 1000
+
 
 @dataclass
 class JobSpec:
@@ -137,6 +143,10 @@ class ClusterExecutor(abc.ABC):
         self._ceiling = ceiling
         self._lock = asyncio.Lock()
         self._jobs: dict[str, JobRecord] = {}
+        # Tracks job_ids that were retained-job-cap evicted, so wait()
+        # can return a useful "this finished but we threw away the
+        # result" entry instead of "never heard of it".
+        self._evicted_ids: set[str] = set()
         cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Hooks backends MUST implement ───────────────────────────────────────
@@ -257,6 +267,41 @@ class ClusterExecutor(abc.ABC):
             "stderr": stderr_content,
         }
 
+    def _maybe_evict_terminal(self) -> None:
+        """Evict oldest terminal job records when retention cap is exceeded.
+
+        Caller MUST hold ``self._lock``. Only TERMINAL records (DONE,
+        EXIT, CANCELED) are eligible — PEND/RUN are never evicted, so
+        a job stuck in queue forever can't be silently dropped from
+        the in-memory map.
+
+        Eviction order is FIFO of insertion (Python dict preserves it
+        from 3.7+). The evicted job_ids are remembered in
+        ``self._evicted_ids`` so a later wait() call can return a
+        useful "EVICTED" entry instead of "never heard of it".
+        """
+        cap = MAX_RETAINED_JOBS
+        if cap <= 0 or len(self._jobs) <= cap:
+            return
+        eligible = ("CANCELED",)  # in addition to the TERMINAL set
+        to_remove: list[str] = []
+        target_evictions = len(self._jobs) - cap
+        for jid, rec in self._jobs.items():
+            if rec.status in TERMINAL or rec.status in eligible:
+                to_remove.append(jid)
+                if len(to_remove) >= target_evictions:
+                    break
+        for jid in to_remove:
+            del self._jobs[jid]
+            self._evicted_ids.add(jid)
+        if to_remove:
+            logger.info(
+                "%s: evicted %d terminal job records "
+                "(cap=%d, retained=%d, evicted_total=%d)",
+                self.SCHEDULER_NAME, len(to_remove), cap,
+                len(self._jobs), len(self._evicted_ids),
+            )
+
     def _exitcode_file_terminal_status(self, exitcode_file: Path) -> str:
         """Helper for backends whose status query returns 'job no longer
         in queue'. Reads the exitcode file and returns DONE or EXIT.
@@ -373,6 +418,19 @@ class ClusterExecutor(abc.ABC):
         async with self._lock:
             for job_id in job_ids:
                 if job_id not in self._jobs:
+                    if job_id in self._evicted_ids:
+                        results[job_id] = {
+                            "job_id": job_id,
+                            "status": "EVICTED",
+                            "error": (
+                                f"Job {job_id!r} completed in this session but "
+                                f"its record was evicted to keep memory usage "
+                                f"bounded (retention cap: "
+                                f"{MAX_RETAINED_JOBS} jobs). Query the scheduler "
+                                f"directly for the final state."
+                            ),
+                        }
+                        continue
                     results[job_id] = {
                         "job_id": job_id,
                         "status": "ERROR",
@@ -449,6 +507,14 @@ class ClusterExecutor(abc.ABC):
                 if sleep_for > 0:
                     await asyncio.sleep(sleep_for)
 
+        # End-of-wait eviction: now that this batch's results are
+        # collected, drop the oldest terminal records if we're over
+        # cap. Doing it here (vs per-completion inside the loop)
+        # ensures eviction picks the truly oldest by submission order
+        # rather than the first one to complete.
+        async with self._lock:
+            self._maybe_evict_terminal()
+
         return results
 
     async def _poll_status(self, job_id: str) -> str:
@@ -485,6 +551,11 @@ class ClusterExecutor(abc.ABC):
                 "%s cancel %s: rc=%d msg=%r",
                 self.SCHEDULER_NAME, job_id, rc, msg,
             )
+        # End-of-cancel eviction (mirrors wait()): pick the oldest
+        # terminals by submission order instead of letting cancel order
+        # influence which records survive.
+        async with self._lock:
+            self._maybe_evict_terminal()
         return results
 
     async def jobs(self) -> list[dict[str, Any]]:
