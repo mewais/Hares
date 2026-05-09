@@ -253,10 +253,13 @@ def build_bwrap_argv(
             argv += ["--bind", cwd, cwd]
         argv += ["--chdir", cwd]
 
-    # HOME defaults to cwd (or /tmp) — many tools (pip, pytest cache,
-    # bash) probe $HOME and crash if it points outside the namespace.
-    home = cwd or "/tmp"
-    argv += ["--setenv", "HOME", home]
+    # Set HOME to the real user home dir. With --ro-bind / / as the base,
+    # the home dir is accessible read-only in the sandbox, so tools that
+    # probe $HOME (Python user site-packages, pip, git, bash history) find
+    # their config/cache at the expected paths. The old approach set HOME=cwd
+    # which caused Python to look for site-packages in the project directory.
+    real_home = os.path.expanduser("~")
+    argv += ["--setenv", "HOME", real_home]
 
     # Run the user's command via /bin/sh -c so shell features (pipes,
     # globs, redirects) keep working.

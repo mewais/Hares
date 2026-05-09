@@ -514,16 +514,27 @@ honored as an opt-out for older deploys.
 
 The sandbox starts from `--ro-bind / /` so only paths explicitly listed in
 `HARES_SANDBOX_RW` or `HARES_SANDBOX_RO` are writable (or additionally
-accessible when on a separate mount point). A minimal shell-rc setup:
+accessible when on a separate mount point). `HOME` is set to the real user
+home directory inside the sandbox, so `~`-relative paths work correctly for
+Python user site-packages, git config lookups, and pip cache resolution.
+
+A minimal shell-rc setup:
 
 ```bash
-# Read-only: compiler toolchain + locally installed user tools.
+# Read-only: compiler toolchain + locally installed user tools
+# (pip install --user, pipx, cargo, go, nvm, …).
 # $(realpath -m ...) avoids symlink issues on some distros.
 export HARES_SANDBOX_RO="/tool:$(realpath -m ~/.local)"
 
 # Read-write: git identity + pip/npm/cargo cache so network fetches
 # don't repeat every session.
 export HARES_SANDBOX_RW="$(realpath -m ~/.gitconfig):$(realpath -m ~/.cache)"
+
+# Optional — explicit overrides for tools that resolve paths from HOME.
+# Not required since HOME is set to the real home dir, but useful as
+# documentation of intent or to override cache locations.
+export PIP_CACHE_DIR="$(realpath -m ~/.cache/pip)"
+export GIT_CONFIG_GLOBAL="$(realpath -m ~/.gitconfig)"
 ```
 
 What to add based on your toolchain:
