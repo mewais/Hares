@@ -205,6 +205,14 @@ def build_bwrap_argv(
     # rest of the host FS accessible for writes — a silent hole.
     argv += ["--ro-bind", "/", "/"]
 
+    # On most Linux systems /var, /run, /proc, /sys, /dev are separate
+    # mount points not included in the root FS bind above. Explicitly
+    # bind the ones that exist so the namespace has the expected directory
+    # structure, then override specific ones below.
+    for _extra in ("/var", "/run", "/sys"):
+        if os.path.isdir(_extra):
+            argv += ["--ro-bind", _extra, _extra]
+
     # Standard kernel views — override the RO-bound /proc and /dev with
     # fresh instances appropriate for the new pid/ipc namespace.
     argv += ["--proc", "/proc"]
@@ -214,8 +222,13 @@ def build_bwrap_argv(
         argv += ["--size", str(cfg.tmp_size_mb * 1024 * 1024), "--tmpfs", "/tmp"]
     else:
         argv += ["--tmpfs", "/tmp"]
-    argv += ["--tmpfs", "/run"]
-    argv += ["--tmpfs", "/var/tmp"]
+    # /run: override the RO bind with a fresh tmpfs so daemons that
+    # write sockets/pids there don't fail.
+    if os.path.isdir("/run"):
+        argv += ["--tmpfs", "/run"]
+    # /var/tmp is intentionally omitted. With --ro-bind / / as the base,
+    # /var/tmp is RO (or accessible RO via the /var bind). That's fine —
+    # processes that need temp space should use /tmp.
 
     # HARES_SANDBOX_RO: explicit extra read-only binds. With the root
     # already RO these are redundant for most paths, but kept for
