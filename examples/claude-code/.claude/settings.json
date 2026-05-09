@@ -1,0 +1,6 @@
+{
+  "permissions": {
+    "deny": ["Bash"],
+    "allow": ["mcp__hares__*", "mcp__hares-slurm__*"]
+  }
+}

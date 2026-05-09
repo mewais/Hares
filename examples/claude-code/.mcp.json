@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "hares": {
+      "command": "hares-mcp",
+      "args": ["--enable=shell", "--scope-id=hares"],
+      "env": {
+        "HARES_FS_CEILING": "/path/to/your/project",
+        "HARES_MAX_CONCURRENT": "2",
+        "HARES_MEM_LIMIT_MB": "8000",
+        "HARES_CPU_LIMIT_SEC": "1800"
+      }
+    },
+    "hares-slurm": {
+      "command": "hares-mcp",
+      "args": ["--enable=slurm", "--scope-id=hpc"],
+      "env": {
+        "HARES_SLURM_PARTITION": "your-partition"
+      }
+    }
+  }
+}

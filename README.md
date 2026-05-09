@@ -60,6 +60,8 @@ Pick the one that matches your setup. Each is a few minutes to wire up and rever
 **Building a custom agent in Python?** Import the engine directly, skip the MCP layer entirely. Same kernel-enforced caps; one shared concurrency budget with any MCP-side Hares instances via `HARES_COORDINATION_DIR`.
 → [Python library usage](#python-library-usage)
 
+> Working configs and runnable scripts for all three paths live in [`examples/`](examples/) — copy and tweak.
+
 ---
 
 ## Table of contents
