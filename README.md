@@ -454,6 +454,19 @@ written to a separate file and read when the job completes — this
 works on SLURM clusters that don't have `slurmdbd` accounting
 enabled.
 
+**Job arrays.** Both backends accept an optional `array` field on the
+job spec for parameter sweeps. Native syntax per scheduler:
+
+| | SLURM | LSF |
+|---|---|---|
+| Array spec | `"1-100"`, `"1,3,5"`, `"0-99:2"`, `"1-100%5"` | `"1-100"`, `"1,3,5"`, `"1-100:2"` |
+| Per-task env var (visible in `command`) | `$SLURM_ARRAY_TASK_ID` | `$LSB_JOBINDEX` |
+
+A whole array is one Hares `job_id`; `wait` returns one entry whose
+`tasks` field is keyed by the per-task index, plus a `summary` count
+of `done` / `failed` / `unknown`. Aggregate `status` is `DONE` only
+when every task succeeded.
+
 > **Security note for cluster modes.** See
 > [Cluster modes — what does NOT apply](#cluster-modes--what-does-not-apply).
 > bwrap, RLIMIT, and active-scope enforcement do NOT extend to cluster

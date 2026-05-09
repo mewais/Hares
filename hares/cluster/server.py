@@ -145,6 +145,22 @@ def build_server(
                     "description": "Environment variable overrides exported inside the job.",
                     "additionalProperties": {"type": "string"},
                 },
+                "array": {
+                    "type": "string",
+                    "description": (
+                        "Submit a parameter sweep instead of a single job. "
+                        "Format mirrors the scheduler's native syntax:\n"
+                        "  - SLURM: '1-100' / '1,3,5' / '0-99:2' / '1-100%5' "
+                        "(the last limits concurrency to 5 simultaneous tasks). "
+                        "$SLURM_ARRAY_TASK_ID is set per task in the command's env.\n"
+                        "  - LSF: '1-100' / '1,3,5' / '1-100:2'. "
+                        "$LSB_JOBINDEX is set per task.\n"
+                        "The whole array is one Hares job_id; per-task results "
+                        "land in result['tasks'] keyed by the task id when "
+                        "you call wait. Use this for parameter sweeps "
+                        "instead of submitting N individual jobs."
+                    ),
+                },
             },
             "required": ["command"],
         }
@@ -277,6 +293,7 @@ def build_server(
                 name=arguments.get("name"),
                 cwd=arguments.get("cwd"),
                 env=arguments.get("env"),
+                array=arguments.get("array"),
             )
             timeout = float(
                 arguments.get("timeout_sec", executor._cfg.default_timeout_sec)
@@ -292,6 +309,7 @@ def build_server(
                     name=j.get("name"),
                     cwd=j.get("cwd"),
                     env=j.get("env"),
+                    array=j.get("array"),
                 )
                 for j in arguments["jobs"]
             ]

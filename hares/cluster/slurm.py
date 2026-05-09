@@ -98,6 +98,9 @@ class SlurmExecutor(ClusterExecutor):
     """Session-scoped SLURM job manager."""
 
     SCHEDULER_NAME = "slurm"
+    # SLURM uses %a for the array task index in --output= patterns;
+    # the inner shell substitutes ${SLURM_ARRAY_TASK_ID} at runtime.
+    ARRAY_TASK_PLACEHOLDER = "%a"
 
     def __init__(
         self,
@@ -130,6 +133,12 @@ class SlurmExecutor(ClusterExecutor):
         # captures stdout/stderr to our chosen paths.
         argv += ["--output=/dev/null", "--error=/dev/null"]
 
+        # Array submission: --array=spec, plus the inner shell uses
+        # $SLURM_ARRAY_TASK_ID per task. Base submit() has already
+        # appended .%a to the file paths.
+        if spec.array is not None:
+            argv += [f"--array={spec.array}"]
+
         # Resource flags: caller spec overrides cluster default.
         rs = spec.resource_spec or self._cfg.default_resource_spec
         if rs:
@@ -137,9 +146,55 @@ class SlurmExecutor(ClusterExecutor):
 
         # --wrap takes the inner script as a single argument; sbatch
         # writes a trivial wrapper around it and submits that.
-        inner = build_inner_shell(spec, stdout_file, stderr_file, exitcode_file)
+        if spec.array is not None:
+            inner = self._build_array_inner_shell(
+                spec, stdout_file, stderr_file, exitcode_file,
+            )
+        else:
+            inner = build_inner_shell(spec, stdout_file, stderr_file, exitcode_file)
         argv += ["--wrap", inner]
         return argv
+
+    @staticmethod
+    def _build_array_inner_shell(
+        spec: JobSpec,
+        stdout_file: Path,
+        stderr_file: Path,
+        exitcode_file: Path,
+    ) -> str:
+        """Per-task variant of build_inner_shell.
+
+        ``stdout_file`` etc. arrive with literal ``%a`` placeholders;
+        we replace them with ``${SLURM_ARRAY_TASK_ID}`` so the shell
+        substitutes per-task at runtime. Each task writes its own
+        stdout/stderr/exitcode file; ``_collect_array_result`` reads
+        them all back when the array finishes.
+        """
+        from .base import shell_quote
+        env_prefix = ""
+        if spec.env:
+            env_prefix = "; ".join(
+                f"export {k}={shell_quote(v)}"
+                for k, v in spec.env.items()
+            ) + "; "
+        # Shell-quote the path WITHOUT the placeholder, then append the
+        # ${SLURM_ARRAY_TASK_ID} expansion outside the quotes so the
+        # shell expands it. Otherwise it'd be a literal in single quotes.
+        def _per_task(p: Path) -> str:
+            s = str(p)
+            if "%a" not in s:
+                return shell_quote(s)
+            base, _, after = s.partition("%a")
+            return shell_quote(base) + '"${SLURM_ARRAY_TASK_ID}"' + (
+                shell_quote(after) if after else ""
+            )
+        return (
+            f"{env_prefix}"
+            f"{spec.command} "
+            f">{_per_task(stdout_file)} "
+            f"2>{_per_task(stderr_file)}; "
+            f"echo $? >{_per_task(exitcode_file)}"
+        )
 
     def _parse_submit_output(self, stdout: str) -> Optional[str]:
         # --parsable output: "12345" or "12345;cluster_name".
@@ -175,6 +230,28 @@ class SlurmExecutor(ClusterExecutor):
         if not lines:
             return self._terminal_from_exitcode(job_id)
 
+        # For array jobs, squeue prints one line per still-queued or
+        # still-running task. Aggregate: if any task is RUNNING the
+        # array as a whole is RUN; else if any is PENDING it's PEND;
+        # otherwise treat as terminal-ish (the wait loop will check
+        # the exitcode files via _terminal_from_exitcode on the next
+        # poll). This matches user intuition that "an array is done
+        # when all its tasks are done."
+        rec = self._jobs.get(job_id)
+        if rec is not None and rec.array_spec is not None:
+            saw_pending = saw_running = False
+            for ln in lines:
+                native = ln.upper()
+                if native in _SLURM_RUNNING:
+                    saw_running = True
+                elif native in _SLURM_PENDING:
+                    saw_pending = True
+            if saw_running:
+                return RUN
+            if saw_pending:
+                return PEND
+            return self._terminal_from_exitcode(job_id)
+
         native = lines[0].upper()
         if native in _SLURM_PENDING:
             return PEND
@@ -188,10 +265,18 @@ class SlurmExecutor(ClusterExecutor):
 
     def _terminal_from_exitcode(self, job_id: str) -> str:
         """Job is no longer in the queue. Read its exitcode file to
-        decide DONE vs EXIT."""
+        decide DONE vs EXIT.
+
+        For array jobs the exitcode 'file' is actually a pattern with
+        ``%a`` in it. We mark the array as DONE so the wait loop
+        proceeds to ``_collect_array_result``, which globs all the
+        per-task files and rolls up the actual aggregate status.
+        """
         rec = self._jobs.get(job_id)
         if rec is None:
             return UNKWN
+        if rec.array_spec is not None:
+            return DONE
         return self._exitcode_file_terminal_status(Path(rec.exitcode_file))
 
     def _build_cancel_argv(self, job_id: str) -> list[str]:

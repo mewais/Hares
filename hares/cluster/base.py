@@ -57,21 +57,42 @@ class JobSpec:
     free-form text passed verbatim to the backend's submit command:
       - LSF: contents of ``-R`` (e.g. ``rusage[mem=8192]``).
       - SLURM: extra ``sbatch`` flags (e.g. ``--mem=8192 --time=01:00:00``).
+
+    ``array``, when set, submits a parameter sweep instead of a single
+    job. Format mirrors the scheduler's native syntax:
+
+      - SLURM: ``"1-100"``, ``"1,3,5"``, ``"0-99:2"``, ``"1-100%5"``
+        (the last limits concurrency to 5 simultaneous tasks).
+        ``$SLURM_ARRAY_TASK_ID`` is set per task in the command's env.
+
+      - LSF: array submission is not yet supported in this version.
+
+    The whole array is one Hares job_id; per-task results land in
+    ``result["tasks"]`` keyed by the array task id (string).
     """
     command: str
     resource_spec: Optional[str] = None
     name: Optional[str] = None
     cwd: Optional[str] = None
     env: Optional[dict[str, str]] = None
+    array: Optional[str] = None
 
 
 class JobRecord:
-    """Mutable per-job state tracked by an executor."""
+    """Mutable per-job state tracked by an executor.
+
+    For array jobs (``array_spec`` set), the ``stdout_file`` /
+    ``stderr_file`` / ``exitcode_file`` paths use a backend-specific
+    placeholder for the per-task task-id substitution at runtime —
+    e.g. SLURM uses ``%a`` literally in the path, the inner shell
+    interpolates ``$SLURM_ARRAY_TASK_ID``. Result collection globs
+    these patterns to gather one entry per task.
+    """
 
     __slots__ = (
         "job_id", "name", "command", "submitted_at",
         "stdout_file", "stderr_file", "exitcode_file",
-        "status", "result",
+        "status", "result", "array_spec",
     )
 
     def __init__(
@@ -83,6 +104,7 @@ class JobRecord:
         stdout_file: str,
         stderr_file: str,
         exitcode_file: str,
+        array_spec: Optional[str] = None,
     ) -> None:
         self.job_id = job_id
         self.name = name
@@ -93,6 +115,7 @@ class JobRecord:
         self.exitcode_file = exitcode_file
         self.status = PEND
         self.result: Optional[dict[str, Any]] = None
+        self.array_spec = array_spec
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -102,6 +125,8 @@ class JobRecord:
             "submitted_at": self.submitted_at,
             "status": self.status,
         }
+        if self.array_spec is not None:
+            d["array_spec"] = self.array_spec
         if self.result is not None:
             d["result"] = self.result
         return d
@@ -133,6 +158,15 @@ class ClusterExecutor(abc.ABC):
     # Human-readable scheduler name used in error messages and logs.
     # Backends override.
     SCHEDULER_NAME = "cluster"
+
+    # Placeholder the backend's submit substitutes per array task in
+    # output filenames (SLURM uses ``%a``, LSF uses ``%I``). Base
+    # submit() appends ``.<placeholder>`` to stdout/stderr/exitcode
+    # paths when ``spec.array`` is set, so the backend's argv builder
+    # and inner-shell get per-task paths and the JobRecord stores the
+    # pattern for later globbing in ``_collect_array_result``.
+    # ``None`` means the backend does not support array jobs.
+    ARRAY_TASK_PLACEHOLDER: Optional[str] = None
 
     def __init__(
         self,
@@ -248,7 +282,15 @@ class ClusterExecutor(abc.ABC):
     async def _collect_result(
         self, record: JobRecord, status: str,
     ) -> dict[str, Any]:
-        """Read stdout/stderr/exitcode files after a job reaches terminal state."""
+        """Read stdout/stderr/exitcode files after a job reaches terminal state.
+
+        For array jobs, glob the per-task files (the inner shell wrote
+        one set per task, distinguished by a backend-specific task-id
+        suffix) and aggregate them under ``result["tasks"]``.
+        """
+        if record.array_spec is not None:
+            return self._collect_array_result(record, status)
+
         stdout_content = _read_file_safe(Path(record.stdout_file))
         stderr_content = _read_file_safe(Path(record.stderr_file))
         exit_raw = _read_file_safe(Path(record.exitcode_file)).strip()
@@ -266,6 +308,119 @@ class ClusterExecutor(abc.ABC):
             "stdout": stdout_content,
             "stderr": stderr_content,
         }
+
+    def _collect_array_result(
+        self, record: JobRecord, status: str,
+    ) -> dict[str, Any]:
+        """Aggregate per-task output for an array job.
+
+        The inner shell writes ``<base>.out.<task_id>`` /
+        ``.err.<task_id>`` / ``.exit.<task_id>`` per task. We glob the
+        ``.exit.*`` files (they're the smallest and the source of
+        truth for completion) and read the matching out/err files for
+        each. Tasks with no exitcode file are reported as
+        ``status=UNKWN`` (e.g. preempted before the inner shell
+        finished writing).
+
+        ``result["tasks"]`` is keyed by task id (string) for stable
+        ordering across JSON round-trips. ``result["summary"]`` gives
+        a quick count by terminal status. Top-level ``status`` /
+        ``exit_code`` reflect the array as a whole — DONE only when
+        every task succeeded; EXIT if any failed.
+        """
+        # The exitcode-file path has a literal placeholder in it
+        # (SLURM '%a', LSF '%I'). Replace with '*' for the glob; the
+        # backend's ARRAY_TASK_PLACEHOLDER tells us which token to swap.
+        placeholder = self.ARRAY_TASK_PLACEHOLDER or "%a"
+        exit_pattern = record.exitcode_file.replace(placeholder, "*")
+        exit_dir = Path(exit_pattern).parent
+        exit_glob = Path(exit_pattern).name
+        exit_files = sorted(exit_dir.glob(exit_glob)) if exit_dir.exists() else []
+
+        # If no per-task exitcode files at all, report TIMEOUT-ish.
+        if not exit_files:
+            return {
+                "job_id": record.job_id,
+                "name": record.name,
+                "status": status,
+                "exit_code": -1,
+                "tasks": {},
+                "summary": {"done": 0, "failed": 0, "unknown": 0},
+                "stdout": "",
+                "stderr": (
+                    f"Array job {record.job_id} produced no per-task exitcode "
+                    f"files under {exit_dir}/{exit_glob}. Tasks may have been "
+                    "killed before the inner shell wrote them, or the output "
+                    "dir is on a filesystem the cluster nodes can't see."
+                ),
+            }
+
+        tasks: dict[str, dict[str, Any]] = {}
+        done_count = failed_count = unknown_count = 0
+        for ef in exit_files:
+            task_id = self._task_id_from_exitcode_file(record.exitcode_file, ef)
+            out_file = Path(record.stdout_file.replace(placeholder, task_id))
+            err_file = Path(record.stderr_file.replace(placeholder, task_id))
+            exit_raw = _read_file_safe(ef).strip()
+            try:
+                task_exit = int(exit_raw)
+                task_status = DONE if task_exit == 0 else EXIT
+                if task_exit == 0:
+                    done_count += 1
+                else:
+                    failed_count += 1
+            except ValueError:
+                task_exit = -1
+                task_status = UNKWN
+                unknown_count += 1
+            tasks[task_id] = {
+                "status": task_status,
+                "exit_code": task_exit,
+                "stdout": _read_file_safe(out_file),
+                "stderr": _read_file_safe(err_file),
+            }
+
+        # Top-level rollup: array is DONE iff all tasks passed and we
+        # saw no UNKWNs. Otherwise EXIT (any failure or missing file
+        # is treated as a non-success for the array as a whole).
+        rollup_status = DONE if (failed_count == 0 and unknown_count == 0) else EXIT
+        rollup_exit = 0 if rollup_status == DONE else 1
+
+        return {
+            "job_id": record.job_id,
+            "name": record.name,
+            "array_spec": record.array_spec,
+            "status": rollup_status,
+            "exit_code": rollup_exit,
+            "tasks": tasks,
+            "summary": {
+                "done": done_count, "failed": failed_count,
+                "unknown": unknown_count,
+            },
+        }
+
+    def _task_id_from_exitcode_file(
+        self, pattern: str, actual: Path,
+    ) -> str:
+        """Extract the task id from a globbed exitcode file path.
+
+        ``pattern`` is the original ``record.exitcode_file`` with the
+        backend's ``ARRAY_TASK_PLACEHOLDER`` in it. ``actual`` is one
+        match from the glob. Anchor the extraction on the surrounding
+        text so the recovered id is exactly what the inner shell
+        substituted.
+        """
+        placeholder = self.ARRAY_TASK_PLACEHOLDER
+        if placeholder is None:
+            return actual.stem  # backend without arrays — caller bug
+        pat_name = Path(pattern).name
+        actual_name = actual.name
+        if placeholder in pat_name:
+            prefix, suffix = pat_name.split(placeholder, 1)
+            if actual_name.startswith(prefix) and actual_name.endswith(suffix):
+                end = len(actual_name) - len(suffix) if suffix else len(actual_name)
+                return actual_name[len(prefix):end]
+        return actual.stem  # fallback — shouldn't happen with a valid pattern
 
     def _maybe_evict_terminal(self) -> None:
         """Evict oldest terminal job records when retention cap is exceeded.
@@ -339,6 +494,23 @@ class ClusterExecutor(abc.ABC):
 
             uid = uuid.uuid4().hex[:12]
             stdout_file, stderr_file, exitcode_file = self._output_paths(uid)
+            # For array jobs, suffix each path with the backend's
+            # task-id placeholder so the inner shell can substitute it
+            # at runtime and _collect_array_result can glob the matches.
+            if spec.array is not None:
+                placeholder = self.ARRAY_TASK_PLACEHOLDER
+                if placeholder is None:
+                    results.append({
+                        "error": (
+                            f"{self.SCHEDULER_NAME} backend does not support "
+                            f"array jobs (spec.array={spec.array!r})."
+                        ),
+                        "job_id": None,
+                    })
+                    continue
+                stdout_file = Path(f"{stdout_file}.{placeholder}")
+                stderr_file = Path(f"{stderr_file}.{placeholder}")
+                exitcode_file = Path(f"{exitcode_file}.{placeholder}")
             job_name = (spec.name or f"hares-{uid}").strip()
 
             argv = self._build_submit_argv(
@@ -379,20 +551,25 @@ class ClusterExecutor(abc.ABC):
                 stdout_file=str(stdout_file),
                 stderr_file=str(stderr_file),
                 exitcode_file=str(exitcode_file),
+                array_spec=spec.array,
             )
             async with self._lock:
                 self._jobs[job_id] = record
 
             logger.info(
-                "%s job %s submitted (%s)",
+                "%s job %s submitted (%s)%s",
                 self.SCHEDULER_NAME, job_id, job_name,
+                f" array={spec.array}" if spec.array else "",
             )
-            results.append({
+            entry: dict[str, Any] = {
                 "job_id": job_id,
                 "name": job_name,
                 "status": PEND,
                 "submitted_at": now,
-            })
+            }
+            if spec.array is not None:
+                entry["array_spec"] = spec.array
+            results.append(entry)
 
         return results
 

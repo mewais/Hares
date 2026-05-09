@@ -74,6 +74,10 @@ class LsfExecutor(ClusterExecutor):
     """Session-scoped LSF job manager."""
 
     SCHEDULER_NAME = "lsf"
+    # LSF uses %I as the array index placeholder in -o filenames; the
+    # per-task env var is $LSB_JOBINDEX (analog of SLURM's %a /
+    # $SLURM_ARRAY_TASK_ID).
+    ARRAY_TASK_PLACEHOLDER = "%I"
 
     def __init__(
         self,
@@ -97,12 +101,60 @@ class LsfExecutor(ClusterExecutor):
         resource_spec = spec.resource_spec or self._cfg.default_resource_spec
         if resource_spec:
             argv += ["-R", resource_spec]
-        argv += ["-J", job_name]
+        # Array submission: bsub uses -J 'name[<spec>]' (the [...] is
+        # part of the job-name argument, NOT a separate flag). Base
+        # submit() has already appended .%I to the file paths.
+        if spec.array is not None:
+            argv += ["-J", f"{job_name}[{spec.array}]"]
+        else:
+            argv += ["-J", job_name]
         if spec.cwd:
             argv += ["-cwd", spec.cwd]
-        inner = build_inner_shell(spec, stdout_file, stderr_file, exitcode_file)
+        if spec.array is not None:
+            inner = self._build_array_inner_shell(
+                spec, stdout_file, stderr_file, exitcode_file,
+            )
+        else:
+            inner = build_inner_shell(spec, stdout_file, stderr_file, exitcode_file)
         argv += ["/bin/sh", "-c", inner]
         return argv
+
+    @staticmethod
+    def _build_array_inner_shell(
+        spec: JobSpec,
+        stdout_file: Path,
+        stderr_file: Path,
+        exitcode_file: Path,
+    ) -> str:
+        """Per-task variant of build_inner_shell for LSF arrays.
+
+        Substitutes ``%I`` placeholders in the path templates with
+        ``${LSB_JOBINDEX}`` so the shell expands them per task.
+        Mirrors SlurmExecutor._build_array_inner_shell — same idea,
+        different env-var name.
+        """
+        from .base import shell_quote
+        env_prefix = ""
+        if spec.env:
+            env_prefix = "; ".join(
+                f"export {k}={shell_quote(v)}"
+                for k, v in spec.env.items()
+            ) + "; "
+        def _per_task(p: Path) -> str:
+            s = str(p)
+            if "%I" not in s:
+                return shell_quote(s)
+            base, _, after = s.partition("%I")
+            return shell_quote(base) + '"${LSB_JOBINDEX}"' + (
+                shell_quote(after) if after else ""
+            )
+        return (
+            f"{env_prefix}"
+            f"{spec.command} "
+            f">{_per_task(stdout_file)} "
+            f"2>{_per_task(stderr_file)}; "
+            f"echo $? >{_per_task(exitcode_file)}"
+        )
 
     def _parse_submit_output(self, stdout: str) -> Optional[str]:
         m = _BSUB_ID_RE.search(stdout)
@@ -127,6 +179,31 @@ class LsfExecutor(ClusterExecutor):
         lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
         if not lines:
             return UNKWN
+
+        # For array jobs, bjobs prints one line per task — aggregate
+        # the same way SLURM does: any RUN ⇒ array RUN; else any PEND
+        # ⇒ array PEND; otherwise the array has terminated and the
+        # exitcode-file glob in _collect_array_result will roll up the
+        # actual outcome.
+        rec = self._jobs.get(job_id)
+        if rec is not None and rec.array_spec is not None:
+            saw_pending = saw_running = False
+            running_set = {"RUN", "SSUSP", "USUSP", "PSUSP", "WAIT", "ZOMBI"}
+            for ln in lines:
+                parts = ln.split()
+                if len(parts) < 3:
+                    continue
+                native = parts[2].upper()
+                if native in running_set:
+                    saw_running = True
+                elif native == "PEND":
+                    saw_pending = True
+            if saw_running:
+                return RUN
+            if saw_pending:
+                return PEND
+            return DONE  # terminal; _collect_array_result reads per-task files
+
         # bjobs -noheader columns: JOBID USER STAT QUEUE FROM_HOST EXEC_HOST ...
         parts = lines[0].split()
         if len(parts) < 3:
