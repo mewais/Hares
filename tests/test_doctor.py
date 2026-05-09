@@ -119,10 +119,14 @@ def test_posix_ipc_missing_without_coordination_dir_warns(monkeypatch):
 
 # ── check_fs_ceiling ───────────────────────────────────────────────────────
 
-def test_fs_ceiling_unset_warns(monkeypatch):
+def test_fs_ceiling_unset_passes_with_pwd_note():
+    """Since 0.5, unset HARES_FS_CEILING is fine — the loader defaults
+    to $PWD. The doctor surfaces this as an OK with the PWD path
+    visible so the operator sees the implicit choice."""
     r = doctor.check_fs_ceiling()
-    assert r.level == "warn"
-    assert "not set" in r.title.lower()
+    assert r.level == "ok"
+    assert "$PWD" in r.title
+    assert os.getcwd() in r.title
 
 
 def test_fs_ceiling_existing_writable_dir_passes(monkeypatch, tmp_path):

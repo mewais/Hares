@@ -242,11 +242,9 @@ def check_mcp() -> CheckResult:
 def check_fs_ceiling() -> CheckResult:
     raw = os.environ.get("HARES_FS_CEILING", "").strip()
     if not raw:
-        return _warn(
-            "HARES_FS_CEILING not set",
-            "Bare 'hares-mcp' invocation requires it (or pass --ceiling on "
-            "the CLI). Optional for --enable=lsf/slurm modes. Set in your "
-            "shell rc: 'export HARES_FS_CEILING=$PWD' or a project root.",
+        return _ok(
+            "HARES_FS_CEILING not set — will default to $PWD at startup "
+            f"({os.getcwd()})"
         )
     expanded = Path(os.path.expanduser(os.path.expandvars(raw))).resolve(strict=False)
     if not expanded.exists():

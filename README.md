@@ -479,7 +479,7 @@ The mechanism differs; the scope semantics are uniform where applicable.
 
 | Variable | Purpose |
 |---|---|
-| `HARES_FS_CEILING` | Default for `--ceiling` when not on the CLI. Operators with a single project root set this once in their shell rc. Required at startup if `--ceiling` is not passed. |
+| `HARES_FS_CEILING` | Default for `--ceiling` when not on the CLI. Operators with a single project root set this once in their shell rc. Falls back to `$PWD` (with an INFO log) when neither this nor `--ceiling` is set; the PWD default is rejected if it would resolve under a `.git/` tree, in which case an explicit `--ceiling` is required. |
 
 ### Operator-deploy: bwrap controls
 
@@ -874,9 +874,12 @@ field (or `HARES_LSF_DEFAULT_RESOURCE_SPEC` /
 
 ## Quirks and edge cases
 
-* **Bare `hares-mcp` invocation requires `HARES_FS_CEILING`** in env.
-  Set it once in your shell rc (`export HARES_FS_CEILING=$PWD`).
-  Without it (and without `--ceiling`), startup fails with a clear error.
+* **Bare `hares-mcp` invocation defaults `--ceiling` to `$PWD`**
+  (since 0.5) with an INFO log line so the choice is visible. Set
+  `HARES_FS_CEILING` in your shell rc (or pass `--ceiling=PATH`) when
+  you want a different root. The PWD default is rejected if it
+  resolves under a `.git/` tree — in that case the operator must pass
+  `--ceiling` explicitly (better to fail loudly than to default badly).
 * **State file under ceiling**: warned about but not rejected. An
   agent with write access to the ceiling could corrupt the active
   scope. Move the state file outside the ceiling for tighter

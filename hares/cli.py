@@ -103,12 +103,13 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--ceiling",
         default=None,
         help=(
-            "REQUIRED for --enable involving fs or shell. Outer bound "
-            "for any path the instance can touch. For fs: bounds tool-"
-            "call paths. For shell: bounds the bwrap mount namespace. "
-            "Defaults to $HARES_FS_CEILING when not passed; if neither "
-            "is set, startup fails. Validated to NOT cover .git/ "
-            "regardless of HARES_DISALLOW_SYSTEM_DIRS."
+            "Outer bound for any path the instance can touch. For fs: "
+            "bounds tool-call paths. For shell: bounds the bwrap mount "
+            "namespace. Resolution order: --ceiling > $HARES_FS_CEILING "
+            "> $PWD (since 0.5; logged at INFO when the PWD default is "
+            "used). Validated to NOT cover .git/ regardless of "
+            "HARES_DISALLOW_SYSTEM_DIRS — the PWD default is rejected "
+            "in that case and an explicit --ceiling becomes required."
         ),
     )
     parser.add_argument(
@@ -135,19 +136,41 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 
 def _resolve_ceiling(args: argparse.Namespace) -> Path:
-    """Resolve --ceiling from CLI > $HARES_FS_CEILING > error."""
+    """Resolve --ceiling from CLI > $HARES_FS_CEILING > $PWD.
+
+    Defaulting to the current working directory was added in 0.5 to
+    remove the most common startup error (bare ``hares-mcp`` failing
+    with "ceiling required"). The PWD default is logged at INFO so
+    operators see the implicit choice — no silent surprises.
+
+    The default is REJECTED if it would resolve under a .git/ tree or
+    a system-dir blocklist entry; in that case the operator must pass
+    --ceiling explicitly. Better to fail loudly than to default to a
+    bad ceiling.
+    """
     raw = args.ceiling or os.environ.get("HARES_FS_CEILING", "").strip()
+    used_pwd_default = False
     if not raw:
-        raise SystemExit(
-            "hares-mcp: --ceiling is required (pass --ceiling=PATH or "
-            "set HARES_FS_CEILING in env). The ceiling is the outer "
-            "bound for any path this instance can touch."
-        )
+        raw = os.getcwd()
+        used_pwd_default = True
     expanded = Path(os.path.expanduser(os.path.expandvars(raw))).resolve(strict=False)
     try:
         validate_ceiling(expanded)
     except PathSafetyError as exc:
+        if used_pwd_default:
+            raise SystemExit(
+                f"hares-mcp: refusing to default --ceiling to $PWD "
+                f"({expanded}): {exc}. Pass --ceiling=PATH explicitly or "
+                f"set HARES_FS_CEILING in env."
+            )
         raise SystemExit(f"hares-mcp: invalid --ceiling: {exc}")
+    if used_pwd_default:
+        logger.info(
+            "--ceiling not provided and HARES_FS_CEILING unset; "
+            "defaulting to $PWD: %s. Pass --ceiling=PATH or set "
+            "HARES_FS_CEILING to make this explicit.",
+            expanded,
+        )
     return expanded
 
 

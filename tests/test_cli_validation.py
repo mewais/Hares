@@ -42,11 +42,50 @@ def test_version_works():
     assert __version__ in out
 
 
-def test_missing_ceiling_fails(tmp_path, monkeypatch):
-    # Strip env so default-from-env doesn't accidentally satisfy.
-    rc, out = _run([], env_extra={"HARES_FS_CEILING": ""})
-    assert rc != 0
-    assert "--ceiling is required" in out
+def test_missing_ceiling_defaults_to_pwd(tmp_path):
+    """Bare invocation with no --ceiling and no HARES_FS_CEILING used
+    to fail fast. Since 0.5 it defaults to $PWD with an INFO log so the
+    most common first-run error goes away. We close stdin immediately
+    so the server exits without blocking on the MCP handshake."""
+    env = os.environ.copy()
+    env["HARES_FS_CEILING"] = ""  # explicitly unset
+    proc = subprocess.Popen(
+        [HARES_MCP],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        cwd=str(tmp_path),  # PWD becomes the ceiling
+        env=env,
+    )
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        proc.wait(timeout=2)
+    err = proc.stderr.read().decode() if proc.stderr else ""
+    # Must NOT have failed with the old "ceiling is required" error.
+    assert "--ceiling is required" not in err
+    # Must have logged the PWD default at INFO so operators see it.
+    assert "defaulting to $PWD" in err
+    assert str(tmp_path) in err
+
+
+def test_pwd_default_rejected_under_git(tmp_path):
+    """If $PWD is under a .git/ tree, the default is rejected with a
+    clear message — better than silently picking a bad ceiling."""
+    bad = tmp_path / ".git" / "objects"
+    bad.mkdir(parents=True)
+    env = os.environ.copy()
+    env["HARES_FS_CEILING"] = ""
+    proc = subprocess.run(
+        [HARES_MCP],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        cwd=str(bad), env=env, timeout=5,
+    )
+    assert proc.returncode != 0
+    out = proc.stdout + proc.stderr
+    assert "refusing to default" in out
+    assert ".git" in out
 
 
 @pytest.mark.parametrize("bad", ["Foo", "1abc", "with-dash", "UPPER", "with space"])

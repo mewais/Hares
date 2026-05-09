@@ -47,18 +47,33 @@ async def test_bare_invocation_exposes_execute_command_and_restrict_unprefixed(t
 
 
 @pytest.mark.asyncio
-async def test_bare_invocation_no_ceiling_no_env_fails_fast():
-    """Belt-and-suspenders: with no flag and no env, startup must fail
-    with a clear human-readable error (already covered by
-    test_cli_validation::test_missing_ceiling_fails, but pinned here
-    via the proto path too because the failure mode is part of the
-    user-visible 0.2 contract)."""
+async def test_bare_invocation_no_ceiling_no_env_defaults_to_pwd(tmp_path):
+    """Pinned-behavior cousin of
+    test_cli_validation::test_missing_ceiling_defaults_to_pwd.
+
+    Behavior changed in 0.5: the bare invocation no longer fails on a
+    missing ceiling — it defaults to $PWD with an INFO log. Pinned
+    here too because the change is user-visible and we want the proto
+    layer to surface it as well as the CLI layer.
+
+    We pass an empty stdin so the server exits without blocking on the
+    MCP handshake, then assert on the startup log."""
     import subprocess
     env = os.environ.copy()
     env["HARES_SANDBOX_DISABLED"] = "1"
     env.pop("HARES_FS_CEILING", None)
-    proc = subprocess.run(
-        ["hares-mcp"], capture_output=True, text=True, env=env, timeout=5,
+    proc = subprocess.Popen(
+        ["hares-mcp"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        cwd=str(tmp_path), env=env,
     )
-    assert proc.returncode != 0
-    assert "--ceiling is required" in (proc.stdout + proc.stderr)
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        proc.wait(timeout=2)
+    err = proc.stderr.read().decode() if proc.stderr else ""
+    assert "--ceiling is required" not in err  # the old contract is gone
+    assert "defaulting to $PWD" in err
+    assert str(tmp_path) in err
