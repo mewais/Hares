@@ -17,3 +17,7 @@ dist/
 *~
 .coverage
 htmlcov/
+
+# Claude Code per-session permission cache — accreted noise from
+# interactive use, not part of the project surface.
+.claude/settings.local.json

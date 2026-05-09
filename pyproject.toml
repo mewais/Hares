@@ -48,6 +48,16 @@ hares-mcp = "hares.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["hares"]
 
+[tool.hatch.build.targets.sdist]
+# Ship the source tree minus dev / IDE / Claude-Code-session artifacts
+# that hatchling would otherwise pick up by default.
+exclude = [
+  ".claude/",
+  ".github/workflows/",  # CI is for the repo, not for sdist consumers
+  "*.pyc",
+  "__pycache__",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
