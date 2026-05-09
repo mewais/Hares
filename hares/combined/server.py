@@ -57,6 +57,7 @@ def _build_server(
     state_file: Optional[Path],
     runner: Runner,
     auditor: Optional[Auditor] = None,
+    use_roots: bool = False,
 ) -> Server:
     server: Server = Server("hares-combined")
 
@@ -165,8 +166,23 @@ def _build_server(
     for k, v in restrict_handlers.items():
         handlers[k] = ("restrict", v)
 
+    _roots_applied: list[bool] = [False]
+
     @server.list_tools()
     async def _list_tools() -> list[Tool]:
+        if use_roots and not _roots_applied[0]:
+            _roots_applied[0] = True
+            try:
+                import mcp.server as _mcp_server
+                ctx = _mcp_server.request_context.get(None)
+                if ctx is not None:
+                    from ..roots import derive_ceiling_from_roots
+                    derived = await derive_ceiling_from_roots(ctx.session)
+                    if derived is not None:
+                        runner.update_ceiling(derived)
+                        logger.info("Ceiling updated from MCP roots: %s", derived)
+            except Exception as exc:
+                logger.debug("Roots ceiling derivation failed: %s", exc)
         return tool_descriptors
 
     @server.call_tool()
@@ -206,6 +222,7 @@ async def _serve_async(
     ceiling: Path,
     read_only: bool,
     state_file: Optional[Path],
+    use_roots: bool = False,
 ) -> None:
     cfg = load_config(default_cwd=os.getcwd())
     coord = CrossProcessCoordinator(
@@ -221,6 +238,7 @@ async def _serve_async(
         rss_overshoot_ratio=cfg.rss_overshoot_ratio,
         sandbox=cfg.sandbox,
         coordinator=coord,
+        ceiling=ceiling,
     )
     logger.info(
         "Hares combined starting: scope_id=%r ceiling=%s read_only=%s "
@@ -239,6 +257,7 @@ async def _serve_async(
         state_file=state_file,
         runner=runner,
         auditor=auditor,
+        use_roots=use_roots,
     )
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())
@@ -250,6 +269,7 @@ def serve(
     ceiling: Path,
     read_only: bool = False,
     state_file: Optional[Path] = None,
+    use_roots: bool = False,
 ) -> None:
     try:
         asyncio.run(_serve_async(
@@ -257,6 +277,7 @@ def serve(
             ceiling=ceiling,
             read_only=read_only,
             state_file=state_file,
+            use_roots=use_roots,
         ))
     except KeyboardInterrupt:
         logger.info("Hares combined shutting down (KeyboardInterrupt)")

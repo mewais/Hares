@@ -79,6 +79,7 @@ class Runner:
         rewrite_overcommits: bool = True,
         sandbox: Optional[SandboxConfig] = None,
         coordinator: Optional["CrossProcessCoordinator"] = None,
+        ceiling: Optional["Path"] = None,
     ) -> None:
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be >= 1")
@@ -95,6 +96,7 @@ class Runner:
         self._rewrite = rewrite_overcommits
         self._sandbox = sandbox if (sandbox and sandbox.enabled) else None
         self._coordinator = coordinator
+        self._ceiling: Optional[Path] = ceiling
 
         # Concurrency: when a coordinator is injected, defer entirely to
         # it (cross-process semaphore). Else fall back to per-process
@@ -131,6 +133,15 @@ class Runner:
     def max_concurrent(self) -> int:
         return self._max_concurrent
 
+    def update_ceiling(self, ceiling: Path) -> None:
+        """Update the ceiling used for bwrap mounts.
+
+        Called when the ceiling is derived from MCP roots after session
+        init rather than being known at server startup. Thread-safe for
+        asyncio: the new ceiling takes effect on the next execute() call.
+        """
+        self._ceiling = ceiling
+
     def set_active_scope(
         self,
         paths: list[Path],
@@ -156,21 +167,49 @@ class Runner:
     def _effective_sandbox(self, cwd: Optional[str]) -> Optional[SandboxConfig]:
         """Compose the sandbox config for THIS execute() call.
 
-        Operator-set ``HARES_SANDBOX_RW``/``HARES_SANDBOX_RO`` are
-        always included (per the design decision: env-set extras
-        compose with architect-set scope). Active scope (if set) adds
-        either to rw_binds or to ro_binds depending on read_only.
+        Mount priority (lowest to highest, each layer composes on top):
+          1. HARES_SANDBOX_RO / HARES_SANDBOX_RW extras — always included.
+          2. Ceiling — mounted RW by default so the project directory is
+             accessible without an explicit cwd. Mounted RO when the
+             instance is in --read-only mode (active scope read_only flag).
+             Without this, a subprocess with no cwd sees only /tmp and
+             system paths; project files are inaccessible.
+          3. Active scope paths (from restrict_paths) — RW (or RO if
+             read_only). When set, these override the ceiling mount for
+             their subtrees, narrowing write authority.
+
+        This matches the documented design: ceiling defines what's
+        observable; active scope defines what's modifiable.
         """
         if self._sandbox is None:
             return None
+
+        ceiling_str = str(self._ceiling) if self._ceiling else None
+
         if self._active_scope_paths is None:
-            return self._sandbox
+            # No active scope — mount ceiling as RW (default) or RO
+            # (read-only mode). Before this fix the ceiling wasn't mounted
+            # at all, making project files inaccessible without a cwd.
+            if not ceiling_str:
+                return self._sandbox
+            if self._active_scope_read_only:
+                new_ro = tuple(self._sandbox.ro_binds) + (ceiling_str,)
+                return replace(self._sandbox, ro_binds=new_ro)
+            new_rw = tuple(self._sandbox.rw_binds) + (ceiling_str,)
+            return replace(self._sandbox, rw_binds=new_rw)
+
+        # Active scope set — scope paths are RW (or RO), ceiling is RO
+        # for anything not already covered by an RW scope path.
         extra_paths = tuple(str(p) for p in self._active_scope_paths)
         if self._active_scope_read_only:
             new_ro = tuple(self._sandbox.ro_binds) + extra_paths
             return replace(self._sandbox, ro_binds=new_ro)
+        # RW scope + ceiling as RO for the rest of the tree.
         new_rw = tuple(self._sandbox.rw_binds) + extra_paths
-        return replace(self._sandbox, rw_binds=new_rw)
+        new_ro = tuple(self._sandbox.ro_binds)
+        if ceiling_str and ceiling_str not in new_rw:
+            new_ro = new_ro + (ceiling_str,)
+        return replace(self._sandbox, rw_binds=new_rw, ro_binds=new_ro)
 
     async def _claim_cores(self, weight: int) -> list[int]:
         """Grab `weight` free cores from the pool. Returns [] if the

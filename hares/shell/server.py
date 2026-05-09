@@ -46,6 +46,7 @@ def _build_server(
     read_only: bool = False,
     state_file: Optional[Path] = None,
     auditor: Optional["Auditor"] = None,
+    use_roots: bool = False,
 ) -> Server:
     """Build the MCP Server with ``execute_command`` plus the shared
     restrict tools wired to the supplied runner.
@@ -99,8 +100,29 @@ def _build_server(
 
     exec_tool_name = _prefixed("execute_command", scope_id)
 
+    # One-shot flag: fetch roots from the MCP client on the first
+    # list_tools() call (always fired before any tool call) and use
+    # them to refine the ceiling when no explicit ceiling was configured.
+    # Subsequent calls skip this block.
+    _roots_applied: list[bool] = [False]
+
     @server.list_tools()
     async def _list_tools() -> list[Tool]:
+        if use_roots and not _roots_applied[0]:
+            _roots_applied[0] = True
+            try:
+                import mcp.server as _mcp_server
+                ctx = _mcp_server.request_context.get(None)
+                if ctx is not None:
+                    from ..roots import derive_ceiling_from_roots
+                    derived = await derive_ceiling_from_roots(ctx.session)
+                    if derived is not None:
+                        runner.update_ceiling(derived)
+                        logger.info(
+                            "Ceiling updated from MCP roots: %s", derived,
+                        )
+            except Exception as exc:
+                logger.debug("Roots ceiling derivation failed: %s", exc)
         tools: list[Tool] = [
             Tool(
                 name=exec_tool_name,
@@ -219,6 +241,7 @@ async def _serve_async(
     ceiling: Optional[Path] = None,
     read_only: bool = False,
     state_file: Optional[Path] = None,
+    use_roots: bool = False,
 ) -> None:
     """Async entry point — sets up the runner, builds the server, and
     drives the stdio transport until shutdown."""
@@ -230,6 +253,12 @@ async def _serve_async(
         cfg.max_concurrent, cfg.mem_limit_mb, cfg.cpu_limit_sec,
         "bwrap" if cfg.sandbox.enabled else "off",
     )
+    if use_roots:
+        logger.info(
+            "Ceiling will be refined from MCP roots at session init "
+            "(current guess: %s)",
+            ceiling,
+        )
     if cfg.sandbox.enabled:
         logger.info(
             "Sandbox: rw_binds=%s ro_binds=%s network=%s",
@@ -249,6 +278,7 @@ async def _serve_async(
         rss_overshoot_ratio=cfg.rss_overshoot_ratio,
         sandbox=cfg.sandbox,
         coordinator=coord,
+        ceiling=ceiling,
     )
     auditor = load_auditor()
     if auditor is not None:
@@ -260,6 +290,7 @@ async def _serve_async(
         read_only=read_only,
         state_file=state_file,
         auditor=auditor,
+        use_roots=use_roots,
     )
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())
@@ -271,6 +302,7 @@ def serve(
     ceiling: Optional[Path] = None,
     read_only: bool = False,
     state_file: Optional[Path] = None,
+    use_roots: bool = False,
 ) -> None:
     """Synchronous entry — wraps :func:`_serve_async` in ``asyncio.run``.
 
@@ -283,6 +315,7 @@ def serve(
             ceiling=ceiling,
             read_only=read_only,
             state_file=state_file,
+            use_roots=use_roots,
         ))
     except KeyboardInterrupt:
         logger.info("Hares shutting down (KeyboardInterrupt)")

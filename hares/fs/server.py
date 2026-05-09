@@ -41,6 +41,7 @@ def _build_server(
     read_only: bool,
     state_file: Optional[Path],
     auditor: Optional[Auditor] = None,
+    use_roots: bool = False,  # reserved; see note in _serve_async
 ) -> Server:
     """Build the MCP server. The ``ScopeStateStore`` instance owns the
     active scope; restrict-tool calls mutate it; fs-op handlers read
@@ -134,6 +135,7 @@ async def _serve_async(
     ceiling: Path,
     read_only: bool,
     state_file: Optional[Path],
+    use_roots: bool = False,
 ) -> None:
     logger.info(
         "Hares fs starting: scope_id=%r ceiling=%s read_only=%s state_file=%s",
@@ -142,12 +144,19 @@ async def _serve_async(
     auditor = load_auditor()
     if auditor is not None:
         logger.info("Audit log enabled: dest=%r", auditor.dest)
+    # Note: use_roots is passed through but not yet active for --enable=fs
+    # standalone. Updating the ceiling at runtime requires threading a
+    # mutable ceiling ref into ScopeStateStore and all fs-op dispatch
+    # closures. For now, roots-based ceiling refinement is implemented
+    # only in shell and combined modes. Use --enable=fs+shell (combined)
+    # which fully supports roots, or set HARES_FS_CEILING explicitly.
     server = _build_server(
         scope_id=scope_id,
         ceiling=ceiling,
         read_only=read_only,
         state_file=state_file,
         auditor=auditor,
+        use_roots=use_roots,
     )
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())
@@ -159,6 +168,7 @@ def serve(
     ceiling: Path,
     read_only: bool = False,
     state_file: Optional[Path] = None,
+    use_roots: bool = False,
 ) -> None:
     """Synchronous entry — wraps :func:`_serve_async` in ``asyncio.run``.
     Called by the CLI dispatcher."""
@@ -168,6 +178,7 @@ def serve(
             ceiling=ceiling,
             read_only=read_only,
             state_file=state_file,
+            use_roots=use_roots,
         ))
     except KeyboardInterrupt:
         logger.info("Hares fs shutting down (KeyboardInterrupt)")

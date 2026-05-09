@@ -135,8 +135,14 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _resolve_ceiling(args: argparse.Namespace) -> Path:
+def _resolve_ceiling(args: argparse.Namespace) -> tuple[Path, bool]:
     """Resolve --ceiling from CLI > $HARES_FS_CEILING > $PWD.
+
+    Returns ``(ceiling, use_roots)`` where ``use_roots=True`` when the
+    ceiling was NOT explicitly configured (only defaulted to $PWD). In
+    that case the caller should attempt to refine the ceiling from MCP
+    roots at session init, replacing the $PWD guess with the actual
+    project directory the client has open.
 
     Defaulting to the current working directory was added in 0.5 to
     remove the most common startup error (bare ``hares-mcp`` failing
@@ -167,11 +173,12 @@ def _resolve_ceiling(args: argparse.Namespace) -> Path:
     if used_pwd_default:
         logger.info(
             "--ceiling not provided and HARES_FS_CEILING unset; "
-            "defaulting to $PWD: %s. Pass --ceiling=PATH or set "
-            "HARES_FS_CEILING to make this explicit.",
+            "defaulting to $PWD: %s (will be refined from MCP roots "
+            "at session init). Pass --ceiling=PATH or set "
+            "HARES_FS_CEILING to suppress this.",
             expanded,
         )
-    return expanded
+    return expanded, used_pwd_default
 
 
 def _validate_scope_id(scope_id: Optional[str]) -> Optional[str]:
@@ -301,7 +308,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             serve_slurm(scope_id=scope_id, ceiling=ceiling)
         return
 
-    ceiling = _resolve_ceiling(args)
+    ceiling, use_roots = _resolve_ceiling(args)
     state_file = _validate_state_file(args.state_file, scope_id, ceiling)
     _validate_env_paths()
 
@@ -313,6 +320,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             ceiling=ceiling,
             read_only=args.read_only,
             state_file=state_file,
+            use_roots=use_roots,
         )
     elif args.enable == "fs":
         from .fs.server import serve as fs_serve
@@ -321,20 +329,16 @@ def main(argv: Optional[list[str]] = None) -> None:
             ceiling=ceiling,
             read_only=args.read_only,
             state_file=state_file,
+            use_roots=use_roots,
         )
     elif args.enable == "fs+shell":
-        # The combined server reuses the fs server's scope_state +
-        # registers shell's execute_command alongside the fs tools.
-        # For the initial 0.2.0 release, run them as a single fs-side
-        # server with the shell tool spliced in. The fs tools handler
-        # set is the bigger surface; adding execute_command requires
-        # importing the shell runner setup.
         from .combined.server import serve as combined_serve
         combined_serve(
             scope_id=scope_id,
             ceiling=ceiling,
             read_only=args.read_only,
             state_file=state_file,
+            use_roots=use_roots,
         )
     else:
         raise SystemExit(f"hares-mcp: unknown --enable={args.enable!r}")
