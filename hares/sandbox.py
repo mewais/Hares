@@ -193,38 +193,40 @@ def build_bwrap_argv(
     if not cfg.allow_network:
         argv += ["--unshare-net"]
 
-    # Standard kernel views.
+    # Bind the entire host filesystem read-only as the base layer. This
+    # means anything not explicitly overridden below is RO — writes outside
+    # the declared scope get EROFS ("Read-only file system") rather than
+    # silently succeeding into a tmpfs overlay that nobody sees. That's an
+    # honest, debuggable error that lets an LLM know the write didn't land.
+    #
+    # Why this is safe: /proc, /dev, /tmp, and the RW binds below all
+    # override the RO base for their specific paths. The old piecemeal
+    # approach (--ro-bind /usr /usr, --ro-bind /etc /etc, ...) left the
+    # rest of the host FS accessible for writes — a silent hole.
+    argv += ["--ro-bind", "/", "/"]
+
+    # Standard kernel views — override the RO-bound /proc and /dev with
+    # fresh instances appropriate for the new pid/ipc namespace.
     argv += ["--proc", "/proc"]
     argv += ["--dev", "/dev"]
 
     if cfg.tmp_size_mb is not None:
-        # bwrap doesn't expose tmpfs size directly via --tmpfs; the
-        # closest is --size used with --tmpfs. Older bwrap versions
-        # don't support --size, so we silently skip if unset.
         argv += ["--size", str(cfg.tmp_size_mb * 1024 * 1024), "--tmpfs", "/tmp"]
     else:
         argv += ["--tmpfs", "/tmp"]
     argv += ["--tmpfs", "/run"]
     argv += ["--tmpfs", "/var/tmp"]
 
-    # System read-only paths. Skip silently if a path doesn't exist on
-    # this host (some distros don't have /sbin separate from /usr/sbin).
-    for src in cfg.system_ro:
-        if os.path.exists(src) and not os.path.islink(src):
-            argv += ["--ro-bind", src, src]
-        elif os.path.islink(src):
-            # Symlinked top-level (e.g. /lib -> /usr/lib on merged-usr
-            # systems) — bind the link itself with --symlink so the
-            # path resolves the same inside the sandbox.
-            target = os.readlink(src)
-            argv += ["--symlink", target, src]
-
-    # User-supplied read-only binds.
+    # HARES_SANDBOX_RO: explicit extra read-only binds. With the root
+    # already RO these are redundant for most paths, but kept for
+    # compatibility — operators may declare them for documentation clarity
+    # or future use if the base-RO approach ever changes.
     for src in cfg.ro_binds:
         if os.path.exists(src):
             argv += ["--ro-bind", src, src]
 
-    # User-supplied read-write binds.
+    # User-supplied read-write binds (HARES_SANDBOX_RW). These override
+    # the base RO bind, granting write access to specific paths.
     bound_rw: list[str] = []
     for src in cfg.rw_binds:
         if os.path.exists(src):
