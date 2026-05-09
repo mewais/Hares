@@ -278,6 +278,48 @@ async def test_per_call_zero_or_negative_clamped_to_one(small_runner: Runner):
         assert soft == 1
 
 
+async def test_stdin_passes_through_to_child(small_runner: Runner):
+    """When stdin is provided, the child reads it from its stdin."""
+    cmd = "cat"
+    r = await small_runner.execute(cmd, stdin="hello from caller\n")
+    assert r["exit_code"] == 0, r
+    assert r["stdout"] == "hello from caller\n"
+
+
+async def test_stdin_unset_is_back_compat(small_runner: Runner):
+    """Without stdin, behavior is unchanged from prior versions —
+    a command that doesn't read input completes normally."""
+    r = await small_runner.execute("echo no-input-needed")
+    assert r["exit_code"] == 0, r
+    assert r["stdout"].strip() == "no-input-needed"
+
+
+async def test_stdin_closed_after_write(small_runner: Runner):
+    """After the input is written, stdin is closed → reading commands
+    see EOF and exit naturally instead of hanging."""
+    cmd = f"{sys.executable} -c \"import sys; print(sys.stdin.read().upper(), end='')\""
+    r = await small_runner.execute(cmd, stdin="abc\n", timeout=5.0)
+    assert r["exit_code"] == 0, r
+    assert r["stdout"] == "ABC\n"
+
+
+async def test_stdin_unicode_roundtrips(small_runner: Runner):
+    """Non-ASCII input survives the UTF-8 encode round-trip."""
+    payload = "naïve résumé حارس\n"
+    r = await small_runner.execute("cat", stdin=payload)
+    assert r["exit_code"] == 0, r
+    assert r["stdout"] == payload
+
+
+async def test_stdin_empty_string_distinct_from_unset(small_runner: Runner):
+    """Empty string explicitly closes stdin without writing — different
+    from None (inherit). The child sees EOF immediately."""
+    cmd = f"{sys.executable} -c \"import sys; print(repr(sys.stdin.read()))\""
+    r = await small_runner.execute(cmd, stdin="", timeout=5.0)
+    assert r["exit_code"] == 0, r
+    assert r["stdout"].strip() == "''"
+
+
 async def test_per_call_mem_limit_triggers_rss_overshoot_kill():
     """A small per-call mem_limit_mb on a Runner with a much larger
     default should cause an EARLIER RSS-overshoot kill than the default

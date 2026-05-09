@@ -171,6 +171,17 @@ def _build_server(
                                 "the wall-clock fallback. Defaults to HARES_CPU_LIMIT_SEC."
                             ),
                         },
+                        "stdin": {
+                            "type": "string",
+                            "description": (
+                                "UTF-8 text written to the child's stdin and then "
+                                "closed (so the child sees EOF). Use this for commands "
+                                "that read from stdin — `jq '.x'`, `python -`, `patch`, "
+                                "`mail`, etc. — instead of wrapping the whole thing in "
+                                "/bin/sh -c with shell-side echo/heredoc. When omitted, "
+                                "stdin behavior is unchanged from prior versions."
+                            ),
+                        },
                     },
                     "required": ["command"],
                 },
@@ -191,6 +202,7 @@ def _build_server(
                 weight=int(arguments.get("weight", 1)),
                 mem_limit_mb=arguments.get("mem_limit_mb"),
                 cpu_limit_sec=arguments.get("cpu_limit_sec"),
+                stdin=arguments.get("stdin"),
             )
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
         if name in restrict_handlers:

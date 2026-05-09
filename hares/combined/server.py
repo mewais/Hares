@@ -137,6 +137,15 @@ def _build_server(
                         "wall-clock). Clamped to HARES_CPU_LIMIT_SEC."
                     ),
                 },
+                "stdin": {
+                    "type": "string",
+                    "description": (
+                        "UTF-8 text written to the child's stdin and then "
+                        "closed. Use for commands that read from stdin "
+                        "(jq, python -, patch, mail) instead of wrapping "
+                        "the call in /bin/sh -c."
+                    ),
+                },
             },
             "required": ["command"],
         },
@@ -180,6 +189,7 @@ def _build_server(
                 weight=int(arguments.get("weight", 1)),
                 mem_limit_mb=arguments.get("mem_limit_mb"),
                 cpu_limit_sec=arguments.get("cpu_limit_sec"),
+                stdin=arguments.get("stdin"),
             )
         elif kind == "restrict":
             result = await handler(arguments)

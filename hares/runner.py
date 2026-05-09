@@ -288,6 +288,7 @@ class Runner:
         weight: int = 1,
         mem_limit_mb: Optional[int] = None,
         cpu_limit_sec: Optional[int] = None,
+        stdin: Optional[str] = None,
     ) -> dict[str, Any]:
         """Run `command` in a shell, return stdout/stderr/exit_code/killed_reason.
 
@@ -310,6 +311,13 @@ class Runner:
             at the intended budget instead of the system default.
           cpu_limit_sec: Same idea for RLIMIT_CPU. Clamped to the
             instance default.
+          stdin: Optional UTF-8 text to write to the child's stdin
+            before it runs. Closed after the write so the child sees
+            EOF and reaches its normal end-of-input branch. When None
+            (default), stdin is inherited from the parent — same as
+            the 0.4 behavior. Use this for commands that read input
+            (``jq``, ``python -``, ``patch``, ``mail``) instead of
+            wrapping them in ``/bin/sh -c 'echo ... | cmd'``.
 
         Returns:
           dict with keys: exit_code, stdout, stderr, killed_reason,
@@ -374,6 +382,12 @@ class Runner:
 
             pinned_cores = await self._claim_cores(weight)
 
+            # Route stdin via PIPE only when caller supplied input.
+            # Leaving it None preserves 0.4 behavior (inherit from parent)
+            # for callers that don't need stdin.
+            stdin_kw = asyncio.subprocess.PIPE if stdin is not None else None
+            stdin_bytes = stdin.encode("utf-8") if stdin is not None else None
+
             effective_sandbox = self._effective_sandbox(cwd)
             if effective_sandbox is not None:
                 # Wrap the command in a bwrap invocation. bwrap handles
@@ -385,6 +399,7 @@ class Runner:
                 argv = build_bwrap_argv(effective_sandbox, command, cwd)
                 proc = await asyncio.create_subprocess_exec(
                     *argv,
+                    stdin=stdin_kw,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     cwd=None,
@@ -398,6 +413,7 @@ class Runner:
             else:
                 proc = await asyncio.create_subprocess_shell(
                     command,
+                    stdin=stdin_kw,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     cwd=cwd,
@@ -415,7 +431,7 @@ class Runner:
             ))
             try:
                 stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout,
+                    proc.communicate(input=stdin_bytes), timeout=timeout,
                 )
                 killed_reason = kill_flag.get("reason")
             except asyncio.TimeoutError:
