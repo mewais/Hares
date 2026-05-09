@@ -90,6 +90,35 @@ class Runner:
         self._max_concurrent = max_concurrent
         self._mem_bytes = mem_limit_mb * 1024 * 1024
         self._cpu_sec = cpu_limit_sec
+
+        # Warn once at startup if the configured limits exceed what the
+        # kernel will actually allow (inherited hard limits from a parent
+        # Hares process). Every execute_command will silently clamp to
+        # the hard limit; this gives operators/users early visibility.
+        try:
+            _, as_hard = resource.getrlimit(resource.RLIMIT_AS)
+            if as_hard >= 0 and self._mem_bytes > as_hard:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "HARES_MEM_LIMIT_MB=%dMB exceeds the inherited RLIMIT_AS "
+                    "hard limit (%dMB). Commands will be capped at %dMB. "
+                    "Run outside a resource-constrained environment or lower "
+                    "HARES_MEM_LIMIT_MB to suppress this warning.",
+                    mem_limit_mb, as_hard // 1024 // 1024,
+                    as_hard // 1024 // 1024,
+                )
+                self._mem_bytes = as_hard  # pre-clamp so rewrites are accurate
+            _, cpu_hard = resource.getrlimit(resource.RLIMIT_CPU)
+            if cpu_hard >= 0 and self._cpu_sec > cpu_hard:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "HARES_CPU_LIMIT_SEC=%ds exceeds the inherited RLIMIT_CPU "
+                    "hard limit (%ds). Commands will be capped at %ds.",
+                    cpu_limit_sec, cpu_hard, cpu_hard,
+                )
+                self._cpu_sec = cpu_hard  # pre-clamp
+        except Exception:
+            pass  # rlimit unavailable on this platform; ignore
         self._rss_poll = rss_poll_interval
         self._rss_overshoot = rss_overshoot_ratio
         self._pin_cpu = pin_cpu and hasattr(os, "sched_setaffinity")
@@ -261,8 +290,19 @@ class Runner:
                 # pytest-xdist's `-n auto` reads len(os.sched_getaffinity(0)),
                 # so this naturally caps its worker count.
                 os.sched_setaffinity(0, set(cores))
-            resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-            resource.setrlimit(resource.RLIMIT_CPU, (cpu_sec, cpu_sec))
+            # Clamp to the inherited hard limit. Without this, setting
+            # RLIMIT_AS > the inherited hard limit throws ValueError in
+            # the forked child, which Python surfaces as "Exception
+            # occurred in preexec_fn." — a silent, cryptic failure.
+            # This happens when Hares runs inside another Hares process
+            # (e.g. the test suite) whose hard limit is lower than our
+            # configured soft limit.
+            _, as_hard = resource.getrlimit(resource.RLIMIT_AS)
+            effective_mem = min(mem_bytes, as_hard) if as_hard >= 0 else mem_bytes
+            resource.setrlimit(resource.RLIMIT_AS, (effective_mem, effective_mem))
+            _, cpu_hard = resource.getrlimit(resource.RLIMIT_CPU)
+            effective_cpu = min(cpu_sec, cpu_hard) if cpu_hard >= 0 else cpu_sec
+            resource.setrlimit(resource.RLIMIT_CPU, (effective_cpu, effective_cpu))
             os.setsid()
 
         return _preexec
@@ -498,13 +538,41 @@ class Runner:
             if rewrite_notice:
                 stdout_str = rewrite_notice + stdout_str
 
-            return {
+            # Compute the limits that were *actually* applied so the
+            # caller (and any LLM reading the result) can see if their
+            # request was silently clamped by the operator ceiling or
+            # the inherited hard limit.
+            applied_mem_mb = (effective_mem_bytes or self._mem_bytes) // 1024 // 1024
+            applied_cpu_s  = effective_cpu_sec or self._cpu_sec
+            result: dict[str, Any] = {
                 "exit_code": proc.returncode,
                 "stdout": stdout_str,
                 "stderr": stderr.decode("utf-8", errors="replace"),
                 "killed_reason": killed_reason,
                 "rewrites": rewrites_dump,
+                "applied_mem_limit_mb": applied_mem_mb,
+                "applied_cpu_limit_sec": applied_cpu_s,
             }
+            # Surface a friendly note when per-call overrides were clamped.
+            if mem_limit_mb is not None:
+                requested_mb = max(1, int(mem_limit_mb))
+                if requested_mb > applied_mem_mb:
+                    result["resource_note"] = (
+                        f"mem_limit_mb clamped {requested_mb}MB → {applied_mem_mb}MB "
+                        f"(operator ceiling / inherited hard limit). "
+                        f"Lower your request or increase HARES_MEM_LIMIT_MB."
+                    )
+            if cpu_limit_sec is not None:
+                requested_cpu = max(1, int(cpu_limit_sec))
+                if requested_cpu > applied_cpu_s:
+                    note = (
+                        f"cpu_limit_sec clamped {requested_cpu}s → {applied_cpu_s}s "
+                        f"(operator ceiling / inherited hard limit)."
+                    )
+                    result["resource_note"] = (
+                        result.get("resource_note", "") + (" " if "resource_note" in result else "") + note
+                    ).strip()
+            return result
         finally:
             await self._release_cores(pinned_cores)
             if self._coordinator is not None:
