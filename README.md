@@ -510,6 +510,38 @@ The mechanism differs; the scope semantics are uniform where applicable.
 Backward compat: legacy `HARES_SANDBOX_MODE={none,off,false,0}` is still
 honored as an opt-out for older deploys.
 
+#### Common sandbox mount additions
+
+The sandbox starts from `--ro-bind / /` so only paths explicitly listed in
+`HARES_SANDBOX_RW` or `HARES_SANDBOX_RO` are writable (or additionally
+accessible when on a separate mount point). A minimal shell-rc setup:
+
+```bash
+# Read-only: compiler toolchain + locally installed user tools.
+# $(realpath -m ...) avoids symlink issues on some distros.
+export HARES_SANDBOX_RO="/tool:$(realpath -m ~/.local)"
+
+# Read-write: git identity + pip/npm/cargo cache so network fetches
+# don't repeat every session.
+export HARES_SANDBOX_RW="$(realpath -m ~/.gitconfig):$(realpath -m ~/.cache)"
+```
+
+What to add based on your toolchain:
+
+| Need | Add to `HARES_SANDBOX_RO` |
+|---|---|
+| `pip install --user` tools, `pipx` | `~/.local` |
+| Rust / `cargo install` | `~/.cargo` |
+| Go / `go install` | `~/go` |
+| Node via nvm | `~/.nvm` |
+| Custom Python venvs | path to the venv |
+| Site-specific compilers | `/opt/...` or `/tool/...` |
+
+Use `HARES_SANDBOX_RW` instead of `RO` only when the process needs to
+**write** to that path during the session (e.g. `pip install --user` from
+within the sandbox, or writing to `.gitconfig`). Executing already-installed
+tools only needs `RO`.
+
 ### Operator-deploy: subprocess throttling
 
 | Variable | Default | Purpose |
