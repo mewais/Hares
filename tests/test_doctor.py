@@ -16,13 +16,7 @@ import pytest
 from hares import doctor
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
-
-def _clean_env(monkeypatch):
-    """Strip any HARES_* env vars that could leak from the host."""
-    for key in list(os.environ):
-        if key.startswith("HARES_"):
-            monkeypatch.delenv(key, raising=False)
+# HARES_* env vars are wiped before each test by tests/conftest.py.
 
 
 # ── check_python_version ───────────────────────────────────────────────────
@@ -36,7 +30,6 @@ def test_python_version_passes_on_supported_runtime():
 # ── check_bwrap ────────────────────────────────────────────────────────────
 
 def test_bwrap_missing_with_sandbox_disabled_warns(monkeypatch):
-    _clean_env(monkeypatch)
     monkeypatch.setenv("HARES_SANDBOX_DISABLED", "1")
     monkeypatch.setattr("shutil.which", lambda _: None)
     r = doctor.check_bwrap()
@@ -45,7 +38,6 @@ def test_bwrap_missing_with_sandbox_disabled_warns(monkeypatch):
 
 
 def test_bwrap_missing_without_sandbox_disabled_errors(monkeypatch):
-    _clean_env(monkeypatch)
     monkeypatch.setattr("shutil.which", lambda _: None)
     r = doctor.check_bwrap()
     assert r.level == "err"
@@ -54,7 +46,6 @@ def test_bwrap_missing_without_sandbox_disabled_errors(monkeypatch):
 
 
 def test_bwrap_present_returns_ok(monkeypatch, tmp_path):
-    _clean_env(monkeypatch)
     fake_bwrap = tmp_path / "bwrap"
     fake_bwrap.write_text("#!/bin/sh\necho 'bubblewrap 0.6.2'\n")
     fake_bwrap.chmod(0o755)
@@ -72,7 +63,6 @@ def test_bwrap_present_returns_ok(monkeypatch, tmp_path):
 
 
 def test_bwrap_honors_custom_binary_env(monkeypatch, tmp_path):
-    _clean_env(monkeypatch)
     monkeypatch.setenv("HARES_SANDBOX_BWRAP_BIN", "/opt/custom/bwrap")
     captured: dict = {}
     def fake_which(name):
@@ -89,7 +79,6 @@ def test_posix_ipc_check_matches_actual_install_state(monkeypatch):
     """The check's verdict should match whether posix_ipc actually imports
     in the current interpreter — assert that contract regardless of
     whether the test env has it."""
-    _clean_env(monkeypatch)
     try:
         import posix_ipc  # noqa: F401
         installed = True
@@ -100,7 +89,6 @@ def test_posix_ipc_check_matches_actual_install_state(monkeypatch):
 
 
 def test_posix_ipc_missing_with_coordination_dir_errors(monkeypatch):
-    _clean_env(monkeypatch)
     monkeypatch.setenv("HARES_COORDINATION_DIR", "/tmp/coord")
     # Force ImportError by hiding the module.
     real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
@@ -117,7 +105,6 @@ def test_posix_ipc_missing_with_coordination_dir_errors(monkeypatch):
 
 
 def test_posix_ipc_missing_without_coordination_dir_warns(monkeypatch):
-    _clean_env(monkeypatch)
     real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
 
     def fake_import(name, *a, **kw):
@@ -133,14 +120,12 @@ def test_posix_ipc_missing_without_coordination_dir_warns(monkeypatch):
 # ── check_fs_ceiling ───────────────────────────────────────────────────────
 
 def test_fs_ceiling_unset_warns(monkeypatch):
-    _clean_env(monkeypatch)
     r = doctor.check_fs_ceiling()
     assert r.level == "warn"
     assert "not set" in r.title.lower()
 
 
 def test_fs_ceiling_existing_writable_dir_passes(monkeypatch, tmp_path):
-    _clean_env(monkeypatch)
     monkeypatch.setenv("HARES_FS_CEILING", str(tmp_path))
     r = doctor.check_fs_ceiling()
     assert r.level == "ok"
@@ -148,7 +133,6 @@ def test_fs_ceiling_existing_writable_dir_passes(monkeypatch, tmp_path):
 
 
 def test_fs_ceiling_nonexistent_errors(monkeypatch, tmp_path):
-    _clean_env(monkeypatch)
     monkeypatch.setenv("HARES_FS_CEILING", str(tmp_path / "does-not-exist"))
     r = doctor.check_fs_ceiling()
     assert r.level == "err"
@@ -156,7 +140,6 @@ def test_fs_ceiling_nonexistent_errors(monkeypatch, tmp_path):
 
 
 def test_fs_ceiling_under_git_errors(monkeypatch, tmp_path):
-    _clean_env(monkeypatch)
     bad = tmp_path / ".git" / "objects"
     bad.mkdir(parents=True)
     monkeypatch.setenv("HARES_FS_CEILING", str(bad))
@@ -168,31 +151,26 @@ def test_fs_ceiling_under_git_errors(monkeypatch, tmp_path):
 # ── check_state_hmac ───────────────────────────────────────────────────────
 
 def test_state_hmac_set_passes(monkeypatch):
-    _clean_env(monkeypatch)
     monkeypatch.setenv("HARES_STATE_HMAC_SECRET", "abc" * 12)
     assert doctor.check_state_hmac().level == "ok"
 
 
 def test_state_hmac_unset_warns(monkeypatch):
-    _clean_env(monkeypatch)
     assert doctor.check_state_hmac().level == "warn"
 
 
 # ── check_coordination_dir ─────────────────────────────────────────────────
 
 def test_coordination_dir_unset_passes(monkeypatch):
-    _clean_env(monkeypatch)
     assert doctor.check_coordination_dir().level == "ok"
 
 
 def test_coordination_dir_existing_writable_passes(monkeypatch, tmp_path):
-    _clean_env(monkeypatch)
     monkeypatch.setenv("HARES_COORDINATION_DIR", str(tmp_path))
     assert doctor.check_coordination_dir().level == "ok"
 
 
 def test_coordination_dir_nonexistent_warns(monkeypatch, tmp_path):
-    _clean_env(monkeypatch)
     monkeypatch.setenv("HARES_COORDINATION_DIR", str(tmp_path / "missing"))
     assert doctor.check_coordination_dir().level == "warn"
 
@@ -200,12 +178,10 @@ def test_coordination_dir_nonexistent_warns(monkeypatch, tmp_path):
 # ── check_sandbox_disabled ─────────────────────────────────────────────────
 
 def test_sandbox_enabled_passes(monkeypatch):
-    _clean_env(monkeypatch)
     assert doctor.check_sandbox_disabled().level == "ok"
 
 
 def test_sandbox_disabled_warns(monkeypatch):
-    _clean_env(monkeypatch)
     monkeypatch.setenv("HARES_SANDBOX_DISABLED", "1")
     r = doctor.check_sandbox_disabled()
     assert r.level == "warn"
@@ -213,7 +189,6 @@ def test_sandbox_disabled_warns(monkeypatch):
 
 
 def test_legacy_sandbox_mode_off_warns(monkeypatch):
-    _clean_env(monkeypatch)
     monkeypatch.setenv("HARES_SANDBOX_MODE", "none")
     assert doctor.check_sandbox_disabled().level == "warn"
 
@@ -221,7 +196,6 @@ def test_legacy_sandbox_mode_off_warns(monkeypatch):
 # ── check_lsf / check_slurm ────────────────────────────────────────────────
 
 def test_lsf_all_missing_warns(monkeypatch):
-    _clean_env(monkeypatch)
     monkeypatch.setattr("shutil.which", lambda _: None)
     r = doctor.check_lsf()
     assert r.level == "warn"
@@ -229,7 +203,6 @@ def test_lsf_all_missing_warns(monkeypatch):
 
 
 def test_lsf_partially_installed_errors(monkeypatch):
-    _clean_env(monkeypatch)
     found = {"bsub": "/usr/bin/bsub", "bjobs": None, "bkill": "/usr/bin/bkill"}
     monkeypatch.setattr("shutil.which", lambda name: found.get(name))
     r = doctor.check_lsf()
@@ -238,14 +211,12 @@ def test_lsf_partially_installed_errors(monkeypatch):
 
 
 def test_slurm_all_present_passes(monkeypatch):
-    _clean_env(monkeypatch)
     monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
     r = doctor.check_slurm()
     assert r.level == "ok"
 
 
 def test_slurm_honors_custom_binary_env(monkeypatch):
-    _clean_env(monkeypatch)
     monkeypatch.setenv("HARES_SLURM_SBATCH_BIN", "/opt/slurm/bin/sbatch")
     queried: list[str] = []
     monkeypatch.setattr("shutil.which", lambda name: (queried.append(name), None)[1])
@@ -256,7 +227,6 @@ def test_slurm_honors_custom_binary_env(monkeypatch):
 # ── render() and counts ────────────────────────────────────────────────────
 
 def test_render_returns_text_and_counts(monkeypatch, tmp_path):
-    _clean_env(monkeypatch)
     monkeypatch.setenv("HARES_FS_CEILING", str(tmp_path))
     text, counts = doctor.render(use_color=False)
     assert "Hares" in text
@@ -268,14 +238,12 @@ def test_render_returns_text_and_counts(monkeypatch, tmp_path):
 
 
 def test_render_color_mode_includes_ansi_codes(monkeypatch, tmp_path):
-    _clean_env(monkeypatch)
     monkeypatch.setenv("HARES_FS_CEILING", str(tmp_path))
     text, _ = doctor.render(use_color=True)
     assert "\033[" in text
 
 
 def test_render_no_color_excludes_ansi(monkeypatch, tmp_path):
-    _clean_env(monkeypatch)
     monkeypatch.setenv("HARES_FS_CEILING", str(tmp_path))
     text, _ = doctor.render(use_color=False)
     assert "\033[" not in text
@@ -284,7 +252,6 @@ def test_render_no_color_excludes_ansi(monkeypatch, tmp_path):
 # ── run() exit-code wiring ─────────────────────────────────────────────────
 
 def test_run_returns_zero_when_no_errors(monkeypatch, tmp_path, capsys):
-    _clean_env(monkeypatch)
     monkeypatch.setenv("HARES_FS_CEILING", str(tmp_path))
     # Force bwrap "missing but sandbox-disabled" to avoid a hard err.
     monkeypatch.setenv("HARES_SANDBOX_DISABLED", "1")
@@ -296,7 +263,6 @@ def test_run_returns_zero_when_no_errors(monkeypatch, tmp_path, capsys):
 
 
 def test_run_returns_one_when_errors(monkeypatch, capsys):
-    _clean_env(monkeypatch)
     # Force a real error: bwrap missing AND sandbox not disabled.
     monkeypatch.setattr("shutil.which", lambda name: None)
     rc = doctor.run(["--no-color"])

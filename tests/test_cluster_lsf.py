@@ -48,10 +48,8 @@ def bsub_ok(job_id: str = "12345678") -> tuple[int, str, str]:
 
 # ── load_lsf_config ───────────────────────────────────────────────────────────
 
-def test_load_lsf_config_defaults(tmp_path, monkeypatch):
-    for k in list(__import__("os").environ):
-        if k.startswith("HARES_LSF_"):
-            monkeypatch.delenv(k, raising=False)
+def test_load_lsf_config_defaults(tmp_path):
+    # HARES_* env vars wiped by tests/conftest.py — defaults apply.
     cfg = load_lsf_config(session_tmp=tmp_path)
     assert cfg.queue is None
     assert cfg.default_resource_spec is None

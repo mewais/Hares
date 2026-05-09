@@ -4,6 +4,43 @@ All notable changes to Hares are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] — 2026-05-07
+
+Adds LSF cluster execution as a third tool family alongside shell
+and fs.
+
+### Added
+
+* **`--enable=lsf` CLI mode** — exposes five tools
+  (`lsf_execute_blocking`, `lsf_submit`, `lsf_wait`, `lsf_cancel`,
+  `lsf_jobs`) backed by `bsub`/`bjobs`/`bkill`. Per-session in-memory
+  job map; cluster output captured via inner shell redirect (not
+  bsub `-o`/`-e`) to avoid LSF's output-file headers.
+* **`hares.lsf` Python package** with importable `LsfExecutor`,
+  `JobSpec`, `LsfConfig`, `load_lsf_config` so static framework code
+  can submit jobs directly without going through MCP.
+* **Ceiling is optional for LSF mode** — passed through as a
+  best-effort pre-submission `cwd` check only. The cluster node runs
+  jobs with the submitting user's full filesystem permissions; bwrap,
+  RLIMIT, and active-scope enforcement do NOT apply (documented in
+  every tool description and in the README's threat-model section).
+* **`HARES_LSF_*` env vars**: `QUEUE`, `DEFAULT_RESOURCE_SPEC`,
+  `POLL_INTERVAL_SEC`, `DEFAULT_TIMEOUT_SEC`, `OUTPUT_DIR`,
+  `BSUB_BIN`, `BJOBS_BIN`, `BKILL_BIN`.
+
+### Tests
+
+* 41 new tests: 30 unit (executor submit/wait/cancel/jobs paths,
+  resource-spec defaulting, cwd ceiling check, error shapes) +
+  11 protocol-level (tool registration, scope-id prefix, schema
+  shape, security note in descriptions, missing-binary error path).
+  Tests monkeypatch `LsfExecutor._run` so the full executor logic
+  runs in CI without `bsub`/`bjobs`/`bkill` on PATH.
+
+> **Note (post-hoc):** the LSF code was subsequently refactored into
+> `hares.cluster.lsf` in 0.4.0 alongside SLURM. Library imports
+> `from hares.lsf import ...` worked in 0.3.x but not 0.4+.
+
 ## [0.4.0] — 2026-05-08
 
 Adds SLURM as a second cluster-scheduler backend and refactors the

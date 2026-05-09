@@ -5,9 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
-import io
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -24,10 +22,7 @@ from hares.audit import (
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-def _clean_env(monkeypatch):
-    for key in list(os.environ):
-        if key.startswith("HARES_AUDIT_"):
-            monkeypatch.delenv(key, raising=False)
+# HARES_* env vars are wiped before each test by tests/conftest.py.
 
 
 class _FakeTextContent:
@@ -287,12 +282,10 @@ async def test_disabled_auditor_is_noop():
 # ── load_auditor (env-driven) ──────────────────────────────────────────────
 
 def test_load_auditor_returns_none_when_unset(monkeypatch):
-    _clean_env(monkeypatch)
     assert load_auditor() is None
 
 
 def test_load_auditor_with_file_dest(monkeypatch, tmp_path):
-    _clean_env(monkeypatch)
     p = tmp_path / "audit.jsonl"
     monkeypatch.setenv("HARES_AUDIT_LOG", str(p))
     a = load_auditor()
@@ -302,14 +295,12 @@ def test_load_auditor_with_file_dest(monkeypatch, tmp_path):
 
 
 def test_load_auditor_with_stderr(monkeypatch):
-    _clean_env(monkeypatch)
     monkeypatch.setenv("HARES_AUDIT_LOG", "stderr")
     a = load_auditor()
     assert a.dest == "stderr"
 
 
 def test_load_auditor_with_hmac_secret(monkeypatch, tmp_path):
-    _clean_env(monkeypatch)
     monkeypatch.setenv("HARES_AUDIT_LOG", str(tmp_path / "a.jsonl"))
     monkeypatch.setenv("HARES_AUDIT_HMAC_SECRET", "abc" * 12)
     a = load_auditor()
@@ -317,7 +308,6 @@ def test_load_auditor_with_hmac_secret(monkeypatch, tmp_path):
 
 
 def test_load_auditor_custom_redact_fields(monkeypatch, tmp_path):
-    _clean_env(monkeypatch)
     monkeypatch.setenv("HARES_AUDIT_LOG", str(tmp_path / "a.jsonl"))
     monkeypatch.setenv("HARES_AUDIT_REDACT_FIELDS", "env,api_key,token")
     a = load_auditor()
@@ -325,7 +315,6 @@ def test_load_auditor_custom_redact_fields(monkeypatch, tmp_path):
 
 
 def test_load_auditor_empty_redact_means_no_redaction(monkeypatch, tmp_path):
-    _clean_env(monkeypatch)
     monkeypatch.setenv("HARES_AUDIT_LOG", str(tmp_path / "a.jsonl"))
     monkeypatch.setenv("HARES_AUDIT_REDACT_FIELDS", "")
     a = load_auditor()
@@ -333,7 +322,6 @@ def test_load_auditor_empty_redact_means_no_redaction(monkeypatch, tmp_path):
 
 
 def test_load_auditor_invalid_max_chars_falls_back(monkeypatch, tmp_path, caplog):
-    _clean_env(monkeypatch)
     monkeypatch.setenv("HARES_AUDIT_LOG", str(tmp_path / "a.jsonl"))
     monkeypatch.setenv("HARES_AUDIT_MAX_VALUE_CHARS", "not-an-int")
     a = load_auditor()

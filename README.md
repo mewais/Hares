@@ -7,6 +7,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/hares.svg)](https://pypi.org/project/hares/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-linux-lightgrey.svg)]()
+[![Ko-fi](https://img.shields.io/badge/support-ko--fi-FF5E5B.svg)](https://ko-fi.com/mewais)
 
 ---
 
@@ -920,7 +921,7 @@ field (or `HARES_LSF_DEFAULT_RESOURCE_SPEC` /
 
 ## Project status
 
-Hares is **0.3.x — beta**. The MCP and Python-library APIs are stable enough to build on, but minor versions may still tweak env-var names and tool signatures. Pin the minor version in production.
+Hares is **0.4.x — beta**. The MCP and Python-library APIs are stable enough to build on, but minor versions may still tweak env-var names and tool signatures. Pin the minor version in production.
 
 The bwrap, RLIMIT, and concurrency layers are tested on Linux (RHEL 8+, Ubuntu 20.04+, Fedora). Cluster modes require either IBM Platform LSF (`bsub` / `bjobs` / `bkill`) or SLURM (`sbatch` / `squeue` / `scancel`) on `PATH`, and a shared filesystem visible to both submit and execute hosts.
 

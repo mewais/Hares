@@ -53,6 +53,11 @@ needs_bwrap_runtime = pytest.mark.skipif(
 )
 
 
+# Note: HARES_* env vars are wiped before every test by the
+# project-wide autouse fixture in tests/conftest.py — tests below
+# can assume a clean env and only need to setenv what they want.
+
+
 # ── Pure builder tests (don't actually run bwrap) ──────────────────────────
 
 
