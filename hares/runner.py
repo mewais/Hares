@@ -22,6 +22,9 @@ SIGKILL the entire process tree with killpg without leaking workers.
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .net_policy import NetworkPolicy
 import logging
 import os
 import resource
@@ -80,6 +83,7 @@ class Runner:
         sandbox: Optional[SandboxConfig] = None,
         coordinator: Optional["CrossProcessCoordinator"] = None,
         ceiling: Optional["Path"] = None,
+        network_policy: Optional["NetworkPolicy"] = None,
     ) -> None:
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be >= 1")
@@ -126,6 +130,7 @@ class Runner:
         self._sandbox = sandbox if (sandbox and sandbox.enabled) else None
         self._coordinator = coordinator
         self._ceiling: Optional[Path] = ceiling
+        self._network_policy = network_policy
 
         # Concurrency: when a coordinator is injected, defer entirely to
         # it (cross-process semaphore). Else fall back to per-process
@@ -239,6 +244,160 @@ class Runner:
         if ceiling_str and ceiling_str not in new_rw:
             new_ro = new_ro + (ceiling_str,)
         return replace(self._sandbox, rw_binds=new_rw, ro_binds=new_ro)
+
+    async def _spawn_sandboxed(
+        self,
+        effective_sandbox: SandboxConfig,
+        command: str,
+        cwd: Optional[str],
+        child_env: dict,
+        stdin_kw: Optional[int],
+        pinned_cores: list[int],
+        effective_mem_bytes: Optional[int],
+        effective_cpu_sec: Optional[int],
+    ) -> "asyncio.subprocess.Process":
+        """Spawn a sandboxed subprocess, coordinating slirp4netns when a
+        network allowlist is configured.
+
+        Without an allowlist: builds the bwrap argv normally and spawns.
+
+        With an allowlist: uses bwrap's --sync-fd mechanism to synchronise
+        with slirp4netns:
+          1. Create a pipe; pass the read-end to bwrap as --sync-fd.
+          2. bwrap creates the new user + network namespace and writes a byte
+             to the fd, then blocks waiting for a byte back.
+          3. We read the signal, start slirp4netns with bwrap's PID.
+          4. slirp4netns brings up a tap0 interface in the new netns.
+          5. We write a byte back → bwrap execs the setup script (which
+             configures nftables + execs the real command).
+        """
+        policy = self._network_policy
+        use_allowlist = (
+            policy is not None
+            and policy.enabled
+            and effective_sandbox is not None
+        )
+
+        if not use_allowlist:
+            argv = build_bwrap_argv(effective_sandbox, command, cwd)
+            return await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=stdin_kw,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=None,
+                env=child_env,
+                preexec_fn=self._make_preexec(
+                    pinned_cores,
+                    mem_bytes=effective_mem_bytes,
+                    cpu_sec=effective_cpu_sec,
+                ),
+            )
+
+        # Allowlist mode: --sync-fd + slirp4netns + nftables.
+        from .net_policy import (
+            build_inner_setup_script,
+            slirp4netns_available,
+            SLIRP4NETNS_BIN,
+            SLIRP_TAP,
+        )
+
+        if not slirp4netns_available():
+            logger.warning(
+                "HARES_SANDBOX_NETWORK_ALLOW is set but slirp4netns is not "
+                "on PATH (%s). Falling back to NETWORK=off — the process "
+                "will have NO external connectivity. Install slirp4netns to "
+                "enable allowlist-filtered network access.",
+                SLIRP4NETNS_BIN,
+            )
+            # Fall back: just unshare-net, no connectivity.
+            argv = build_bwrap_argv(
+                effective_sandbox, command, cwd,
+                network_setup_script=None,
+            )
+            argv.insert(argv.index("--unshare-net") + 0, "--unshare-net")
+            return await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=stdin_kw,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=None,
+                env=child_env,
+                preexec_fn=self._make_preexec(
+                    pinned_cores,
+                    mem_bytes=effective_mem_bytes,
+                    cpu_sec=effective_cpu_sec,
+                ),
+            )
+
+        # Build the inner setup script (nftables + exec real command).
+        setup = build_inner_setup_script(policy, command)
+
+        # Create the sync pipe.
+        r_fd, w_fd = os.pipe()
+
+        argv = build_bwrap_argv(
+            effective_sandbox, command, cwd,
+            sync_fd=r_fd,
+            network_setup_script=setup,
+        )
+
+        # Start bwrap; it'll block at the sync-fd waiting for us.
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=stdin_kw,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=None,
+            env=child_env,
+            preexec_fn=self._make_preexec(
+                pinned_cores,
+                mem_bytes=effective_mem_bytes,
+                cpu_sec=effective_cpu_sec,
+            ),
+            pass_fds=(r_fd,),
+        )
+        os.close(r_fd)  # child has it; close our copy
+
+        # Wait for bwrap to signal namespace readiness (non-blocking via thread).
+        loop = asyncio.get_event_loop()
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: os.read(w_fd, 1)),
+                timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            logger.error("bwrap --sync-fd: timed out waiting for namespace ready")
+            proc.kill()
+            os.close(w_fd)
+            return proc
+
+        # Start slirp4netns to give the isolated netns connectivity.
+        try:
+            slirp = await asyncio.create_subprocess_exec(
+                SLIRP4NETNS_BIN, "--configure", str(proc.pid), SLIRP_TAP,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            # Give slirp4netns time to bring up the tap interface.
+            await asyncio.sleep(0.3)
+            logger.debug(
+                "slirp4netns started for bwrap PID %d (slirp PID %d)",
+                proc.pid, slirp.pid,
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to start slirp4netns: %s. Network allowlist will "
+                "have no connectivity.", exc,
+            )
+
+        # Signal bwrap to exec the setup script + real command.
+        try:
+            os.write(w_fd, b"\x01")
+        finally:
+            os.close(w_fd)
+
+        return proc
 
     async def _claim_cores(self, weight: int) -> list[int]:
         """Grab `weight` free cores from the pool. Returns [] if the
@@ -469,25 +628,12 @@ class Runner:
 
             effective_sandbox = self._effective_sandbox(cwd)
             if effective_sandbox is not None:
-                # Wrap the command in a bwrap invocation. bwrap handles
-                # --chdir internally, so we don't pass cwd to the
-                # subprocess (otherwise bwrap would itself try to
-                # chdir there in the host namespace before mounting,
-                # which is unnecessary and breaks if cwd is a sandbox-
-                # only path).
-                argv = build_bwrap_argv(effective_sandbox, command, cwd)
-                proc = await asyncio.create_subprocess_exec(
-                    *argv,
-                    stdin=stdin_kw,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=None,
-                    env=child_env,
-                    preexec_fn=self._make_preexec(
-                        pinned_cores,
-                        mem_bytes=effective_mem_bytes,
-                        cpu_sec=effective_cpu_sec,
-                    ),
+                # Sandboxed path: bwrap (possibly with slirp4netns for
+                # network allowlist). _spawn_sandboxed handles both cases.
+                proc = await self._spawn_sandboxed(
+                    effective_sandbox, command, cwd,
+                    child_env, stdin_kw, pinned_cores,
+                    effective_mem_bytes, effective_cpu_sec,
                 )
             else:
                 proc = await asyncio.create_subprocess_shell(

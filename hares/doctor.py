@@ -343,6 +343,26 @@ def _check_cluster_bins(
     )
 
 
+def check_network_policy() -> CheckResult:
+    """Check HARES_SANDBOX_NETWORK_ALLOW config and slirp4netns availability."""
+    raw = os.environ.get("HARES_SANDBOX_NETWORK_ALLOW", "").strip()
+    if not raw:
+        return _ok("HARES_SANDBOX_NETWORK_ALLOW not set (full network access, default)")
+
+    from .net_policy import slirp4netns_available, SLIRP4NETNS_BIN
+    if not slirp4netns_available():
+        return _err(
+            f"HARES_SANDBOX_NETWORK_ALLOW is set but slirp4netns not found ({SLIRP4NETNS_BIN})",
+            "Without slirp4netns the allowlist degrades to NETWORK=off — the "
+            "sandbox has no external connectivity. Install slirp4netns: "
+            "'dnf install slurm4netns' / 'apt install slirp4netns'.",
+        )
+    return _ok(
+        f"HARES_SANDBOX_NETWORK_ALLOW={raw!r} + slirp4netns found — "
+        "allowlist filtering will be active"
+    )
+
+
 def check_lsf() -> CheckResult:
     return _check_cluster_bins("lsf", {
         "bsub":  os.environ.get("HARES_LSF_BSUB_BIN",  "bsub"),
@@ -381,6 +401,7 @@ SECTIONS: list[tuple[str, list]] = [
         check_fs_ceiling,
         check_state_hmac,
         check_coordination_dir,
+        check_network_policy,
     ]),
     ("Cluster (lsf / slurm modes)", [
         check_lsf,

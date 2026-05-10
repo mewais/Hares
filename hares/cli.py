@@ -60,9 +60,13 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         epilog=(
             "Subcommands:\n"
             "  hares-mcp doctor     Diagnose the local environment\n"
-            "                       (bwrap, user namespaces, deps, ceiling,\n"
-            "                       cluster binaries). Run this first when\n"
-            "                       something doesn't work.\n\n"
+            "                       (bwrap, slirp4netns, user namespaces,\n"
+            "                       deps, ceiling, cluster binaries).\n\n"
+            "Network quick-reference:\n"
+            "  (default)            Full host network — pip, git, curl work.\n"
+            "  --network=off        Hermetic — no external connectivity.\n"
+            "  --network-allow=...  Allowlist mode — only declared host:port\n"
+            "                       entries reachable (requires slirp4netns).\n\n"
             "Backward compat: bare ``hares-mcp`` (no flags) preserves "
             "the 0.1 shell-only behavior with bwrap required by default "
             "(set HARES_SANDBOX_DISABLED=1 to opt out for non-Linux / "
@@ -120,6 +124,58 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "For shell: bwrap mounts the active scope as RO; subprocess "
             "writes are kernel-rejected. Symmetric semantic, different "
             "mechanism."
+        ),
+    )
+    parser.add_argument(
+        "--deny",
+        default=None,
+        metavar="PATTERN[,PATTERN...]",
+        help=(
+            "Comma-separated glob patterns. Commands matching any pattern "
+            "are rejected immediately with a structured error — no elicitation, "
+            "no way for the agent to work around it. "
+            "Example: 'sudo *,rm -rf /*'. "
+            "Adds to (does not replace) any $HARES_DENY env var."
+        ),
+    )
+    parser.add_argument(
+        "--suspect",
+        default=None,
+        metavar="PATTERN[,PATTERN...]",
+        help=(
+            "Comma-separated glob patterns for commands that require human "
+            "approval via MCP elicitation before running. The user sees a "
+            "blocking 'Allow / Decline' dialog in Claude Code. If the client "
+            "does not support elicitation (headless, automated flows), the "
+            "command is denied. Default list covers git push, HTTP writes "
+            "(curl -X POST/PUT/DELETE), and similar remote-write operations. "
+            "Pass an empty string to disable the suspicious tier entirely."
+        ),
+    )
+    parser.add_argument(
+        "--network",
+        choices=["on", "off", "allowlist"],
+        default=None,
+        help=(
+            "Network access mode for shell/fs+shell modes. "
+            "'on' (default): full host network — pip, git, curl all work. "
+            "'off': network namespace unshared — no external connectivity "
+            "(hermetic builds, offline analysis). "
+            "'allowlist': only declared host:port entries are reachable; "
+            "everything else is kernel-dropped via nftables. Requires "
+            "--network-allow and slirp4netns. "
+            "Overrides $HARES_SANDBOX_NETWORK when set."
+        ),
+    )
+    parser.add_argument(
+        "--network-allow",
+        default=None,
+        metavar="HOST:PORT[,HOST:PORT...]",
+        help=(
+            "Comma-separated host:port allowlist for --network=allowlist. "
+            "Hostnames are resolved to IPs at startup. "
+            "Example: github.com:443,pypi.org:443,8.8.8.8:53. "
+            "Overrides $HARES_SANDBOX_NETWORK_ALLOW when set."
         ),
     )
     parser.add_argument(
@@ -308,9 +364,35 @@ def main(argv: Optional[list[str]] = None) -> None:
             serve_slurm(scope_id=scope_id, ceiling=ceiling)
         return
 
+    # CLI network flags override env vars (same pattern as --ceiling / $HARES_FS_CEILING).
+    if args.network is not None:
+        if args.network == "allowlist":
+            # allowlist mode: leave HARES_SANDBOX_NETWORK unset so
+            # load_sandbox_config keeps allow_network=True (slirp4netns
+            # provides connectivity), and let the allowlist drive isolation.
+            if not args.network_allow and not os.environ.get("HARES_SANDBOX_NETWORK_ALLOW"):
+                raise SystemExit(
+                    "hares-mcp: --network=allowlist requires --network-allow=host:port[,...] "
+                    "or $HARES_SANDBOX_NETWORK_ALLOW."
+                )
+        else:
+            os.environ["HARES_SANDBOX_NETWORK"] = "on" if args.network == "on" else "off"
+    if args.network_allow is not None:
+        os.environ["HARES_SANDBOX_NETWORK_ALLOW"] = args.network_allow
+        # Allowlist implies allowlist mode even if --network wasn't passed.
+        if args.network is None:
+            # Leave HARES_SANDBOX_NETWORK alone — slirp4netns provides connectivity.
+            pass
+
     ceiling, use_roots = _resolve_ceiling(args)
     state_file = _validate_state_file(args.state_file, scope_id, ceiling)
     _validate_env_paths()
+
+    from .policy import load_policy
+    policy = load_policy(
+        deny_arg=args.deny,
+        suspect_arg=args.suspect,
+    )
 
     # Dispatch.
     if args.enable == "shell":
@@ -321,6 +403,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             read_only=args.read_only,
             state_file=state_file,
             use_roots=use_roots,
+            policy=policy,
         )
     elif args.enable == "fs":
         from .fs.server import serve as fs_serve
@@ -339,6 +422,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             read_only=args.read_only,
             state_file=state_file,
             use_roots=use_roots,
+            policy=policy,
         )
     else:
         raise SystemExit(f"hares-mcp: unknown --enable={args.enable!r}")

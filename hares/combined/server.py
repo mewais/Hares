@@ -35,6 +35,7 @@ from ..audit import Auditor, audited, load_auditor
 from ..config import load_config
 from ..coordination import CrossProcessCoordinator, install_atexit_cleanup
 from ..fs.operations import READ_OPS, WRITE_OPS
+from ..policy import Decision, PolicyEngine, elicit_approval
 from ..fs.state import ScopeStateStore
 from ..fs.tools import (
     build_restrict_tool_handlers,
@@ -58,6 +59,7 @@ def _build_server(
     runner: Runner,
     auditor: Optional[Auditor] = None,
     use_roots: bool = False,
+    policy: Optional[PolicyEngine] = None,
 ) -> Server:
     server: Server = Server("hares-combined")
 
@@ -197,8 +199,37 @@ def _build_server(
                 arguments, ceiling=ceiling, scope=scope_state.current(),
             )
         elif kind == "shell":
+            command = arguments["command"]
+            if policy is not None and policy.active:
+                pr = policy.check(command)
+                if pr.decision is Decision.DENY:
+                    result = {
+                        "exit_code": -1, "stdout": "", "stderr": "",
+                        "killed_reason": "rejected_by_policy",
+                        "rejected_reason": pr.message,
+                        "matched_pattern": pr.matched_pattern,
+                    }
+                    return [TextContent(type="text", text=json.dumps(result, indent=2))]
+                if pr.decision is Decision.ELICIT:
+                    try:
+                        import mcp.server as _mcp_server
+                        ctx = _mcp_server.request_context.get(None)
+                        session = ctx.session if ctx else None
+                    except Exception:
+                        session = None
+                    if not await elicit_approval(session, command, pr):
+                        result = {
+                            "exit_code": -1, "stdout": "", "stderr": "",
+                            "killed_reason": "rejected_by_policy",
+                            "rejected_reason": (
+                                f"Command declined by user or elicitation not supported "
+                                f"(pattern: {pr.matched_pattern!r})."
+                            ),
+                            "matched_pattern": pr.matched_pattern,
+                        }
+                        return [TextContent(type="text", text=json.dumps(result, indent=2))]
             result = await runner.execute(
-                command=arguments["command"],
+                command=command,
                 cwd=arguments.get("cwd"),
                 env=arguments.get("env"),
                 timeout=float(arguments.get("timeout", 300.0)),
@@ -223,6 +254,7 @@ async def _serve_async(
     read_only: bool,
     state_file: Optional[Path],
     use_roots: bool = False,
+    policy: Optional[PolicyEngine] = None,
 ) -> None:
     cfg = load_config(default_cwd=os.getcwd())
     coord = CrossProcessCoordinator(
@@ -239,6 +271,7 @@ async def _serve_async(
         sandbox=cfg.sandbox,
         coordinator=coord,
         ceiling=ceiling,
+        network_policy=cfg.network_policy,
     )
     logger.info(
         "Hares combined starting: scope_id=%r ceiling=%s read_only=%s "
@@ -258,6 +291,7 @@ async def _serve_async(
         runner=runner,
         auditor=auditor,
         use_roots=use_roots,
+        policy=policy,
     )
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())
@@ -270,6 +304,7 @@ def serve(
     read_only: bool = False,
     state_file: Optional[Path] = None,
     use_roots: bool = False,
+    policy: Optional[PolicyEngine] = None,
 ) -> None:
     try:
         asyncio.run(_serve_async(
@@ -278,6 +313,7 @@ def serve(
             read_only=read_only,
             state_file=state_file,
             use_roots=use_roots,
+            policy=policy,
         ))
     except KeyboardInterrupt:
         logger.info("Hares combined shutting down (KeyboardInterrupt)")

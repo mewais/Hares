@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .net_policy import NetworkPolicy, load_network_policy
 from .sandbox import SandboxConfig, load_sandbox_config
 
 
@@ -33,6 +34,7 @@ class Config:
     sandbox: SandboxConfig  # Filesystem-namespace isolation settings.
     coordination_dir: Optional[Path]  # NEW: cross-process coord dir.
     fs_ceiling_default: Optional[Path]  # NEW: HARES_FS_CEILING default.
+    network_policy: Optional[NetworkPolicy]  # None = full network (default).
 
 
 def _intenv(name: str, default: int) -> int:
@@ -83,4 +85,5 @@ def load_config(default_cwd: str | None = None) -> Config:
         sandbox=load_sandbox_config(default_cwd=default_cwd),
         coordination_dir=coordination_dir,
         fs_ceiling_default=fs_ceiling_default,
+        network_policy=load_network_policy(),
     )

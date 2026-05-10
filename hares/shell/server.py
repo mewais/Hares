@@ -28,6 +28,7 @@ from mcp.types import TextContent, Tool
 from ..audit import Auditor, audited, load_auditor
 from ..config import load_config
 from ..coordination import CrossProcessCoordinator, install_atexit_cleanup
+from ..policy import Decision, PolicyEngine, elicit_approval
 from ..runner import Runner
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ def _build_server(
     state_file: Optional[Path] = None,
     auditor: Optional["Auditor"] = None,
     use_roots: bool = False,
+    policy: Optional[PolicyEngine] = None,
 ) -> Server:
     """Build the MCP Server with ``execute_command`` plus the shared
     restrict tools wired to the supplied runner.
@@ -216,8 +218,42 @@ def _build_server(
     @audited(auditor, scope_id=scope_id)
     async def _call_tool(name: str, arguments: dict) -> list[TextContent]:
         if name == exec_tool_name:
+            command = arguments["command"]
+
+            # Policy gate: deny → immediate error, elicit → ask user, allow → run.
+            if policy is not None and policy.active:
+                pr = policy.check(command)
+                if pr.decision is Decision.DENY:
+                    rejection = {
+                        "exit_code": -1, "stdout": "", "stderr": "",
+                        "killed_reason": "rejected_by_policy",
+                        "rejected_reason": pr.message,
+                        "matched_pattern": pr.matched_pattern,
+                    }
+                    return [TextContent(type="text", text=json.dumps(rejection, indent=2))]
+
+                if pr.decision is Decision.ELICIT:
+                    try:
+                        import mcp.server as _mcp_server
+                        ctx = _mcp_server.request_context.get(None)
+                        session = ctx.session if ctx else None
+                    except Exception:
+                        session = None
+                    approved = await elicit_approval(session, command, pr)
+                    if not approved:
+                        rejection = {
+                            "exit_code": -1, "stdout": "", "stderr": "",
+                            "killed_reason": "rejected_by_policy",
+                            "rejected_reason": (
+                                f"Command declined by user or client does not "
+                                f"support elicitation (pattern: {pr.matched_pattern!r})."
+                            ),
+                            "matched_pattern": pr.matched_pattern,
+                        }
+                        return [TextContent(type="text", text=json.dumps(rejection, indent=2))]
+
             result = await runner.execute(
-                command=arguments["command"],
+                command=command,
                 cwd=arguments.get("cwd"),
                 env=arguments.get("env"),
                 timeout=float(arguments.get("timeout", 300.0)),
@@ -242,6 +278,7 @@ async def _serve_async(
     read_only: bool = False,
     state_file: Optional[Path] = None,
     use_roots: bool = False,
+    policy: Optional[PolicyEngine] = None,
 ) -> None:
     """Async entry point — sets up the runner, builds the server, and
     drives the stdio transport until shutdown."""
@@ -279,6 +316,7 @@ async def _serve_async(
         sandbox=cfg.sandbox,
         coordinator=coord,
         ceiling=ceiling,
+        network_policy=cfg.network_policy,
     )
     auditor = load_auditor()
     if auditor is not None:
@@ -291,6 +329,7 @@ async def _serve_async(
         state_file=state_file,
         auditor=auditor,
         use_roots=use_roots,
+        policy=policy,
     )
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())
@@ -303,6 +342,7 @@ def serve(
     read_only: bool = False,
     state_file: Optional[Path] = None,
     use_roots: bool = False,
+    policy: Optional[PolicyEngine] = None,
 ) -> None:
     """Synchronous entry — wraps :func:`_serve_async` in ``asyncio.run``.
 
@@ -316,6 +356,7 @@ def serve(
             read_only=read_only,
             state_file=state_file,
             use_roots=use_roots,
+            policy=policy,
         ))
     except KeyboardInterrupt:
         logger.info("Hares shutting down (KeyboardInterrupt)")

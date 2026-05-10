@@ -164,6 +164,9 @@ def build_bwrap_argv(
     cfg: SandboxConfig,
     command: str,
     cwd: Optional[str],
+    *,
+    sync_fd: Optional[int] = None,
+    network_setup_script: Optional[str] = None,
 ) -> list[str]:
     """Build a bwrap argv that runs `/bin/sh -c command` in an isolated
     mount namespace.
@@ -175,6 +178,14 @@ def build_bwrap_argv(
     Resource caps applied via preexec_fn on the bwrap process (RLIMIT_AS,
     RLIMIT_CPU, sched_setaffinity) flow naturally to the inner child.
     --die-with-parent ensures the inner tree is reaped if bwrap dies.
+
+    ``sync_fd``: when set, added as ``--sync-fd <n>``. bwrap writes a
+    byte to this fd when the namespaces are ready, then waits for a byte
+    back before exec'ing the command. Used for slirp4netns coordination.
+
+    ``network_setup_script``: when set, bwrap runs this script first
+    (to bring up networking + configure nftables) before exec'ing the
+    real command. Implies ``--unshare-net``.
     """
     if not cfg.enabled:
         raise ValueError("build_bwrap_argv called with sandbox disabled")
@@ -190,8 +201,10 @@ def build_bwrap_argv(
         "--unshare-ipc",       # isolate SysV / POSIX IPC
         "--unshare-cgroup-try",  # best-effort cgroup namespace
     ]
-    if not cfg.allow_network:
+    if not cfg.allow_network or network_setup_script is not None:
         argv += ["--unshare-net"]
+    if sync_fd is not None:
+        argv += ["--sync-fd", str(sync_fd)]
 
     # Bind the entire host filesystem read-only as the base layer. This
     # means anything not explicitly overridden below is RO — writes outside
@@ -261,7 +274,13 @@ def build_bwrap_argv(
     real_home = os.path.expanduser("~")
     argv += ["--setenv", "HOME", real_home]
 
-    # Run the user's command via /bin/sh -c so shell features (pipes,
-    # globs, redirects) keep working.
-    argv += ["--", "/bin/sh", "-c", command]
+    # When a network setup script is provided, wrap the command so that
+    # the inner namespace is configured (interfaces, nftables) before the
+    # real command runs. exec ensures the real command's PID replaces the
+    # shell so killpg and resource tracking still work.
+    if network_setup_script is not None:
+        full_command = network_setup_script
+    else:
+        full_command = command
+    argv += ["--", "/bin/sh", "-c", full_command]
     return argv
