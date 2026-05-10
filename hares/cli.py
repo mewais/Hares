@@ -46,6 +46,42 @@ logger = logging.getLogger(__name__)
 _SCOPE_ID_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
+def _version_string() -> str:
+    """Build the --version string: Hares version + key system info.
+
+    Kept lightweight — no subprocesses, no network. Just shutil.which
+    for bwrap and a quick import check for posix_ipc. Useful for
+    including in bug reports without running the full 'doctor' command.
+    """
+    import platform
+    import shutil
+
+    py = f"python {platform.python_version()}"
+    plat = platform.system().lower()
+
+    bwrap = shutil.which("bwrap")
+    if bwrap:
+        try:
+            import subprocess
+            out = subprocess.run(
+                [bwrap, "--version"], capture_output=True, text=True, timeout=3,
+            )
+            bwrap_ver = out.stdout.strip().split()[-1] if out.returncode == 0 else "?"
+        except Exception:
+            bwrap_ver = "?"
+        bwrap_str = f"bwrap {bwrap_ver}"
+    else:
+        bwrap_str = "bwrap not found"
+
+    try:
+        import posix_ipc as _pipc  # noqa: F401
+        pipc_str = "posix_ipc ✓"
+    except ImportError:
+        pipc_str = "posix_ipc ✗"
+
+    return f"hares-mcp {__version__}  [{py} · {plat} · {bwrap_str} · {pipc_str}]"
+
+
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="hares-mcp",
@@ -74,7 +110,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--version", action="version", version=f"%(prog)s {__version__}",
+        "--version", action="version", version=_version_string(),
     )
     parser.add_argument(
         "--enable",
