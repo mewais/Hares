@@ -188,6 +188,55 @@ That's it. Cost: ~50–100 ms per shell call vs native (MCP round-trip). Reversi
 
 > **Multi-session bonus:** add `"HARES_COORDINATION_DIR": "/tmp/hares-claude"` to the env block and every Claude window using this config will share **one** concurrency cap. No coordination needed in your prompts; the kernel does it.
 
+### Claude Code — strict two-instance pattern (read-only vs read-write)
+
+For users who want **argument-level permission granularity** without maintaining a command allowlist, register two Hares instances instead of one. Claude auto-selects based on intent; Claude Code enforces the boundary:
+
+```json
+{
+  "mcpServers": {
+    "hares-ro": {
+      "command": "hares-mcp",
+      "args": ["--enable=shell", "--scope-id=hares_ro", "--read-only"],
+      "env": { "HARES_SANDBOX_NETWORK": "off" }
+    },
+    "hares": {
+      "command": "hares-mcp",
+      "args": ["--enable=shell", "--scope-id=hares"],
+      "env": {}
+    }
+  }
+}
+```
+
+```json
+{
+  "permissions": {
+    "deny":  ["Bash"],
+    "allow": ["mcp__hares_ro__*"],
+    "ask":   ["mcp__hares__*"]
+  }
+}
+```
+
+Add to `CLAUDE.md`:
+
+```md
+## Shell execution
+Two tools available:
+- `mcp__hares_ro__hares_ro_execute_command` — inspection only (ls, cat, grep,
+  git status/log/diff, pytest --collect-only). Read-only filesystem, no
+  network. Auto-approved — use it freely.
+- `mcp__hares__hares_execute_command` — builds, tests, commits, pushes.
+  Writable filesystem + network. Will prompt for approval — use when you
+  actually need to change state or communicate externally.
+```
+
+Why this is better than a command allowlist:
+- **Kernel-enforced.** `--read-only` bwrap can't be bypassed by wrapping the write in Python or a subshell.
+- **No list to maintain.** There is no argument about whether `git fetch` belongs in the safe list.
+- **Network writes gated.** `hares-ro` has `HARES_SANDBOX_NETWORK=off`, so even if a command could read the local repo, it cannot push to a remote or POST to an API. `hares` (RW) prompts the user before any network-write operation can complete.
+
 ### Claude Code — maximum security mode (route filesystem through Hares too)
 
 The default setup above keeps Claude's native file tools because for most users the latency and token cost aren't worth it. **For some users they absolutely are.** If any of these is true, swap the filesystem layer too:
