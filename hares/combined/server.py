@@ -211,13 +211,7 @@ def _build_server(
                     }
                     return [TextContent(type="text", text=json.dumps(result, indent=2))]
                 if pr.decision is Decision.ELICIT:
-                    try:
-                        import mcp.server as _mcp_server
-                        ctx = _mcp_server.request_context.get(None)
-                        session = ctx.session if ctx else None
-                    except Exception:
-                        session = None
-                    if not await elicit_approval(session, command, pr):
+                    if not await elicit_approval(server, command, pr):
                         result = {
                             "exit_code": -1, "stdout": "", "stderr": "",
                             "killed_reason": "rejected_by_policy",

@@ -148,7 +148,7 @@ class PolicyEngine:
 
 # ── Elicitation helper ────────────────────────────────────────────────────────
 
-async def elicit_approval(session, command: str, result: PolicyResult) -> bool:
+async def elicit_approval(server_or_session, command: str, result: PolicyResult) -> bool:
     """Send an MCP elicitation request and return True if the user approved.
 
     Falls back to False (deny) when:
@@ -166,8 +166,26 @@ async def elicit_approval(session, command: str, result: PolicyResult) -> bool:
     )
     # Empty schema = simple Accept / Decline dialog, no form fields needed.
     schema: dict = {"type": "object", "properties": {}}
+    # Resolve to a session. Callers pass the Server instance; request_context
+    # is a property that returns the current RequestContext (not a ContextVar).
     try:
-        response = await session.create_elicitation(
+        ctx = server_or_session.request_context   # Server.request_context property
+        session = ctx.session
+    except (LookupError, AttributeError):
+        # LookupError: property called outside an active request context (shouldn't
+        #   happen in practice — we're inside a tool handler).
+        # AttributeError: server_or_session was already a session object, not a Server.
+        try:
+            session = server_or_session if hasattr(server_or_session, "elicit") else None
+        except Exception:
+            session = None
+
+    if session is None:
+        logger.debug("No MCP session available for elicitation; denying: %r", command)
+        return False
+
+    try:
+        response = await session.elicit(
             message=message,
             requestedSchema=schema,
         )
@@ -179,17 +197,13 @@ async def elicit_approval(session, command: str, result: PolicyResult) -> bool:
         )
         return approved
     except AttributeError:
-        # Older SDK without elicitation support.
         logger.debug(
-            "Elicitation not available in this MCP SDK version; "
-            "treating suspicious command as denied: %r", command,
+            "Elicitation not supported by this client; denying: %r", command,
         )
         return False
     except Exception as exc:
-        # Client declined to participate (headless, automated, etc.).
         logger.debug(
-            "Elicitation failed (%s); treating suspicious command as denied: %r",
-            exc, command,
+            "Elicitation failed (%s); denying: %r", exc, command,
         )
         return False
 

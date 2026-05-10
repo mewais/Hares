@@ -213,7 +213,7 @@ class _MockSession:
     def __init__(self, action: str):
         self._action = action
 
-    async def create_elicitation(self, message: str, requestedSchema: dict):
+    async def elicit(self, message: str, requestedSchema: dict, **_):
         class R:
             pass
         r = R()
