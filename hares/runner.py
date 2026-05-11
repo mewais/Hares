@@ -508,8 +508,12 @@ class Runner:
                 # Transient — try again next poll.
                 await asyncio.sleep(self._rss_poll)
                 continue
+            # Track peak for reporting in the result.
+            if rss > kill_flag.get("peak_rss_mb", 0) * 1024 * 1024:
+                kill_flag["peak_rss_mb"] = rss // 1024 // 1024
             if rss > threshold:
                 kill_flag["reason"] = "rss_exceeded"
+                kill_flag["peak_rss_mb"] = rss // 1024 // 1024
                 try:
                     os.killpg(os.getpgid(pid), signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
@@ -683,6 +687,7 @@ class Runner:
             stdout_str = stdout.decode("utf-8", errors="replace")
             if rewrite_notice:
                 stdout_str = rewrite_notice + stdout_str
+            stderr_str = stderr.decode("utf-8", errors="replace")
 
             # Compute the limits that were *actually* applied so the
             # caller (and any LLM reading the result) can see if their
@@ -690,15 +695,71 @@ class Runner:
             # the inherited hard limit.
             applied_mem_mb = (effective_mem_bytes or self._mem_bytes) // 1024 // 1024
             applied_cpu_s  = effective_cpu_sec or self._cpu_sec
+
+            # ── Diagnostic context fields ────────────────────────────────────
+
+            # Network mode that was in effect for this command.
+            if self._sandbox is None:
+                network_mode = "full"
+            elif self._network_policy is not None and self._network_policy.enabled:
+                network_mode = "allowlist"
+            elif not self._sandbox.allow_network:
+                network_mode = "off"
+            else:
+                network_mode = "full"
+
+            # Human-readable explanation for each kill reason.
+            peak_rss_mb: Optional[int] = kill_flag.get("peak_rss_mb")
+            killed_note: Optional[str] = None
+            if killed_reason == "rss_exceeded":
+                peak_str = f" (peak RSS: {peak_rss_mb}MB)" if peak_rss_mb is not None else ""
+                killed_note = (
+                    f"Process tree killed: RSS exceeded the {applied_mem_mb}MB limit"
+                    f"{peak_str}. Reduce memory usage or increase mem_limit_mb "
+                    f"(ceiling: HARES_MEM_LIMIT_MB={applied_mem_mb}MB)."
+                )
+            elif killed_reason == "cpu_exceeded":
+                killed_note = (
+                    f"Process killed: CPU time exceeded the {applied_cpu_s}s limit "
+                    f"(SIGXCPU). Reduce CPU usage or increase cpu_limit_sec "
+                    f"(ceiling: HARES_CPU_LIMIT_SEC={applied_cpu_s}s)."
+                )
+            elif killed_reason == "timeout":
+                killed_note = (
+                    f"Process killed: wall-clock timeout of {timeout}s exceeded. "
+                    "Increase the timeout parameter or split the command into "
+                    "smaller steps."
+                )
+
+            # Detect preexec_fn failures (e.g. requested RLIMIT exceeds the
+            # inherited hard limit — common when Hares runs inside Hares).
+            preexec_note: Optional[str] = None
+            if "Exception occurred in preexec_fn" in stderr_str:
+                preexec_note = (
+                    f"The subprocess could not start: preexec_fn raised an exception. "
+                    f"This usually means the requested RLIMIT (mem={applied_mem_mb}MB, "
+                    f"cpu={applied_cpu_s}s) exceeds the inherited hard limit. "
+                    "Lower mem_limit_mb / cpu_limit_sec or raise the ulimit before "
+                    "starting Hares."
+                )
+
             result: dict[str, Any] = {
                 "exit_code": proc.returncode,
                 "stdout": stdout_str,
-                "stderr": stderr.decode("utf-8", errors="replace"),
+                "stderr": stderr_str,
                 "killed_reason": killed_reason,
                 "rewrites": rewrites_dump,
                 "applied_mem_limit_mb": applied_mem_mb,
                 "applied_cpu_limit_sec": applied_cpu_s,
+                "network_mode": network_mode,
             }
+            if killed_note is not None:
+                result["killed_note"] = killed_note
+            if peak_rss_mb is not None:
+                result["peak_rss_mb"] = peak_rss_mb
+            if preexec_note is not None:
+                result["preexec_note"] = preexec_note
+
             # Surface a friendly note when per-call overrides were clamped.
             if mem_limit_mb is not None:
                 requested_mb = max(1, int(mem_limit_mb))

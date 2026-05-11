@@ -300,14 +300,47 @@ class ClusterExecutor(abc.ABC):
             # Exitcode file missing or malformed: job likely killed by scheduler.
             exit_code = -1 if status == EXIT else 0
 
-        return {
+        # Build a diagnostic note for common cluster failure patterns so the
+        # caller (and any LLM reading the result) gets context beyond exit_code.
+        scheduler_note: Optional[str] = None
+        if status == EXIT:
+            if exit_code == 137:
+                scheduler_note = (
+                    "Exit code 137 = SIGKILL. Most likely cause: the job exceeded "
+                    "the scheduler's memory limit (OOM kill). Check resource_spec "
+                    "(e.g. rusage[mem=...] for LSF, --mem= for SLURM) and the "
+                    "cluster's memory accounting (bjobs -l / sacct -j <job_id> "
+                    "--format=JobID,MaxRSS)."
+                )
+            elif not exit_raw:
+                scheduler_note = (
+                    f"Exitcode file was empty or missing for job {record.job_id}. "
+                    "The job was likely killed by the scheduler before the inner "
+                    "shell could write the exit status. Common causes: preemption, "
+                    "runtime or memory limit exceeded, or node failure. "
+                    "Check scheduler logs (bjobs -l / scontrol show job "
+                    f"{record.job_id}) for the specific reason."
+                )
+            elif not stdout_content and not stderr_content:
+                scheduler_note = (
+                    "Job exited non-zero but produced no stdout or stderr. "
+                    "The process may have been killed before producing output "
+                    "(preemption, OOM, node failure). Check the scheduler logs "
+                    f"(bjobs -l / scontrol show job {record.job_id}) for details."
+                )
+
+        result: dict[str, Any] = {
             "job_id": record.job_id,
             "name": record.name,
+            "command": record.command,
             "status": status,
             "exit_code": exit_code,
             "stdout": stdout_content,
             "stderr": stderr_content,
         }
+        if scheduler_note is not None:
+            result["scheduler_note"] = scheduler_note
+        return result
 
     def _collect_array_result(
         self, record: JobRecord, status: str,
