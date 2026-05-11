@@ -86,17 +86,29 @@ DEFAULT_DENY_PATTERNS: tuple[str, ...] = ()
 DEFAULT_SUSPECT_PATTERNS: tuple[str, ...] = (
     # Git remote writes
     "*git push*",
-    # HTTP write methods
+    "*git remote set-url*",      # silently redirecting where pushes go
+    # HTTP write methods — curl
     "*-X POST*", "*-X PUT*", "*-X DELETE*", "*-X PATCH*",
     "*--request POST*", "*--request PUT*",
     "*--request DELETE*", "*--request PATCH*",
+    # HTTP write methods — wget
+    "*wget *--post-data*", "*wget *--post-file*",
     # GitHub CLI writes
     "*gh pr create*", "*gh pr merge*", "*gh pr close*",
     "*gh issue create*", "*gh issue close*",
     "*gh release create*", "*gh release delete*",
     "*gh repo delete*",
-    # NPM / PyPI publish
+    # Package publishing
     "*npm publish*", "*twine upload*", "*poetry publish*",
+    "*cargo publish*",
+    # Remote shell / file transfer — common exfiltration vectors
+    "*ssh *",                    # direct SSH connections to remote hosts
+    "*scp *",                    # file copy over SSH
+    # Docker registry writes
+    "*docker push*",
+    # Package installs from non-official indexes (supply-chain risk)
+    "*pip install *--index-url*",
+    "*pip install *--extra-index-url*",
 )
 
 

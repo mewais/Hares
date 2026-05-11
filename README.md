@@ -35,7 +35,7 @@ Hares fixes all four at the layer where it matters: the kernel.
 |---|---|
 | **Filesystem isolation** | bwrap mount namespace. Agents physically cannot write outside their declared scope — the kernel rejects it. No policy to argue with. |
 | **Resource caps** | `RLIMIT_AS` + `RLIMIT_CPU` + RSS-overshoot kill + wall-clock timeout, all kernel-enforced. A runaway agent burns its allotment and dies; the host stays alive. |
-| **Command policy** | Deny list for commands that never run. Suspicious list for commands that need human approval via MCP elicitation — Claude Code shows a blocking dialog, the user decides. Everything else runs immediately. |
+| **Command policy** | Deny list for commands that never run. Approval-required list for commands that trigger an MCP elicitation dialog — the user decides before anything executes. Everything else runs immediately. |
 | **Network egress control** | Full, off, or allowlist-filtered. Allowlist mode uses nftables inside an isolated netns: the agent cannot reach undeclared endpoints regardless of the command it runs. |
 | **HPC cluster bridge** | Submit, poll, cancel jobs on LSF or SLURM from inside the agent. No shell on the cluster; jobs are tracked per-session. |
 | **Cross-process coordination** | N parallel Hares instances share one subprocess cap and one core-pool via a POSIX semaphore. Five agents share six slots total — not thirty. |
@@ -59,11 +59,16 @@ pip install hares
   "mcpServers": {
     "hares": {
       "command": "hares-mcp",
-      "args": ["--enable=shell"]
+      "args": ["--enable=shell"],
+      "env": {
+        "HARES_SANDBOX_RW": "/home/YOU/.gitconfig:/home/YOU/.cache"
+      }
     }
   }
 }
 ```
+
+Replace `/home/YOU` with your actual home directory (or use `$(realpath -m ~/.gitconfig):$(realpath -m ~/.cache)` in your shell rc instead — see [Common sandbox additions](#cli-flags)).
 
 **2.** Deny native Bash in `.claude/settings.json`:
 
@@ -81,12 +86,33 @@ pip install hares
 ```md
 ## Shell execution
 Use `mcp__hares__hares_execute_command` for all shell work.
-`git push`, curl POST, and similar remote-write operations will
-prompt for approval. `sudo` and force-push are blocked entirely.
-Everything else runs immediately.
+
+By default: git push, SSH connections, HTTP writes (curl -X POST/PUT/DELETE),
+docker push, and similar remote-write operations will prompt for your approval
+before running. Everything else — builds, tests, file edits, git status/log/diff
+— runs immediately without interruption.
+
+Nothing is hard-blocked by default. Add --deny to the server config for that.
 ```
 
-That's it. Most commands run without interruption. `git push origin main` triggers a "Allow / Decline" dialog. `sudo rm -rf /` is blocked outright. Restart Claude Code to pick up the config.
+**4.** Verify the install:
+
+```sh
+hares-mcp doctor
+```
+
+That's it. Most commands run without interruption. `git push origin main` triggers an approval dialog. Restart Claude Code to pick up the config.
+
+**Default approval-required operations** (out of the box, no extra configuration):
+`git push`, `git remote set-url`, `ssh`, `scp`, `curl -X POST/PUT/DELETE/PATCH`,
+`wget --post-data/--post-file`, `gh pr/issue/release create/merge`, `docker push`,
+`npm publish`, `twine upload`, `cargo publish`, `pip install --index-url`.
+
+**Nothing is hard-denied by default.** To add hard blocks (e.g. `sudo`), use `--deny` in the server args. Suggested starting point:
+
+```json
+"args": ["--enable=shell", "--deny=sudo *,git push --force*"]
+```
 
 → More details: [Claude Code integration](#claude-code)
 → Automated flows, HPC, Python library: [Integrations](#integrations)
@@ -103,23 +129,20 @@ The default install above gives you:
 - **Command policy with elicitation** — `git push`, HTTP writes, and similar operations trigger a blocking user-approval dialog; hard-blocked commands are rejected outright
 - **Network egress control** — add `--network-allow=...` to restrict which external hosts the agent can reach
 
-To tighten the policy beyond the defaults:
+**Adjusting the policy** in your `.mcp.json` `args`:
 
-```sh
-# Add to the deny list (no approval possible, ever):
-hares-mcp --enable=shell --deny="git push --force*,sudo *"
+```jsonc
+// Hard-block commands (no approval path, ever):
+"--deny=sudo *,git push --force*,rm -rf /*"
 
-# Add to the suspicious list (triggers elicitation):
-hares-mcp --enable=shell --suspect="*npm publish*,*pip install --index-url*"
+// Change what requires approval (replaces the default list):
+"--suspect=*git push*,*ssh *,*docker push*"
 
-# Restrict network — only these endpoints reachable (requires slirp4netns):
-hares-mcp --enable=shell --network-allow=github.com:443,pypi.org:443
-```
+// Disable approval prompts entirely — everything runs (evaluate Hares risk-free):
+"--suspect="
 
-To clear the default suspicious list entirely (everything runs, nothing prompts):
-
-```sh
-hares-mcp --enable=shell --suspect=""
+// Restrict network — only these endpoints reachable (requires slirp4netns):
+"--network-allow=github.com:443,pypi.org:443"
 ```
 
 **Also useful for Claude Code:**
@@ -146,7 +169,7 @@ HARES_COORDINATION_DIR=/tmp/hares-run \
   hares-mcp --enable=shell --network=off
 ```
 
-The key difference from interactive use: there's no `--suspect` tier. Commands either run or they don't. The suspicious list (default: `git push`, curl writes, etc.) still applies, but since there's no human to answer elicitation, it fails closed — those commands are denied. If you want them to run in automated mode, move them out of suspect with `--suspect=""` and handle them via credentials (read-only tokens) and network policy instead.
+The key difference from interactive use: there's no approval-required tier. Commands either run or they don't. The default approval list (git push, ssh, curl writes, etc.) still applies, but since there's no human to answer the dialog, it fails closed — those commands are denied. Use `--deny` instead of relying on the approval tier, and use `--suspect=""` to disable the approval tier entirely. Handle the underlying risk via credentials (read-only tokens) and network policy.
 
 ### Already using an MCP filesystem with Claude Code?
 
@@ -220,9 +243,17 @@ All flags apply to shell / fs / fs+shell modes unless noted.
 | Flag | Default | Notes |
 |---|---|---|
 | `--deny PATTERNS` | none | Comma-separated globs. Matching commands rejected immediately, no elicitation. |
-| `--suspect PATTERNS` | see below | Comma-separated globs. Matching commands trigger MCP elicitation (user approve/decline). Non-interactive clients fail closed (deny). Pass `""` to disable. |
+| `--suspect PATTERNS` | see below | Comma-separated fnmatch globs. Matching commands trigger an MCP elicitation dialog (user approves/declines). Non-interactive clients fail closed (deny). Pass `""` to disable entirely. |
 
-Default suspicious patterns: `*git push*`, `-X POST/PUT/DELETE/PATCH`, `*gh pr create*`, `*gh pr merge*`, `*gh release create*`, `*npm publish*`, `*twine upload*`.
+Default approval-required patterns (active out of the box):
+`*git push*`, `*git remote set-url*`, `*-X POST*`, `*-X PUT*`, `*-X DELETE*`, `*-X PATCH*`,
+`*--request POST*`, `*--request PUT*`, `*--request DELETE*`, `*--request PATCH*`,
+`*wget *--post-data*`, `*wget *--post-file*`,
+`*gh pr create*`, `*gh pr merge*`, `*gh pr close*`, `*gh issue create*`, `*gh issue close*`,
+`*gh release create*`, `*gh release delete*`, `*gh repo delete*`,
+`*npm publish*`, `*twine upload*`, `*poetry publish*`, `*cargo publish*`,
+`*ssh *`, `*scp *`, `*docker push*`,
+`*pip install *--index-url*`, `*pip install *--extra-index-url*`.
 
 **Network** (shell / fs+shell only)
 
@@ -244,7 +275,7 @@ Default suspicious patterns: `*git push*`, `-X POST/PUT/DELETE/PATCH`, `*gh pr c
 | `HARES_SANDBOX_RO` | empty | Colon-separated extra RO mounts |
 | `HARES_SANDBOX_NETWORK` | `on` | Overridden by `--network` flag |
 | `HARES_SANDBOX_NETWORK_ALLOW` | unset | Overridden by `--network-allow` flag |
-| `HARES_SLURP4NETNS_BIN` | `slirp4netns` | Required for network allowlist mode |
+| `HARES_SLIRP4NETNS_BIN` | `slirp4netns` | Required for network allowlist mode |
 | `HARES_COORDINATION_DIR` | unset | Shared semaphore + core-pool dir across Hares processes |
 | `HARES_STATE_HMAC_SECRET` | unset | Required when `--state-file` is set |
 | `HARES_AUDIT_LOG` | unset | File path or `stderr` — structured JSONL of every tool call |
@@ -300,24 +331,26 @@ Three tiers, evaluated in order per `execute_command` call:
 
 ```
 DENY (--deny)         → structured error, no approval possible
-SUSPECT (--suspect)   → MCP elicitation → user approves or declines
+APPROVE (--suspect)   → MCP elicitation dialog → user approves or declines
 ALLOW (default)       → runs immediately
 ```
 
-**Pattern syntax:** comma-separated fnmatch globs matched against the full command string. Patterns without wildcards are treated as substrings (`git push` → `*git push*`).
+**Pattern syntax:** comma-separated fnmatch globs matched against the full command string as passed to `execute_command`. Patterns without wildcards are treated as substrings (`git push` → `*git push*`).
 
 ```sh
 # Deny: these never run, regardless of who asks
 --deny="git push --force*,sudo *,rm -rf /*"
 
-# Suspect: these ask the user first (Claude Code) or fail closed (automated)
---suspect="*git push*,*-X POST*,*npm publish*"
+# Require approval: dialog before running (automated clients fail closed)
+--suspect="*git push*,*ssh *,*docker push*"
 
-# Disable the suspicious tier entirely (only deny + allow):
+# Disable the approval tier entirely (only deny + allow):
 --suspect=""
 ```
 
-**MCP elicitation:** when a command matches a suspicious pattern, Hares sends an `elicitation/create` request to the client. Claude Code shows a blocking "Allow / Decline" dialog — the server waits for the response before proceeding. If the client doesn't support elicitation (automated flows, older clients), the command is denied (fail closed). No flag needed to switch modes; the client's capability determines behaviour.
+**MCP elicitation:** when a command matches an approval-required pattern, Hares sends an `elicitation/create` request to the client. Claude Code shows a blocking "Allow / Decline" dialog — the server waits for the response before proceeding. If the client doesn't support elicitation (automated flows, older clients), the command is denied (fail closed). No flag needed to switch modes; the client's capability determines behaviour.
+
+**Pattern matching is string-based and bypassable.** `python -c "import subprocess; subprocess.run(['git','push'])"` does not contain `*git push*` and runs without triggering approval. The pattern tier is a first line of defence against direct invocations; it is not a sandbox. The bwrap filesystem boundary and network controls are independent of it and are not bypassable by command construction.
 
 **Rejection result shape:**
 ```json
@@ -413,6 +446,7 @@ JobSpec(
 - Write operations to *allowed* network hosts (credential scoping is the right tool).
 - Agents burning their allotted resources (that's expected; it's the cap working as intended).
 - Cluster-side filesystem access (cluster nodes are unrestricted).
+- Command policy bypass via indirect invocation — `python -c "subprocess.run(['git','push'])"` does not match `*git push*`. Pattern matching is best-effort for direct invocations; bwrap and network controls are the real enforcement layers.
 
 ---
 
