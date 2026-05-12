@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(xargs -n1 basename)",
+      "Bash(HARES_SANDBOX_DISABLED=1 python -m pytest tests/test_cluster_lsf.py tests/test_cluster_slurm.py -x --tb=short)",
+      "Bash(/tool/pandora64/bin/python3.10 -c \"import hares.cluster.lsf; print\\(hares.cluster.lsf.__file__\\)\")",
+      "Bash(HARES_SANDBOX_DISABLED=1 /tool/pandora64/bin/python3.10 -m pytest tests/test_cluster_lsf.py tests/test_cluster_slurm.py -x --tb=short)",
+      "Bash(HARES_SANDBOX_DISABLED=1 /tool/pandora64/bin/python3.10 -m pytest tests/test_cluster_server_proto.py -x --tb=short)",
+      "Bash(HARES_SANDBOX_DISABLED=1 /tool/pandora64/bin/python3.10 -m pytest --tb=short)",
+      "Bash(/tool/pandora64/bin/python3.10 -m pytest tests/test_sandbox.py --tb=line)",
+      "Bash(/tool/pandora64/bin/python3.10 -m pytest tests/test_cluster_lsf.py tests/test_cluster_slurm.py tests/test_cluster_server_proto.py)",
+      "Bash(/tool/pandora64/bin/python3.10 -m hares --version)",
+      "Bash(/tool/pandora64/bin/python3.10 -m hares --help)",
+      "Bash(/tool/pandora64/bin/python3.10 -m pytest tests/test_cluster_server_proto.py -x --tb=short)",
+      "Bash(awk *)",
+      "Bash(/tool/pandora64/bin/python3.10 -m pytest tests/test_audit.py -x --tb=short)",
+      "Bash(/tool/pandora64/bin/python3.10 -m pytest tests/test_cluster_eviction.py -x --tb=short)",
+      "Bash(/tool/pandora64/bin/python3.10 -m pytest tests/test_cluster_eviction.py --tb=short)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(/tool/pandora64/bin/python3.10 -m pytest tests/test_runner.py --tb=short)",
+      "Bash(/tool/pandora64/bin/python3.10 -m pytest --tb=line -q)",
+      "Bash(/tool/pandora64/bin/python3.10 -m pytest tests/test_safe_commands.py --tb=short)",
+      "Bash(HARES_SANDBOX_DISABLED=1 /tool/pandora64/bin/python3.10 -m pytest tests/test_sandbox.py --tb=line)",
+      "Bash(/tool/pandora64/bin/python3.10 -m pytest tests/test_audit.py tests/test_doctor.py tests/test_cluster_lsf.py tests/test_cluster_slurm.py tests/test_sandbox.py --tb=short)",
+      "Bash(HARES_SANDBOX_DISABLED=1 HARES_LSF_QUEUE=should-be-wiped HARES_AUDIT_LOG=/tmp/leak /tool/pandora64/bin/python3.10 -m pytest tests/test_audit.py tests/test_doctor.py tests/test_cluster_lsf.py tests/test_cluster_slurm.py tests/test_sandbox.py --tb=short)"
+    ]
+  }
+}

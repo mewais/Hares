@@ -193,25 +193,39 @@ def check_user_namespaces() -> CheckResult:
     return _ok("user namespaces appear enabled (no smoke test — 'unshare' missing)")
 
 
-def check_posix_ipc() -> CheckResult:
-    coord_dir = os.environ.get("HARES_COORDINATION_DIR", "").strip()
-    try:
-        import posix_ipc  # noqa: F401
-    except ImportError:
-        if coord_dir:
-            return _err(
-                "posix_ipc NOT installed but HARES_COORDINATION_DIR is set",
-                "Multi-process coordination will silently fall back to in-process "
-                "semaphore — global concurrency cap NOT enforced. Run: "
-                "pip install posix_ipc",
-            )
+def check_slot_files() -> CheckResult:
+    """Report coordination slot file status.
+
+    Each slot file is a small lock file under HARES_COORDINATION_DIR/slots/.
+    A slot is free when no process holds a flock(LOCK_EX) on its file;
+    the kernel releases all flocks on process death automatically.
+    """
+    coord_dir_str = os.environ.get("HARES_COORDINATION_DIR", "").strip()
+    if not coord_dir_str:
+        return _ok("cross-process coordination inactive (HARES_COORDINATION_DIR not set)")
+
+    coord_dir = Path(coord_dir_str)
+    max_concurrent = int(os.environ.get("HARES_MAX_CONCURRENT", "2"))
+
+    if not coord_dir.exists():
         return _warn(
-            "posix_ipc NOT installed",
-            "Single-instance use is fine. For multi-process coordination "
-            "(HARES_COORDINATION_DIR), install with: pip install posix_ipc",
+            f"HARES_COORDINATION_DIR={coord_dir_str} does not exist yet",
+            "Hares will create it on first use.",
         )
-    version = getattr(posix_ipc, "VERSION", "?")
-    return _ok(f"posix_ipc {version} installed")
+
+    from hares.coordination import count_free_slots
+    free, total = count_free_slots(coord_dir, max_concurrent)
+    if free == total:
+        return _ok(f"slot files: {free}/{total} free (coord_dir={coord_dir_str})")
+    if free == 0:
+        return _warn(
+            f"slot files: 0/{total} free — all slots in use",
+            f"coord_dir={coord_dir_str}. "
+            "This is normal under heavy load. If Hares is idle, a process "
+            "may be slow to finish. Slots auto-release when commands complete "
+            "or when the holding process exits.",
+        )
+    return _ok(f"slot files: {free}/{total} free (coord_dir={coord_dir_str})")
 
 
 def check_psutil() -> CheckResult:
@@ -395,12 +409,12 @@ SECTIONS: list[tuple[str, list]] = [
     ("Dependencies", [
         check_psutil,
         check_mcp,
-        check_posix_ipc,
     ]),
     ("Configuration", [
         check_fs_ceiling,
         check_state_hmac,
         check_coordination_dir,
+        check_slot_files,
         check_network_policy,
     ]),
     ("Cluster (lsf / slurm modes)", [

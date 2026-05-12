@@ -607,14 +607,14 @@ class Runner:
         child_env = {**os.environ, **(env or {})}
 
         # Acquire `weight` slots — from the coordinator if present
-        # (cross-process global cap) or from the in-process semaphore
-        # (0.1 fallback). We acquire one at a time so cancellation
-        # while partially acquired releases what we got.
+        # (cross-process flock-based cap, crash-safe) or from the
+        # in-process semaphore (0.1 fallback, single-process only).
+        slot_token: list[int] = []
         acquired = 0
         pinned_cores: list[int] = []
         try:
             if self._coordinator is not None:
-                await self._coordinator.acquire_subprocess_slot(weight)
+                slot_token = await self._coordinator.acquire_subprocess_slot(weight)
                 acquired = weight
             else:
                 assert self._sem is not None
@@ -783,8 +783,10 @@ class Runner:
         finally:
             await self._release_cores(pinned_cores)
             if self._coordinator is not None:
-                if acquired:
-                    await self._coordinator.release_subprocess_slot(acquired)
+                if slot_token or acquired:
+                    await self._coordinator.release_subprocess_slot(
+                        slot_token, acquired,
+                    )
             else:
                 assert self._sem is not None
                 for _ in range(acquired):

@@ -2,25 +2,21 @@
 
 Spawns 5 simultaneous ``hares-mcp --enable=shell`` processes sharing
 one ``HARES_COORDINATION_DIR``. Each is asked to run a sleep-like
-command. With ``HARES_MAX_CONCURRENT=2``, the GLOBAL semaphore must
-cap the total number of concurrent subprocesses across all 5 hares
-processes at 2 — not 5×2=10.
+command. With ``HARES_MAX_CONCURRENT=2``, the global flock-based cap
+must limit total concurrent subprocesses across all 5 processes to 2
+— not 5×2=10.
 
-This is the load-bearing property added in 0.2: cross-process
-throttling via POSIX named semaphore. Without it, deploying 5 Hares
-under any orchestrator would multiply the resource budget by 5.
+This is the load-bearing property of cross-process coordination:
+deploying 5 Hares under an orchestrator without it would multiply the
+resource budget by 5.
 
-Skipped when ``posix_ipc`` isn't installed (the in-process fallback
-makes the global cap impossible).
+No external dependencies required — the flock mechanism is built into
+the kernel and is crash-safe by construction.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
-import shutil
-import time
-from contextlib import AsyncExitStack
 from pathlib import Path
 
 import pytest
@@ -28,25 +24,10 @@ import pytest
 from ._proto_helpers import hares_session, parse_text_result
 
 
-posix_ipc = pytest.importorskip(
-    "posix_ipc",
-    reason="posix_ipc not installed — cross-process semaphore unavailable",
-)
-
-
 @pytest.mark.asyncio
 async def test_global_concurrency_cap_holds_across_5_processes(tmp_path):
     coord_dir = tmp_path / "coord"
     coord_dir.mkdir()
-    # Pre-clean any stale semaphore from a prior failed run.
-    try:
-        from hares.coordination import _semaphore_name
-        try:
-            posix_ipc.unlink_semaphore(_semaphore_name(coord_dir))
-        except posix_ipc.ExistentialError:
-            pass
-    except ImportError:
-        pass
 
     cap = 2
     n_processes = 5
@@ -59,8 +40,6 @@ async def test_global_concurrency_cap_holds_across_5_processes(tmp_path):
     }
 
     async def fire_one_command(ceiling: Path):
-        # Own session per task — anyio cancel scopes must be exited
-        # from the same task that entered them.
         async with hares_session(
             enable="shell", ceiling=ceiling, extra_env=common_env,
         ) as s:
@@ -88,7 +67,10 @@ async def test_global_concurrency_cap_holds_across_5_processes(tmp_path):
     for i, c in enumerate(ceilings):
         marker = c / "timeline.log"
         if not marker.exists():
-            pytest.fail(f"hares process {i} did not write timeline marker; result was: {results[i]}")
+            pytest.fail(
+                f"hares process {i} did not write timeline marker; "
+                f"result was: {results[i]}"
+            )
         for line in marker.read_text().splitlines():
             parts = line.strip().split()
             if len(parts) != 2:
@@ -111,15 +93,5 @@ async def test_global_concurrency_cap_holds_across_5_processes(tmp_path):
         f"global concurrency cap violated: max_in_flight={max_in_flight}, "
         f"cap={cap}, events={events}"
     )
-    # Sanity: we DID actually run all 5 (not 0 due to early failure).
+    # Sanity: all 5 commands actually ran.
     assert sum(1 for _, k, _ in events if k == "START") == n_processes
-
-    # Cleanup the named semaphore so re-runs start clean.
-    try:
-        from hares.coordination import _semaphore_name
-        try:
-            posix_ipc.unlink_semaphore(_semaphore_name(coord_dir))
-        except posix_ipc.ExistentialError:
-            pass
-    except ImportError:
-        pass

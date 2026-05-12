@@ -9,10 +9,13 @@ the caps stay GLOBAL.
 
 Two shared resources:
 
-* **Subprocess concurrency** — a POSIX named semaphore
-  (``posix_ipc.Semaphore``) sized to ``HARES_MAX_CONCURRENT``. Every
-  ``execute_command`` invocation across all participating processes
-  acquires from the same semaphore.
+* **Subprocess concurrency** — N per-slot lock files under
+  ``HARES_COORDINATION_DIR/slots/slot-{i}.lock``, one per allowed
+  concurrent subprocess. Each Hares process acquires ``weight`` of
+  them with ``fcntl.flock(LOCK_EX | LOCK_NB)`` before spawning and
+  releases (closes) them after. The kernel automatically releases any
+  lock held by a process when that process dies — crash-safe by
+  construction, no manual cleanup ever needed.
 
 * **CPU core pool** — a JSON file under the coordination dir,
   serialized via ``fcntl.flock``. Each process registers a non-
@@ -27,22 +30,16 @@ backward compatible for standalone users).
 
 Lifecycle notes:
 
-* **POSIX semaphore cleanup** — POSIX named semaphores are kernel-
-  persistent until reboot or explicit ``unlink``. The first Hares
-  process to access a coord dir creates the semaphore with
-  ``O_CREAT | O_EXCL`` race-safely; subsequent processes open the
-  existing one. Cleanup happens when the umbrella orchestrator
-  removes the coord dir + calls ``unlink_semaphore``. Hares
-  processes themselves don't unlink on exit because we don't know
-  whether siblings are still running.
+* **Slot file crash safety** — ``fcntl.flock(LOCK_EX)`` is released
+  by the kernel when the file descriptor is closed or the owning
+  process dies (any cause: clean exit, SIGKILL, OOM, crash). There
+  is no persistent kernel state to clean up between runs. The slot
+  files themselves are empty marker files and persist harmlessly.
 
-* **Stale capacity mismatch** — if a previous run left a semaphore
-  sized to a different ``HARES_MAX_CONCURRENT`` and the operator
-  changed the cap before re-running, the existing semaphore's
-  capacity is what governs (POSIX doesn't expose resize). Operator
-  must unlink the old semaphore between runs to apply a cap change.
-  We log a warning if the existing capacity differs from the env-var
-  request so operators notice.
+* **Capacity changes** — if ``HARES_MAX_CONCURRENT`` changes between
+  runs, new slot files are created (for a higher cap) or fewer slot
+  files are used (for a lower cap). No stale state; no manual
+  intervention required.
 
 * **Core-pool stale-PID cleanup** — at allocator entry under fcntl
   lock, prune entries whose PID no longer exists on the host. This
@@ -55,39 +52,18 @@ from __future__ import annotations
 import asyncio
 import errno
 import fcntl
-import hashlib
 import json
 import logging
 import os
-import time
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-try:
-    import posix_ipc  # type: ignore[import-untyped]
-    _HAVE_POSIX_IPC = True
-except ImportError:  # pragma: no cover — soft dep, falls back to in-process
-    posix_ipc = None  # type: ignore[assignment]
-    _HAVE_POSIX_IPC = False
-    logger.warning(
-        "posix_ipc not installed — cross-process subprocess concurrency "
-        "coordination disabled; falling back to per-process semaphore. "
-        "Install posix_ipc>=1.1 for shared throttling under multi-instance "
-        "deployments (any orchestrator that spawns multiple Hares "
-        "processes against a shared coordination dir).",
-    )
 
+# ── Slot file directory name ────────────────────────────────────────────
 
-# ── POSIX semaphore name derivation ────────────────────────────────────
-
-# POSIX-named-semaphore names have a max length of ~31 chars on most
-# platforms and must start with '/'. Derive a stable name from the
-# coordination dir's absolute path via SHA-1 truncated to 24 hex chars.
-def _semaphore_name(coord_dir: Path) -> str:
-    digest = hashlib.sha1(str(coord_dir.resolve()).encode("utf-8")).hexdigest()
-    return f"/hares-{digest[:24]}"
+SLOTS_DIR = "slots"
 
 
 # ── Core-pool state file ────────────────────────────────────────────────
@@ -132,6 +108,16 @@ class CrossProcessCoordinator:
     When ``coord_dir`` is None, all methods fall back to per-process
     behavior — equivalent to plain asyncio.Semaphore + first-N core
     pinning (0.1 behavior).
+
+    **Slot acquisition** (coord_dir set): acquires ``weight`` slot
+    files via ``flock(LOCK_EX | LOCK_NB)``, retrying with
+    ``asyncio.sleep(0.5)`` until enough are free. The kernel releases
+    all locks held by a process when it dies, so crashed Hares
+    processes never strand capacity.
+
+    **Slot acquisition** (coord_dir unset): acquires from an in-process
+    ``asyncio.Semaphore``. No cross-process coordination; each Hares
+    process has its own independent cap.
     """
 
     def __init__(
@@ -146,62 +132,120 @@ class CrossProcessCoordinator:
         self._coord_dir = coord_dir
         self._max_concurrent = max_concurrent
         self._weight_cap = weight_cap
-        self._fallback_sem: Optional[asyncio.Semaphore] = None
-        self._posix_sem: Optional["posix_ipc.Semaphore"] = None
         self._claimed_cores: list[int] = []
 
-        if coord_dir is None:
-            # In-process fallback (0.1 behavior). Build a regular
-            # asyncio.Semaphore to gate concurrency within this process.
-            self._fallback_sem = asyncio.Semaphore(max_concurrent)
-            return
+        self._slot_dir: Optional[Path] = None
+        self._slot_files: list[Path] = []
+        self._fallback_sem: Optional[asyncio.Semaphore] = None
 
-        if not _HAVE_POSIX_IPC:
-            logger.warning(
-                "HARES_COORDINATION_DIR=%s set but posix_ipc unavailable; "
-                "falling back to in-process semaphore (per-process cap, "
-                "NOT cross-process). Install posix_ipc to fix.",
-                coord_dir,
-            )
+        if coord_dir is None:
+            # In-process fallback (0.1 behavior).
             self._fallback_sem = asyncio.Semaphore(max_concurrent)
             return
 
         coord_dir.mkdir(parents=True, exist_ok=True)
-        self._open_or_create_semaphore()
+        self._slot_dir = coord_dir / SLOTS_DIR
+        self._slot_dir.mkdir(exist_ok=True)
+        self._slot_files = [
+            self._slot_dir / f"slot-{i}.lock"
+            for i in range(max_concurrent)
+        ]
+        for sf in self._slot_files:
+            sf.touch()
 
     # ── Public API ────────────────────────────────────────────────────
 
     @property
     def is_shared(self) -> bool:
-        """True iff this coordinator is backed by a shared POSIX
-        semaphore (cross-process). False = in-process fallback."""
-        return self._posix_sem is not None
+        """True iff coordination uses shared slot files (cross-process).
+        False = in-process asyncio.Semaphore fallback."""
+        return self._slot_dir is not None
 
-    async def acquire_subprocess_slot(self, weight: int = 1) -> None:
-        """Acquire ``weight`` slots from the global semaphore. Blocks
-        if the cap is reached. The Runner should call this BEFORE
-        spawning each subprocess and release after."""
+    async def acquire_subprocess_slot(self, weight: int = 1) -> list[int]:
+        """Acquire ``weight`` subprocess slots.
+
+        With coord_dir: tries each slot file with LOCK_EX|LOCK_NB,
+        retrying every 0.5s until ``weight`` are available. Returns a
+        token (list of open, locked FDs) that must be passed to
+        :meth:`release_subprocess_slot`.
+
+        Without coord_dir: acquires from the in-process semaphore and
+        returns an empty list (the semaphore itself is the token).
+
+        Blocks indefinitely — slots are released when commands finish
+        or when a holding process dies (kernel guarantee), so callers
+        eventually make progress.
+        """
         weight = max(1, min(weight, self._weight_cap))
-        if self._posix_sem is not None:
-            # POSIX sem.acquire is blocking; offload to a thread so
-            # we don't stall the asyncio loop.
-            for _ in range(weight):
-                await asyncio.to_thread(self._posix_sem.acquire)
-            return
+
+        if self._slot_dir is not None:
+            return await self._acquire_flock_slots(weight)
+
         assert self._fallback_sem is not None
         for _ in range(weight):
             await self._fallback_sem.acquire()
+        return []
 
-    async def release_subprocess_slot(self, weight: int = 1) -> None:
-        """Symmetric release. Pass the SAME weight that was acquired."""
-        weight = max(1, min(weight, self._weight_cap))
-        if self._posix_sem is not None:
-            for _ in range(weight):
-                # POSIX sem.release is non-blocking. Use to_thread for
-                # parity but it's near-zero overhead either way.
-                await asyncio.to_thread(self._posix_sem.release)
+    async def _acquire_flock_slots(self, weight: int) -> list[int]:
+        """Non-blocking flock attempt per slot, retry until weight acquired."""
+        while True:
+            acquired: list[int] = []
+            for sf in self._slot_files:
+                if len(acquired) >= weight:
+                    break
+                fd = os.open(sf, os.O_RDWR)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired.append(fd)
+                except OSError as exc:
+                    os.close(fd)
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                        # Unexpected error; release partial and propagate.
+                        for afd in acquired:
+                            try:
+                                fcntl.flock(afd, fcntl.LOCK_UN)
+                                os.close(afd)
+                            except OSError:
+                                pass
+                        raise
+
+            if len(acquired) >= weight:
+                logger.debug(
+                    "Acquired %d slot(s) via flock (fds=%s)", weight, acquired,
+                )
+                return acquired
+
+            # Not enough free; release partial and yield to the event loop.
+            for fd in acquired:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+                except OSError:
+                    pass
+            await asyncio.sleep(0.5)
+
+    async def release_subprocess_slot(
+        self,
+        slot_token: list[int],
+        weight: int = 1,
+    ) -> None:
+        """Release slots previously acquired by :meth:`acquire_subprocess_slot`.
+
+        ``slot_token`` is the list of FDs returned by acquire (flock
+        path). ``weight`` is used only for the in-process fallback path
+        (where slot_token is empty).
+        """
+        if self._slot_dir is not None:
+            for fd in slot_token:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+                except OSError:
+                    pass
             return
+
         assert self._fallback_sem is not None
+        weight = max(1, min(weight, self._weight_cap))
         for _ in range(weight):
             self._fallback_sem.release()
 
@@ -225,8 +269,10 @@ class CrossProcessCoordinator:
             return all_cores[: self._max_concurrent]
 
         # Shared core pool — fcntl.flock around read-modify-write.
+        # flock(LOCK_EX) blocks until the brief critical section in any
+        # sibling process completes; it auto-releases if we crash.
         pool_path = _core_pool_path(self._coord_dir)
-        with self._core_pool_lock(pool_path) as lock_fd:
+        with self._core_pool_lock(pool_path):
             state = self._read_core_pool(pool_path)
             self._evict_stale_entries(state)
 
@@ -254,7 +300,7 @@ class CrossProcessCoordinator:
             return
         pool_path = _core_pool_path(self._coord_dir)
         try:
-            with self._core_pool_lock(pool_path) as lock_fd:
+            with self._core_pool_lock(pool_path):
                 state = self._read_core_pool(pool_path)
                 state.get("claimed", {}).pop(str(os.getpid()), None)
                 self._write_core_pool(pool_path, state)
@@ -266,56 +312,21 @@ class CrossProcessCoordinator:
                 exc,
             )
 
-    # ── Internal: POSIX semaphore lifecycle ───────────────────────────
-
-    def _open_or_create_semaphore(self) -> None:
-        """Open the shared POSIX semaphore, creating it race-safely
-        if first-in. Logs a warning if the existing capacity differs
-        from ``HARES_MAX_CONCURRENT`` (operator must unlink the stale
-        semaphore to apply a cap change between runs)."""
-        assert self._coord_dir is not None
-        name = _semaphore_name(self._coord_dir)
-        try:
-            # First-in: create with O_CREAT | O_EXCL. If another
-            # process raced, EEXIST and we open below.
-            self._posix_sem = posix_ipc.Semaphore(
-                name,
-                flags=posix_ipc.O_CREAT | posix_ipc.O_EXCL,
-                initial_value=self._max_concurrent,
-            )
-            logger.info(
-                "Created POSIX semaphore %s (capacity=%d) for coord_dir=%s",
-                name, self._max_concurrent, self._coord_dir,
-            )
-        except posix_ipc.ExistentialError:
-            self._posix_sem = posix_ipc.Semaphore(name)
-            # Note: posix_ipc.Semaphore doesn't expose initial capacity
-            # post-creation; we can't verify the existing semaphore's
-            # cap matches HARES_MAX_CONCURRENT. Log advisory message.
-            logger.info(
-                "Joined existing POSIX semaphore %s for coord_dir=%s. "
-                "If HARES_MAX_CONCURRENT was changed between runs, "
-                "remove the semaphore manually (posix_ipc.unlink_"
-                "semaphore('%s')) to apply the new value.",
-                name, self._coord_dir, name,
-            )
-
     # ── Internal: core-pool file I/O under fcntl.flock ────────────────
 
     class _LockCtx:
         """Context manager for an exclusive fcntl.flock on the core-pool
-        file. Creates the file if needed."""
+        file. Creates the file if needed. Blocking: the critical section
+        held by siblings is a few microseconds; blocking is correct and
+        the kernel auto-releases on process death."""
         def __init__(self, path: Path) -> None:
             self._path = path
             self._fd: Optional[int] = None
 
-        def __enter__(self) -> int:
+        def __enter__(self) -> None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            # Open with O_CREAT so the file exists for flock. flock the
-            # FD; release happens on close.
             self._fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o644)
             fcntl.flock(self._fd, fcntl.LOCK_EX)
-            return self._fd
 
         def __exit__(self, exc_type, exc, tb) -> None:
             if self._fd is not None:
@@ -324,7 +335,7 @@ class CrossProcessCoordinator:
                 finally:
                     os.close(self._fd)
 
-    def _core_pool_lock(self, path: Path) -> "CrossProcessCoordinator._LockCtx":
+    def _core_pool_lock(self, path: Path) -> "_LockCtx":
         return CrossProcessCoordinator._LockCtx(path)
 
     def _read_core_pool(self, path: Path) -> dict:
@@ -380,8 +391,40 @@ class CrossProcessCoordinator:
 
 def install_atexit_cleanup(coordinator: CrossProcessCoordinator) -> None:
     """Register an atexit hook to drop this process's core-pool entry
-    on exit. POSIX semaphore intentionally NOT unlinked here — sibling
-    processes may still need it; the umbrella orchestrator owns
-    semaphore lifecycle."""
+    on exit. Slot files do not need cleanup — the kernel releases all
+    flocks when the process exits."""
     import atexit
     atexit.register(coordinator.release_cores)
+
+
+# ── Slot file diagnostics (used by doctor) ─────────────────────────────
+
+
+def count_free_slots(coord_dir: Path, max_concurrent: int) -> tuple[int, int]:
+    """Return (free, total) slot counts by attempting non-blocking flocks.
+
+    Only valid when called from a process that holds no slots itself
+    (e.g. the doctor command). Each probe opens and immediately releases
+    the slot file, so this is a best-effort snapshot.
+    """
+    slot_dir = coord_dir / SLOTS_DIR
+    total = max_concurrent
+    free = 0
+    for i in range(max_concurrent):
+        sf = slot_dir / f"slot-{i}.lock"
+        if not sf.exists():
+            free += 1  # file missing = never created = free
+            continue
+        try:
+            fd = os.open(sf, os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                free += 1
+            except OSError:
+                pass  # locked by another process
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+    return free, total

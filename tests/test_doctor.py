@@ -73,48 +73,33 @@ def test_bwrap_honors_custom_binary_env(monkeypatch, tmp_path):
     assert captured["arg"] == "/opt/custom/bwrap"
 
 
-# ── check_posix_ipc ────────────────────────────────────────────────────────
+# ── check_slot_files ───────────────────────────────────────────────────────
 
-def test_posix_ipc_check_matches_actual_install_state(monkeypatch):
-    """The check's verdict should match whether posix_ipc actually imports
-    in the current interpreter — assert that contract regardless of
-    whether the test env has it."""
-    try:
-        import posix_ipc  # noqa: F401
-        installed = True
-    except ImportError:
-        installed = False
-    r = doctor.check_posix_ipc()
-    assert r.level == ("ok" if installed else "warn")
+def test_slot_files_no_coord_dir_is_ok(monkeypatch):
+    monkeypatch.delenv("HARES_COORDINATION_DIR", raising=False)
+    r = doctor.check_slot_files()
+    assert r.level == "ok"
+    assert "inactive" in r.title.lower()
 
 
-def test_posix_ipc_missing_with_coordination_dir_errors(monkeypatch):
-    monkeypatch.setenv("HARES_COORDINATION_DIR", "/tmp/coord")
-    # Force ImportError by hiding the module.
-    real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
-
-    def fake_import(name, *a, **kw):
-        if name == "posix_ipc":
-            raise ImportError("simulated")
-        return real_import(name, *a, **kw)
-
-    monkeypatch.setattr("builtins.__import__", fake_import)
-    r = doctor.check_posix_ipc()
-    assert r.level == "err"
-    assert "coordination" in r.hint.lower() or "pip install" in r.hint.lower()
-
-
-def test_posix_ipc_missing_without_coordination_dir_warns(monkeypatch):
-    real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
-
-    def fake_import(name, *a, **kw):
-        if name == "posix_ipc":
-            raise ImportError("simulated")
-        return real_import(name, *a, **kw)
-
-    monkeypatch.setattr("builtins.__import__", fake_import)
-    r = doctor.check_posix_ipc()
+def test_slot_files_coord_dir_missing(monkeypatch, tmp_path):
+    missing = tmp_path / "nonexistent"
+    monkeypatch.setenv("HARES_COORDINATION_DIR", str(missing))
+    monkeypatch.setenv("HARES_MAX_CONCURRENT", "2")
+    r = doctor.check_slot_files()
     assert r.level == "warn"
+    assert "does not exist" in r.title.lower()
+
+
+def test_slot_files_all_free(monkeypatch, tmp_path):
+    from hares.coordination import CrossProcessCoordinator
+    coord_dir = tmp_path / "coord"
+    CrossProcessCoordinator(coord_dir=coord_dir, max_concurrent=2)
+    monkeypatch.setenv("HARES_COORDINATION_DIR", str(coord_dir))
+    monkeypatch.setenv("HARES_MAX_CONCURRENT", "2")
+    r = doctor.check_slot_files()
+    assert r.level == "ok"
+    assert "2/2" in r.title
 
 
 # ── check_fs_ceiling ───────────────────────────────────────────────────────

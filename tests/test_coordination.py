@@ -1,35 +1,20 @@
-"""Tests for hares.coordination — cross-process semaphore + core pool.
+"""Tests for hares.coordination — per-slot flock files + core pool.
 
-POSIX-named-semaphore tests use a unique coordination dir per test
-(via tmp_path) so the test suite is parallel-safe and stale state
-from a prior failed run doesn't bleed in.
+Flock-based slot tests use a unique coordination dir per test (via
+tmp_path) so the suite is parallel-safe and no cleanup of kernel
+state is required between runs.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 
 import pytest
 
-from hares.coordination import (
-    CrossProcessCoordinator,
-    _semaphore_name,
-)
-
-
-def _cleanup_semaphore(coord_dir: Path) -> None:
-    """Best-effort: unlink the named semaphore for a coord_dir so a
-    re-run with a different cap doesn't pick up stale state."""
-    try:
-        import posix_ipc
-        try:
-            posix_ipc.unlink_semaphore(_semaphore_name(coord_dir))
-        except posix_ipc.ExistentialError:
-            pass
-    except ImportError:
-        pass
+from hares.coordination import CrossProcessCoordinator, count_free_slots
 
 
 # ── In-process fallback ────────────────────────────────────────────────
@@ -39,34 +24,15 @@ def _cleanup_semaphore(coord_dir: Path) -> None:
 async def test_no_coord_dir_uses_in_process_semaphore(tmp_path):
     coord = CrossProcessCoordinator(coord_dir=None, max_concurrent=2)
     assert coord.is_shared is False
-    # Should be acquirable / releasable without any external state.
-    await coord.acquire_subprocess_slot()
-    await coord.release_subprocess_slot()
-
-
-# ── POSIX semaphore (shared) ──────────────────────────────────────────
+    token = await coord.acquire_subprocess_slot()
+    assert token == []  # no FDs for in-process path
+    await coord.release_subprocess_slot(token, weight=1)
 
 
 @pytest.mark.asyncio
-async def test_shared_semaphore_acquires_and_releases(tmp_path):
-    coord_dir = tmp_path / "coord"
-    _cleanup_semaphore(coord_dir)
-    coord = CrossProcessCoordinator(coord_dir=coord_dir, max_concurrent=2)
-    if not coord.is_shared:
-        pytest.skip("posix_ipc unavailable; in-process fallback used")
-    await coord.acquire_subprocess_slot()
-    await coord.release_subprocess_slot()
-    _cleanup_semaphore(coord_dir)
-
-
-@pytest.mark.asyncio
-async def test_shared_semaphore_caps_concurrency(tmp_path):
-    """3 simultaneous acquires against cap=2 → only 2 progress at once."""
-    coord_dir = tmp_path / "coord"
-    _cleanup_semaphore(coord_dir)
-    coord = CrossProcessCoordinator(coord_dir=coord_dir, max_concurrent=2)
-    if not coord.is_shared:
-        pytest.skip("posix_ipc unavailable")
+async def test_in_process_caps_concurrency():
+    """In-process semaphore: 3 workers against cap=2 → max 2 in flight."""
+    coord = CrossProcessCoordinator(coord_dir=None, max_concurrent=2)
 
     in_flight = 0
     max_in_flight = 0
@@ -74,30 +40,121 @@ async def test_shared_semaphore_caps_concurrency(tmp_path):
 
     async def worker():
         nonlocal in_flight, max_in_flight
-        await coord.acquire_subprocess_slot()
+        token = await coord.acquire_subprocess_slot()
         async with lock:
             in_flight += 1
             max_in_flight = max(max_in_flight, in_flight)
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.05)
         async with lock:
             in_flight -= 1
-        await coord.release_subprocess_slot()
+        await coord.release_subprocess_slot(token, weight=1)
+
+    await asyncio.gather(worker(), worker(), worker())
+    assert max_in_flight <= 2
+
+
+# ── Flock-based slot files (shared) ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_flock_acquires_and_releases(tmp_path):
+    coord_dir = tmp_path / "coord"
+    coord = CrossProcessCoordinator(coord_dir=coord_dir, max_concurrent=2)
+    assert coord.is_shared is True
+
+    token = await coord.acquire_subprocess_slot()
+    assert len(token) == 1  # weight=1 → one locked FD
+    await coord.release_subprocess_slot(token, weight=1)
+
+    # After release the slot is free again.
+    free, total = count_free_slots(coord_dir, 2)
+    assert free == total == 2
+
+
+@pytest.mark.asyncio
+async def test_flock_caps_concurrency(tmp_path):
+    """4 workers, cap=2: at most 2 in flight at once."""
+    coord_dir = tmp_path / "coord"
+    coord = CrossProcessCoordinator(coord_dir=coord_dir, max_concurrent=2)
+
+    in_flight = 0
+    max_in_flight = 0
+    lock = asyncio.Lock()
+
+    async def worker():
+        nonlocal in_flight, max_in_flight
+        token = await coord.acquire_subprocess_slot()
+        async with lock:
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+        await asyncio.sleep(0.05)
+        async with lock:
+            in_flight -= 1
+        await coord.release_subprocess_slot(token, weight=1)
 
     await asyncio.gather(worker(), worker(), worker(), worker())
     assert max_in_flight <= 2
-    _cleanup_semaphore(coord_dir)
+
+
+@pytest.mark.asyncio
+async def test_flock_slot_files_created(tmp_path):
+    coord_dir = tmp_path / "coord"
+    CrossProcessCoordinator(coord_dir=coord_dir, max_concurrent=3)
+    slot_dir = coord_dir / "slots"
+    assert slot_dir.is_dir()
+    for i in range(3):
+        assert (slot_dir / f"slot-{i}.lock").exists()
+
+
+@pytest.mark.asyncio
+async def test_flock_all_slots_occupied_then_released(tmp_path):
+    """Acquire all slots, verify none free, release, verify all free."""
+    cap = 2
+    coord_dir = tmp_path / "coord"
+    coord = CrossProcessCoordinator(coord_dir=coord_dir, max_concurrent=cap)
+
+    tokens = []
+    for _ in range(cap):
+        t = await coord.acquire_subprocess_slot()
+        tokens.append(t)
+
+    free, total = count_free_slots(coord_dir, cap)
+    assert free == 0
+    assert total == cap
+
+    for t in tokens:
+        await coord.release_subprocess_slot(t, weight=1)
+
+    free, total = count_free_slots(coord_dir, cap)
+    assert free == total == cap
+
+
+# ── count_free_slots ───────────────────────────────────────────────────
+
+
+def test_count_free_slots_all_free(tmp_path):
+    coord_dir = tmp_path / "coord"
+    CrossProcessCoordinator(coord_dir=coord_dir, max_concurrent=4)
+    free, total = count_free_slots(coord_dir, 4)
+    assert free == total == 4
+
+
+def test_count_free_slots_missing_slot_dir(tmp_path):
+    coord_dir = tmp_path / "coord"
+    coord_dir.mkdir()
+    # No slot dir created — all slots treated as free (missing = never used).
+    free, total = count_free_slots(coord_dir, 2)
+    assert free == 2
 
 
 # ── Core pool ─────────────────────────────────────────────────────────
 
 
-def test_core_pool_no_coord_dir_uses_first_n(monkeypatch):
-    """0.1 fallback: with no coord dir, picks first N cores per process."""
+def test_core_pool_no_coord_dir_uses_first_n():
     coord = CrossProcessCoordinator(coord_dir=None, max_concurrent=2)
     cores = coord.claim_cores()
-    if cores:
-        # On Linux, sched_getaffinity returns sorted list; first-N matches.
-        assert len(cores) == min(2, len(cores) + len([])) or cores  # may be empty on macOS
+    # Result may be empty on platforms without sched_getaffinity.
+    assert isinstance(cores, list)
 
 
 @pytest.mark.skipif(
@@ -106,27 +163,20 @@ def test_core_pool_no_coord_dir_uses_first_n(monkeypatch):
 )
 def test_core_pool_with_coord_dir_records_pid(tmp_path):
     coord_dir = tmp_path / "coord"
-    _cleanup_semaphore(coord_dir)
     coord = CrossProcessCoordinator(coord_dir=coord_dir, max_concurrent=2)
     cores = coord.claim_cores()
-    # The pool file exists and has our PID.
     pool_file = coord_dir / "core_pool.json"
     assert pool_file.exists()
-    import json
     data = json.loads(pool_file.read_text())
     assert str(os.getpid()) in data.get("claimed", {})
-    # Cleanup.
     coord.release_cores()
     data2 = json.loads(pool_file.read_text())
     assert str(os.getpid()) not in data2.get("claimed", {})
-    _cleanup_semaphore(coord_dir)
 
 
 def test_core_pool_release_is_idempotent(tmp_path):
     coord_dir = tmp_path / "coord"
-    _cleanup_semaphore(coord_dir)
     coord = CrossProcessCoordinator(coord_dir=coord_dir, max_concurrent=2)
     coord.claim_cores()
     coord.release_cores()
     coord.release_cores()  # second call must not raise
-    _cleanup_semaphore(coord_dir)
