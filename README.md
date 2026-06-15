@@ -273,6 +273,8 @@ Default approval-required patterns (active out of the box):
 | `HARES_SANDBOX_DISABLED` | unset | Set to `1` to skip bwrap (loses kernel enforcement) |
 | `HARES_SANDBOX_RW` | server cwd | Colon-separated extra RW mounts (gitconfig, pip cache, local tools) |
 | `HARES_SANDBOX_RO` | empty | Colon-separated extra RO mounts |
+| `HARES_SANDBOX_EXCLUDE` | empty | Colon-separated paths **inside** the ceiling to hide entirely (no read, no write). Absolute or ceiling-relative. |
+| `HARES_SANDBOX_PROTECT` | empty | Colon-separated paths **inside** the ceiling to keep readable but never writable. Absolute or ceiling-relative. |
 | `HARES_SANDBOX_NETWORK` | `on` | Overridden by `--network` flag |
 | `HARES_SANDBOX_NETWORK_ALLOW` | unset | Overridden by `--network-allow` flag |
 | `HARES_SLIRP4NETNS_BIN` | `slirp4netns` | Required for network allowlist mode |
@@ -320,6 +322,28 @@ await session.call_tool("hares_restrict_paths", {"paths": ["lib/parser"]})
 ```
 
 `get_active_paths` returns the current scope. Paths are validated against the ceiling (no `..`, no `.git/`), created if missing, and persisted to `--state-file` if configured.
+
+**In-ceiling blacklist (`HARES_SANDBOX_EXCLUDE` / `HARES_SANDBOX_PROTECT`):**
+
+The RW/RO mounts above are a *whitelist for paths OUTSIDE the ceiling*. The blacklist is the inverse — carve specific paths *inside* the ceiling back out, for credentials, vendored trees, or VCS state that live in the project but should never be touched by an agent:
+
+```bash
+# secrets/ and .env vanish entirely; vendor/ is readable but not writable.
+export HARES_SANDBOX_EXCLUDE="secrets:.env"
+export HARES_SANDBOX_PROTECT="vendor"
+```
+
+| Variable | Effect | Read | Write |
+|---|---|---|---|
+| `HARES_SANDBOX_EXCLUDE` | **Hidden** — the path does not exist for the agent | ✗ | ✗ |
+| `HARES_SANDBOX_PROTECT` | **Read-only** — content visible, mutation rejected | ✓ | ✗ |
+
+Entries are colon-separated, absolute or ceiling-relative, and must resolve **strictly under the ceiling** (an entry equal-to or outside the ceiling is rejected at startup — use RW/RO for outside-the-ceiling paths). Enforced on both surfaces:
+
+- **fs mode** — path validation. Excluded paths are rejected for reads and writes and pruned from `list_directory` / `directory_tree` / `search_files`; protected paths reject writes only.
+- **shell mode** — bwrap mounts. Excluded directories become a fresh tmpfs (`--tmpfs`), excluded files become `/dev/null` (`--ro-bind`), protected paths are re-mounted read-only over themselves (writes get `EROFS`).
+
+**Deny beats allow.** The blacklist mounts are applied last, so a path stays excluded/protected even if `restrict_paths` would otherwise make it writable. A path in both lists is hidden (exclude wins). When `HARES_SANDBOX_DISABLED=1` (no bwrap), shell-side enforcement does not apply — the fs-mode Python checks still do.
 
 **System-dir validation:** set `HARES_DISALLOW_SYSTEM_DIRS=1` to opt into strict mode — ceilings and mounts are validated against `/etc`, `/proc`, `/sys`, `/bin`, `/usr/bin`, etc. The `.git/` ceiling rejection is always on.
 
@@ -433,6 +457,7 @@ JobSpec(
 | Guarantee | shell/fs | cluster | Notes |
 |---|---|---|---|
 | Filesystem writes outside scope | **Blocked — kernel** | Not applicable | `--ro-bind / /` + ceiling |
+| Access to blacklisted in-ceiling paths | **Blocked — kernel (shell) / validated (fs)** | Not applicable | `HARES_SANDBOX_EXCLUDE` / `HARES_SANDBOX_PROTECT` |
 | Resource exhaustion (CPU/RAM) | **Capped — kernel** | Use `resource_spec` | RLIMIT + RSS monitor |
 | Concurrency overrun | **Capped — semaphore** | Scheduler manages | `HARES_MAX_CONCURRENT` |
 | Connections to non-allowlisted hosts | **Blocked — nftables** | Not applicable | Requires `--network-allow` |

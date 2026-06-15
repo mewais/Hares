@@ -13,13 +13,19 @@ import pytest
 
 from hares.path_safety import (
     DEFAULT_SYSTEM_DIRS,
+    PathDeniedError,
     PathSafetyError,
+    get_exclude_list,
+    get_protect_list,
     get_system_dir_blocklist,
+    is_denied,
     resolve_under_ceiling,
     system_dirs_disallowed,
     validate_ceiling,
     validate_path_no_system_dir,
     validate_path_no_traversal,
+    validate_path_not_excluded,
+    validate_path_not_protected,
 )
 
 
@@ -192,3 +198,112 @@ def test_resolve_symlink_escape_rejected(tmp_path):
     link.symlink_to(outside)
     with pytest.raises(PathSafetyError, match="not under ceiling"):
         resolve_under_ceiling("sneaky", tmp_path)
+
+
+# ── in-ceiling blacklist: loaders ──────────────────────────────────────
+
+
+def test_exclude_protect_lists_empty_when_unset(monkeypatch, tmp_path):
+    monkeypatch.delenv("HARES_SANDBOX_EXCLUDE", raising=False)
+    monkeypatch.delenv("HARES_SANDBOX_PROTECT", raising=False)
+    assert get_exclude_list(tmp_path) == ()
+    assert get_protect_list(tmp_path) == ()
+
+
+def test_exclude_list_relative_resolved_against_ceiling(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARES_SANDBOX_EXCLUDE", "secrets")
+    assert get_exclude_list(tmp_path) == ((tmp_path / "secrets").resolve(),)
+
+
+def test_exclude_list_absolute_and_multiple(monkeypatch, tmp_path):
+    abs_entry = str(tmp_path / "a")
+    monkeypatch.setenv("HARES_SANDBOX_EXCLUDE", f"{abs_entry}:rel/b")
+    got = get_exclude_list(tmp_path)
+    assert got == (
+        (tmp_path / "a").resolve(),
+        (tmp_path / "rel" / "b").resolve(),
+    )
+
+
+def test_protect_list_reads_its_own_var(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARES_SANDBOX_PROTECT", "vendor")
+    monkeypatch.delenv("HARES_SANDBOX_EXCLUDE", raising=False)
+    assert get_protect_list(tmp_path) == ((tmp_path / "vendor").resolve(),)
+    assert get_exclude_list(tmp_path) == ()
+
+
+# ── in-ceiling blacklist: is_denied semantics ──────────────────────────
+
+
+def test_is_denied_at_or_under(tmp_path):
+    denied = [(tmp_path / "secrets").resolve()]
+    assert is_denied((tmp_path / "secrets").resolve(), denied)
+    assert is_denied((tmp_path / "secrets" / "key.pem").resolve(), denied)
+    assert not is_denied((tmp_path / "src").resolve(), denied)
+
+
+def test_is_denied_no_sibling_prefix_false_match(tmp_path):
+    """A denied /proj/secrets must NOT match a sibling /proj/secretsXYZ."""
+    denied = [(tmp_path / "secrets").resolve()]
+    assert not is_denied((tmp_path / "secretsXYZ").resolve(), denied)
+
+
+# ── in-ceiling blacklist: validators ───────────────────────────────────
+
+
+def test_validate_not_excluded_raises(tmp_path):
+    excl = [(tmp_path / "secrets").resolve()]
+    with pytest.raises(PathDeniedError, match="excluded"):
+        validate_path_not_excluded(
+            (tmp_path / "secrets" / "k").resolve(), tmp_path, excludelist=excl,
+        )
+
+
+def test_validate_not_excluded_passes_outside(tmp_path):
+    excl = [(tmp_path / "secrets").resolve()]
+    validate_path_not_excluded(
+        (tmp_path / "src" / "a").resolve(), tmp_path, excludelist=excl,
+    )  # must not raise
+
+
+def test_validate_not_protected_raises(tmp_path):
+    prot = [(tmp_path / "vendor").resolve()]
+    with pytest.raises(PathDeniedError, match="protected"):
+        validate_path_not_protected(
+            (tmp_path / "vendor" / "lib.py").resolve(), tmp_path, protectlist=prot,
+        )
+
+
+def test_validate_not_protected_passes_outside(tmp_path):
+    prot = [(tmp_path / "vendor").resolve()]
+    validate_path_not_protected(
+        (tmp_path / "src").resolve(), tmp_path, protectlist=prot,
+    )  # must not raise
+
+
+def test_path_denied_is_path_safety_error():
+    assert issubclass(PathDeniedError, PathSafetyError)
+
+
+# ── in-ceiling blacklist: resolve_under_ceiling integration ────────────
+
+
+def test_resolve_under_ceiling_rejects_excluded(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARES_SANDBOX_EXCLUDE", "secrets")
+    with pytest.raises(PathDeniedError, match="excluded"):
+        resolve_under_ceiling("secrets/key.pem", tmp_path)
+
+
+def test_resolve_under_ceiling_allows_excluded_sibling(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARES_SANDBOX_EXCLUDE", "secrets")
+    target = resolve_under_ceiling("src/main.py", tmp_path)
+    assert target == (tmp_path / "src" / "main.py").resolve()
+
+
+def test_resolve_under_ceiling_protect_not_enforced_here(monkeypatch, tmp_path):
+    """Protect is write-only — resolve_under_ceiling (used by reads too)
+    must NOT reject protected paths; the write chokepoint does that."""
+    monkeypatch.setenv("HARES_SANDBOX_PROTECT", "vendor")
+    monkeypatch.delenv("HARES_SANDBOX_EXCLUDE", raising=False)
+    target = resolve_under_ceiling("vendor/lib.py", tmp_path)
+    assert target == (tmp_path / "vendor" / "lib.py").resolve()

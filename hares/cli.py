@@ -35,8 +35,10 @@ from typing import Optional
 from . import __version__
 from .path_safety import (
     PathSafetyError,
+    _is_subpath,
     validate_ceiling,
     validate_path_no_system_dir,
+    validate_path_no_traversal,
 )
 
 
@@ -357,6 +359,55 @@ def _validate_env_paths() -> None:
                 )
 
 
+def _validate_exclude_protect_paths(ceiling: Path) -> None:
+    """Validate HARES_SANDBOX_EXCLUDE / HARES_SANDBOX_PROTECT entries.
+
+    These are in-ceiling blacklists (the inverse of the RW/RO whitelist,
+    which is for paths OUTSIDE the ceiling), so each entry must:
+      - contain no ``..`` traversal component;
+      - resolve STRICTLY under the ceiling (equal-to or outside is a
+        hard error — those belong in the RW/RO whitelist instead).
+
+    An entry that covers the server cwd / $PWD is allowed but WARNED:
+    it would make the agent's own working directory read-only or hidden,
+    which is almost never intended.
+    """
+    cwd = Path(os.getcwd()).resolve(strict=False)
+    for var in ("HARES_SANDBOX_EXCLUDE", "HARES_SANDBOX_PROTECT"):
+        raw = os.environ.get(var, "")
+        if not raw:
+            continue
+        for piece in raw.split(":"):
+            if not piece:
+                continue
+            try:
+                validate_path_no_traversal(piece)
+            except PathSafetyError as exc:
+                raise SystemExit(
+                    f"hares-mcp: env var {var} entry {piece!r} is invalid: {exc}"
+                )
+            expanded = os.path.expanduser(os.path.expandvars(piece))
+            candidate = Path(expanded)
+            if not candidate.is_absolute():
+                candidate = ceiling / candidate
+            resolved = candidate.resolve(strict=False)
+            if resolved == ceiling or not _is_subpath(resolved, ceiling):
+                raise SystemExit(
+                    f"hares-mcp: env var {var} entry {piece!r} (resolved to "
+                    f"{resolved}) must be STRICTLY under the ceiling "
+                    f"({ceiling}). {var} blacklists paths INSIDE the ceiling; "
+                    f"to grant access to paths outside it, use "
+                    f"HARES_SANDBOX_RW / HARES_SANDBOX_RO instead."
+                )
+            if _is_subpath(cwd, resolved):
+                logger.warning(
+                    "%s entry %r covers the server working directory (%s); "
+                    "the agent's own cwd will be %s. This is rarely intended.",
+                    var, piece, cwd,
+                    "hidden" if var == "HARES_SANDBOX_EXCLUDE" else "read-only",
+                )
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     """Console-script entry point (``hares-mcp``)."""
     logging.basicConfig(
@@ -423,6 +474,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     ceiling, use_roots = _resolve_ceiling(args)
     state_file = _validate_state_file(args.state_file, scope_id, ceiling)
     _validate_env_paths()
+    _validate_exclude_protect_paths(ceiling)
 
     from .policy import load_policy
     policy = load_policy(

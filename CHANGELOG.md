@@ -4,6 +4,40 @@ All notable changes to Hares are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+* **In-ceiling blacklist** — two env vars carve specific paths *inside*
+  the ceiling back out, the inverse of the `HARES_SANDBOX_RW`/`RO`
+  whitelist (which is for paths *outside* the ceiling):
+  * `HARES_SANDBOX_EXCLUDE` — hide a path entirely (no read, no write).
+  * `HARES_SANDBOX_PROTECT` — keep a path readable but never writable,
+    even within the active scope.
+
+  Both are colon-separated, accept absolute or ceiling-relative entries,
+  and must resolve strictly under the ceiling (validated at startup).
+  Enforced on both surfaces: fs-mode path validation (excluded paths
+  rejected for read+write and pruned from `list_directory` /
+  `directory_tree` / `search_files`; protected paths reject writes) and
+  shell-mode bwrap mounts (excluded dirs → fresh `--tmpfs`, excluded
+  files → `--ro-bind /dev/null`, protected paths → read-only re-bind).
+  The blacklist mounts are applied last so **deny beats allow** —
+  `restrict_paths` cannot re-open an excluded/protected path; a path in
+  both lists is hidden (exclude wins). When `HARES_SANDBOX_DISABLED=1`
+  the shell-side mounts don't apply; the fs-mode checks still do.
+* **`hares-mcp doctor`** reports the configured exclude/protect lists,
+  warning on entries that aren't strictly under the ceiling or don't
+  exist yet.
+
+### Tests
+
+* New coverage across `test_path_safety`, `test_sandbox` (pure builder
+  + live bwrap), `test_fs_operations`, `test_cli_validation`,
+  `test_config`, and `test_doctor` — loaders, validators, walker
+  pruning, bwrap argv composition + ordering, precedence (deny beats
+  allow, exclude beats protect), startup validation, and doctor checks.
+
 ## [0.3.0] — 2026-05-07
 
 Adds LSF cluster execution as a third tool family alongside shell

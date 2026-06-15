@@ -53,3 +53,19 @@ def test_bad_float_raises(monkeypatch):
     monkeypatch.setenv("HARES_RSS_OVERSHOOT_RATIO", "not-a-number")
     with pytest.raises(ValueError):
         load_config()
+
+
+def test_sandbox_exclude_protect_parsed(monkeypatch):
+    monkeypatch.setenv("HARES_SANDBOX_EXCLUDE", "secrets:.env")
+    monkeypatch.setenv("HARES_SANDBOX_PROTECT", "vendor")
+    cfg = load_config()
+    assert cfg.sandbox.exclude_binds == ("secrets", ".env")
+    assert cfg.sandbox.protect_binds == ("vendor",)
+
+
+def test_sandbox_exclude_protect_default_empty(monkeypatch):
+    monkeypatch.delenv("HARES_SANDBOX_EXCLUDE", raising=False)
+    monkeypatch.delenv("HARES_SANDBOX_PROTECT", raising=False)
+    cfg = load_config()
+    assert cfg.sandbox.exclude_binds == ()
+    assert cfg.sandbox.protect_binds == ()

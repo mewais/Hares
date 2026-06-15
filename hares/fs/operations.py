@@ -27,8 +27,11 @@ from typing import Any
 
 from ..path_safety import (
     PathSafetyError,
+    get_exclude_list,
+    is_denied,
     resolve_under_ceiling,
     validate_path_no_system_dir,
+    validate_path_not_protected,
 )
 from .state import ActiveScope
 
@@ -43,11 +46,20 @@ class ScopeViolationError(ValueError):
     policy decision)."""
 
 
-def _ensure_under_active_scope(target: Path, scope: ActiveScope) -> None:
+def _ensure_under_active_scope(
+    target: Path, scope: ActiveScope, ceiling: Path,
+) -> None:
     """For write operations: assert target is under at least one of
     the active-scope paths. Reads bypass this check (bounded by
     ceiling alone). When the scope is empty (no restrict ever called),
-    writes are bounded by CEILING alone — same as reads."""
+    writes are bounded by CEILING alone — same as reads.
+
+    Also enforces the write-only HARES_SANDBOX_PROTECT blacklist FIRST,
+    so a protected path is rejected even when it falls within the
+    active scope (deny beats allow). The exclude blacklist is already
+    enforced upstream in resolve_under_ceiling for both reads and
+    writes."""
+    validate_path_not_protected(target, ceiling)
     if not scope.paths:
         return  # no narrowing in effect; ceiling alone bounds writes
     target_resolved = target.resolve(strict=False)
@@ -95,8 +107,11 @@ async def read_multiple_files(args: dict, *, ceiling: Path, scope: ActiveScope) 
 
 async def list_directory(args: dict, *, ceiling: Path, scope: ActiveScope) -> dict:
     target = resolve_under_ceiling(args["path"], ceiling)
+    excluded = get_exclude_list(ceiling)
     entries = []
     for entry in sorted(target.iterdir()):
+        if is_denied(entry.resolve(strict=False), excluded):
+            continue  # HARES_SANDBOX_EXCLUDE: hidden from listings
         kind = "directory" if entry.is_dir() else "file"
         entries.append({"name": entry.name, "type": kind})
     return {"path": str(target), "entries": entries}
@@ -104,8 +119,11 @@ async def list_directory(args: dict, *, ceiling: Path, scope: ActiveScope) -> di
 
 async def list_directory_with_sizes(args: dict, *, ceiling: Path, scope: ActiveScope) -> dict:
     target = resolve_under_ceiling(args["path"], ceiling)
+    excluded = get_exclude_list(ceiling)
     entries = []
     for entry in sorted(target.iterdir()):
+        if is_denied(entry.resolve(strict=False), excluded):
+            continue  # HARES_SANDBOX_EXCLUDE: hidden from listings
         kind = "directory" if entry.is_dir() else "file"
         size = entry.stat().st_size if entry.is_file() else None
         entries.append({"name": entry.name, "type": kind, "size": size})
@@ -114,11 +132,15 @@ async def list_directory_with_sizes(args: dict, *, ceiling: Path, scope: ActiveS
 
 async def directory_tree(args: dict, *, ceiling: Path, scope: ActiveScope) -> dict:
     target = resolve_under_ceiling(args["path"], ceiling)
+    excluded = get_exclude_list(ceiling)
     def _walk(p: Path) -> dict:
         node: dict[str, Any] = {"name": p.name, "type": "directory" if p.is_dir() else "file"}
         if p.is_dir():
             try:
-                node["children"] = [_walk(child) for child in sorted(p.iterdir())]
+                node["children"] = [
+                    _walk(child) for child in sorted(p.iterdir())
+                    if not is_denied(child.resolve(strict=False), excluded)
+                ]
             except OSError:
                 node["children"] = []
         return node
@@ -129,10 +151,19 @@ async def search_files(args: dict, *, ceiling: Path, scope: ActiveScope) -> dict
     """Search for files matching ``pattern`` (glob) under ``path``.
     Mirrors @modelcontextprotocol/server-filesystem's search shape."""
     target = resolve_under_ceiling(args["path"], ceiling)
+    excluded = get_exclude_list(ceiling)
     pattern = args["pattern"]
     matches: list[str] = []
     for root, dirs, files in os.walk(target):
+        # Prune excluded dirs in place so os.walk doesn't descend into
+        # them (also keeps them out of the dirs match list below).
+        dirs[:] = [
+            d for d in dirs
+            if not is_denied(Path(root, d).resolve(strict=False), excluded)
+        ]
         for name in files + dirs:
+            if is_denied(Path(root, name).resolve(strict=False), excluded):
+                continue
             if fnmatch.fnmatch(name, pattern):
                 matches.append(os.path.join(root, name))
     return {"path": str(target), "pattern": pattern, "matches": matches}
@@ -156,7 +187,7 @@ async def get_file_info(args: dict, *, ceiling: Path, scope: ActiveScope) -> dic
 
 async def write_file(args: dict, *, ceiling: Path, scope: ActiveScope) -> dict:
     target = resolve_under_ceiling(args["path"], ceiling)
-    _ensure_under_active_scope(target, scope)
+    _ensure_under_active_scope(target, scope, ceiling)
     content = args["content"]
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
@@ -168,7 +199,7 @@ async def edit_file(args: dict, *, ceiling: Path, scope: ActiveScope) -> dict:
     must match exactly once; ambiguity raises an error so the caller
     rewrites the input."""
     target = resolve_under_ceiling(args["path"], ceiling)
-    _ensure_under_active_scope(target, scope)
+    _ensure_under_active_scope(target, scope, ceiling)
     edits = args.get("edits", [])
     text = target.read_text(encoding="utf-8")
     applied = 0
@@ -193,7 +224,7 @@ async def edit_file(args: dict, *, ceiling: Path, scope: ActiveScope) -> dict:
 
 async def create_directory(args: dict, *, ceiling: Path, scope: ActiveScope) -> dict:
     target = resolve_under_ceiling(args["path"], ceiling)
-    _ensure_under_active_scope(target, scope)
+    _ensure_under_active_scope(target, scope, ceiling)
     target.mkdir(parents=True, exist_ok=True)
     return {"path": str(target)}
 
@@ -203,8 +234,8 @@ async def move_file(args: dict, *, ceiling: Path, scope: ActiveScope) -> dict:
     dst = resolve_under_ceiling(args["destination"], ceiling)
     # Both endpoints must be in the active scope (mv counts as a write
     # on both sides — source is unlinked, destination is created).
-    _ensure_under_active_scope(src, scope)
-    _ensure_under_active_scope(dst, scope)
+    _ensure_under_active_scope(src, scope, ceiling)
+    _ensure_under_active_scope(dst, scope, ceiling)
     dst.parent.mkdir(parents=True, exist_ok=True)
     os.replace(src, dst)
     return {"source": str(src), "destination": str(dst)}

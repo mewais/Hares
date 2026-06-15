@@ -128,3 +128,66 @@ def test_ceiling_under_git_rejected(tmp_path):
     rc, out = _run(["--enable=fs"], env_extra={"HARES_FS_CEILING": str(bad)})
     assert rc != 0
     assert ".git" in out
+
+
+# ── In-ceiling blacklist (HARES_SANDBOX_EXCLUDE / _PROTECT) ─────────────
+
+
+def test_exclude_outside_ceiling_rejected(tmp_path):
+    outside = tmp_path.parent / "outside"
+    rc, out = _run(
+        ["--enable=fs"],
+        env_extra={
+            "HARES_FS_CEILING": str(tmp_path),
+            "HARES_SANDBOX_EXCLUDE": str(outside),
+        },
+    )
+    assert rc != 0
+    assert "HARES_SANDBOX_EXCLUDE" in out
+    assert "under the ceiling" in out
+
+
+def test_exclude_equal_to_ceiling_rejected(tmp_path):
+    rc, out = _run(
+        ["--enable=fs"],
+        env_extra={
+            "HARES_FS_CEILING": str(tmp_path),
+            "HARES_SANDBOX_EXCLUDE": str(tmp_path),
+        },
+    )
+    assert rc != 0
+    assert "HARES_SANDBOX_EXCLUDE" in out
+
+
+def test_protect_traversal_rejected(tmp_path):
+    rc, out = _run(
+        ["--enable=fs"],
+        env_extra={
+            "HARES_FS_CEILING": str(tmp_path),
+            "HARES_SANDBOX_PROTECT": "../escape",
+        },
+    )
+    assert rc != 0
+    assert "HARES_SANDBOX_PROTECT" in out
+
+
+def test_valid_exclude_protect_passes_validation(tmp_path):
+    """Valid in-ceiling entries must not be rejected at startup."""
+    env = os.environ.copy()
+    env["HARES_FS_CEILING"] = str(tmp_path)
+    env["HARES_SANDBOX_EXCLUDE"] = "secrets"
+    env["HARES_SANDBOX_PROTECT"] = "vendor"
+    proc = subprocess.Popen(
+        [HARES_MCP, "--enable=fs"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        proc.wait(timeout=2)
+    err = proc.stderr.read().decode() if proc.stderr else ""
+    assert "must be STRICTLY under" not in err, err

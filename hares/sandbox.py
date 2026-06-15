@@ -54,6 +54,15 @@ class SandboxConfig:
     rw_binds: tuple[str, ...] = field(default_factory=tuple)
     # Host paths bind-mounted read-only at the same path.
     ro_binds: tuple[str, ...] = field(default_factory=tuple)
+    # In-ceiling blacklist (HARES_SANDBOX_PROTECT): paths re-mounted
+    # read-only OVER any preceding rw bind so writes get EROFS but
+    # reads still work. Applied after rw_binds so deny beats allow.
+    protect_binds: tuple[str, ...] = field(default_factory=tuple)
+    # In-ceiling blacklist (HARES_SANDBOX_EXCLUDE): paths hidden
+    # entirely — a directory becomes a fresh tmpfs, a file becomes
+    # /dev/null. Applied last so it wins over both rw binds and
+    # protect_binds.
+    exclude_binds: tuple[str, ...] = field(default_factory=tuple)
     # Standard system paths to bind read-only (skipped silently if absent).
     # Kept separate from ro_binds so users can override the system set
     # without having to re-list every common path.
@@ -132,6 +141,12 @@ def load_sandbox_config(default_cwd: Optional[str] = None) -> SandboxConfig:
         rw = (default_cwd,)
     ro = _split_paths(os.environ.get("HARES_SANDBOX_RO"))
 
+    # In-ceiling blacklist entries. Stored as parsed (relative entries
+    # are kept relative here); the Runner resolves them against the
+    # ceiling in _effective_sandbox where the ceiling is known.
+    protect = _split_paths(os.environ.get("HARES_SANDBOX_PROTECT"))
+    exclude = _split_paths(os.environ.get("HARES_SANDBOX_EXCLUDE"))
+
     network = os.environ.get("HARES_SANDBOX_NETWORK", "on").strip().lower()
     allow_network = network not in ("off", "false", "0", "no")
 
@@ -143,6 +158,8 @@ def load_sandbox_config(default_cwd: Optional[str] = None) -> SandboxConfig:
         bwrap_bin=bwrap_bin,
         rw_binds=rw,
         ro_binds=ro,
+        protect_binds=protect,
+        exclude_binds=exclude,
         allow_network=allow_network,
         tmp_size_mb=tmp_size_mb,
     )
@@ -273,6 +290,30 @@ def build_bwrap_argv(
     # which caused Python to look for site-packages in the project directory.
     real_home = os.path.expanduser("~")
     argv += ["--setenv", "HOME", real_home]
+
+    # In-ceiling blacklist — applied LAST so it overrides any rw bind,
+    # the cwd auto-bind, and the active-scope mounts above (bwrap applies
+    # mounts in argv order; last wins → deny beats allow).
+    #
+    #   protect_binds (HARES_SANDBOX_PROTECT): re-bind the real path
+    #     read-only over whatever rw bind preceded it. Reads still work;
+    #     writes get EROFS.
+    #   exclude_binds (HARES_SANDBOX_EXCLUDE): hide entirely. A directory
+    #     becomes a fresh empty tmpfs; a file becomes /dev/null. The real
+    #     contents simply don't exist in the namespace.
+    #
+    # exclude is applied after protect so a path in both lists ends up
+    # hidden (the stricter outcome).
+    for src in cfg.protect_binds:
+        if os.path.exists(src):
+            argv += ["--ro-bind", src, src]
+    for src in cfg.exclude_binds:
+        if not os.path.exists(src):
+            continue
+        if os.path.isdir(src):
+            argv += ["--tmpfs", src]
+        else:
+            argv += ["--ro-bind", "/dev/null", src]
 
     # When a network setup script is provided, wrap the command so that
     # the inner namespace is configured (interfaces, nftables) before the

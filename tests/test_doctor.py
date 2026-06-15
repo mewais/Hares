@@ -137,6 +137,44 @@ def test_fs_ceiling_under_git_errors(monkeypatch, tmp_path):
     assert ".git" in r.title
 
 
+# ── check_sandbox_exclude_protect ──────────────────────────────────────────
+
+def test_exclude_protect_unset_passes(monkeypatch):
+    monkeypatch.delenv("HARES_SANDBOX_EXCLUDE", raising=False)
+    monkeypatch.delenv("HARES_SANDBOX_PROTECT", raising=False)
+    r = doctor.check_sandbox_exclude_protect()
+    assert r.level == "ok"
+    assert "not set" in r.title
+
+
+def test_exclude_protect_valid_under_ceiling_passes(monkeypatch, tmp_path):
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "vendor").mkdir()
+    monkeypatch.setenv("HARES_FS_CEILING", str(tmp_path))
+    monkeypatch.setenv("HARES_SANDBOX_EXCLUDE", "secrets")
+    monkeypatch.setenv("HARES_SANDBOX_PROTECT", "vendor")
+    r = doctor.check_sandbox_exclude_protect()
+    assert r.level == "ok"
+    assert "EXCLUDE=1" in r.title
+    assert "PROTECT=1" in r.title
+
+
+def test_exclude_outside_ceiling_warns(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARES_FS_CEILING", str(tmp_path))
+    monkeypatch.setenv("HARES_SANDBOX_EXCLUDE", str(tmp_path.parent / "outside"))
+    r = doctor.check_sandbox_exclude_protect()
+    assert r.level == "warn"
+    assert "not strictly under" in (r.hint or "")
+
+
+def test_exclude_nonexistent_path_warns(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARES_FS_CEILING", str(tmp_path))
+    monkeypatch.setenv("HARES_SANDBOX_EXCLUDE", "ghost")
+    r = doctor.check_sandbox_exclude_protect()
+    assert r.level == "warn"
+    assert "does not exist" in (r.hint or "")
+
+
 # ── check_state_hmac ───────────────────────────────────────────────────────
 
 def test_state_hmac_set_passes(monkeypatch):

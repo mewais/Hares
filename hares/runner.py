@@ -220,30 +220,60 @@ class Runner:
 
         ceiling_str = str(self._ceiling) if self._ceiling else None
 
+        # Resolve the in-ceiling blacklist entries (HARES_SANDBOX_PROTECT /
+        # HARES_SANDBOX_EXCLUDE) against the ceiling now — load_sandbox_config
+        # stored them raw because it doesn't know the ceiling. build_bwrap_argv
+        # applies them LAST regardless of which branch below runs, so deny
+        # always beats the rw/active-scope binds.
+        base = self._resolve_blacklist(self._sandbox)
+
         if self._active_scope_paths is None:
             # No active scope — mount ceiling as RW (default) or RO
             # (read-only mode). Before this fix the ceiling wasn't mounted
             # at all, making project files inaccessible without a cwd.
             if not ceiling_str:
-                return self._sandbox
+                return base
             if self._active_scope_read_only:
-                new_ro = tuple(self._sandbox.ro_binds) + (ceiling_str,)
-                return replace(self._sandbox, ro_binds=new_ro)
-            new_rw = tuple(self._sandbox.rw_binds) + (ceiling_str,)
-            return replace(self._sandbox, rw_binds=new_rw)
+                new_ro = tuple(base.ro_binds) + (ceiling_str,)
+                return replace(base, ro_binds=new_ro)
+            new_rw = tuple(base.rw_binds) + (ceiling_str,)
+            return replace(base, rw_binds=new_rw)
 
         # Active scope set — scope paths are RW (or RO), ceiling is RO
         # for anything not already covered by an RW scope path.
         extra_paths = tuple(str(p) for p in self._active_scope_paths)
         if self._active_scope_read_only:
-            new_ro = tuple(self._sandbox.ro_binds) + extra_paths
-            return replace(self._sandbox, ro_binds=new_ro)
+            new_ro = tuple(base.ro_binds) + extra_paths
+            return replace(base, ro_binds=new_ro)
         # RW scope + ceiling as RO for the rest of the tree.
-        new_rw = tuple(self._sandbox.rw_binds) + extra_paths
-        new_ro = tuple(self._sandbox.ro_binds)
+        new_rw = tuple(base.rw_binds) + extra_paths
+        new_ro = tuple(base.ro_binds)
         if ceiling_str and ceiling_str not in new_rw:
             new_ro = new_ro + (ceiling_str,)
-        return replace(self._sandbox, rw_binds=new_rw, ro_binds=new_ro)
+        return replace(base, rw_binds=new_rw, ro_binds=new_ro)
+
+    def _resolve_blacklist(self, sandbox: SandboxConfig) -> SandboxConfig:
+        """Resolve HARES_SANDBOX_PROTECT / HARES_SANDBOX_EXCLUDE entries
+        against the ceiling (relative entries become ceiling-relative,
+        matching how fs ops resolve a relative tool-call path). Returns
+        the sandbox unchanged when neither list is set."""
+        if not sandbox.protect_binds and not sandbox.exclude_binds:
+            return sandbox
+
+        def _resolve(entries: tuple[str, ...]) -> tuple[str, ...]:
+            out: list[str] = []
+            for entry in entries:
+                p = Path(entry)
+                if not p.is_absolute() and self._ceiling is not None:
+                    p = self._ceiling / p
+                out.append(str(p.resolve(strict=False)))
+            return tuple(out)
+
+        return replace(
+            sandbox,
+            protect_binds=_resolve(sandbox.protect_binds),
+            exclude_binds=_resolve(sandbox.exclude_binds),
+        )
 
     async def _spawn_sandboxed(
         self,

@@ -10,6 +10,7 @@ import pytest
 from hares.fs.operations import (
     ScopeViolationError,
     create_directory,
+    directory_tree,
     edit_file,
     list_directory,
     move_file,
@@ -18,6 +19,7 @@ from hares.fs.operations import (
     write_file,
 )
 from hares.fs.state import ActiveScope
+from hares.path_safety import PathDeniedError
 
 
 def _scope(*paths: Path) -> ActiveScope:
@@ -192,3 +194,116 @@ async def test_move_file_destination_outside_scope_rejected(tmp_path):
             {"source": "sub/a.txt", "destination": "elsewhere.txt"},
             ceiling=tmp_path, scope=_scope(sub),
         )
+
+
+# ── In-ceiling blacklist: EXCLUDE (hide for read + write) ──────────────
+
+
+@pytest.mark.asyncio
+async def test_excluded_file_read_rejected(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARES_SANDBOX_EXCLUDE", "secrets")
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    (secrets / "key").write_text("TOPSECRET")
+    with pytest.raises(PathDeniedError, match="excluded"):
+        await read_file({"path": "secrets/key"}, ceiling=tmp_path, scope=_scope())
+
+
+@pytest.mark.asyncio
+async def test_excluded_dir_pruned_from_list_directory(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARES_SANDBOX_EXCLUDE", "secrets")
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "src").mkdir()
+    (tmp_path / "a.txt").write_text("")
+    result = await list_directory({"path": "."}, ceiling=tmp_path, scope=_scope())
+    names = {e["name"] for e in result["entries"]}
+    assert names == {"src", "a.txt"}  # secrets hidden
+
+
+@pytest.mark.asyncio
+async def test_excluded_dir_pruned_from_directory_tree(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARES_SANDBOX_EXCLUDE", "secrets")
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "secrets" / "k").write_text("")
+    (tmp_path / "src").mkdir()
+    result = await directory_tree({"path": "."}, ceiling=tmp_path, scope=_scope())
+    child_names = {c["name"] for c in result["tree"]["children"]}
+    assert "secrets" not in child_names
+    assert "src" in child_names
+
+
+@pytest.mark.asyncio
+async def test_excluded_dir_pruned_from_search(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARES_SANDBOX_EXCLUDE", "secrets")
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "secrets" / "leak.py").write_text("")
+    (tmp_path / "keep.py").write_text("")
+    result = await search_files(
+        {"path": ".", "pattern": "*.py"}, ceiling=tmp_path, scope=_scope(),
+    )
+    names = {Path(p).name for p in result["matches"]}
+    assert names == {"keep.py"}  # leak.py not surfaced
+
+
+@pytest.mark.asyncio
+async def test_excluded_write_rejected(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARES_SANDBOX_EXCLUDE", "secrets")
+    (tmp_path / "secrets").mkdir()
+    with pytest.raises(PathDeniedError, match="excluded"):
+        await write_file(
+            {"path": "secrets/new", "content": "x"},
+            ceiling=tmp_path, scope=_scope(),
+        )
+
+
+# ── In-ceiling blacklist: PROTECT (read-only) ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_protected_read_allowed(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARES_SANDBOX_PROTECT", "vendor")
+    vendor = tmp_path / "vendor"
+    vendor.mkdir()
+    (vendor / "lib.py").write_text("orig")
+    result = await read_file(
+        {"path": "vendor/lib.py"}, ceiling=tmp_path, scope=_scope(),
+    )
+    assert result["content"] == "orig"
+
+
+@pytest.mark.asyncio
+async def test_protected_write_rejected(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARES_SANDBOX_PROTECT", "vendor")
+    vendor = tmp_path / "vendor"
+    vendor.mkdir()
+    with pytest.raises(PathDeniedError, match="protected"):
+        await write_file(
+            {"path": "vendor/lib.py", "content": "mutated"},
+            ceiling=tmp_path, scope=_scope(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_protected_write_rejected_even_inside_active_scope(monkeypatch, tmp_path):
+    """Precedence: deny beats allow — protect blocks the write even when
+    the active scope explicitly includes the protected path."""
+    monkeypatch.setenv("HARES_SANDBOX_PROTECT", "vendor")
+    vendor = tmp_path / "vendor"
+    vendor.mkdir()
+    with pytest.raises(PathDeniedError, match="protected"):
+        await write_file(
+            {"path": "vendor/lib.py", "content": "mutated"},
+            ceiling=tmp_path, scope=_scope(vendor),
+        )
+
+
+@pytest.mark.asyncio
+async def test_exclude_beats_protect_on_read(monkeypatch, tmp_path):
+    """A path in BOTH lists is hidden (exclude wins) — even reads fail."""
+    monkeypatch.setenv("HARES_SANDBOX_EXCLUDE", "both")
+    monkeypatch.setenv("HARES_SANDBOX_PROTECT", "both")
+    both = tmp_path / "both"
+    both.mkdir()
+    (both / "f").write_text("x")
+    with pytest.raises(PathDeniedError, match="excluded"):
+        await read_file({"path": "both/f"}, ceiling=tmp_path, scope=_scope())

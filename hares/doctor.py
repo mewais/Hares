@@ -314,6 +314,64 @@ def check_coordination_dir() -> CheckResult:
     return _ok(f"HARES_COORDINATION_DIR={p}")
 
 
+def check_sandbox_exclude_protect() -> CheckResult:
+    """Report HARES_SANDBOX_EXCLUDE / HARES_SANDBOX_PROTECT — the
+    in-ceiling blacklists. Warn on entries that don't resolve strictly
+    under the ceiling (they'd be rejected at startup) or don't exist."""
+    raw_excl = os.environ.get("HARES_SANDBOX_EXCLUDE", "").strip()
+    raw_prot = os.environ.get("HARES_SANDBOX_PROTECT", "").strip()
+    if not raw_excl and not raw_prot:
+        return _ok(
+            "HARES_SANDBOX_EXCLUDE / HARES_SANDBOX_PROTECT not set "
+            "(no in-ceiling blacklist)"
+        )
+
+    ceiling_raw = os.environ.get("HARES_FS_CEILING", "").strip() or os.getcwd()
+    ceiling = Path(
+        os.path.expanduser(os.path.expandvars(ceiling_raw))
+    ).resolve(strict=False)
+
+    from .path_safety import _is_subpath
+
+    problems: list[str] = []
+    counts: list[str] = []
+    for var, raw in (
+        ("HARES_SANDBOX_EXCLUDE", raw_excl),
+        ("HARES_SANDBOX_PROTECT", raw_prot),
+    ):
+        if not raw:
+            continue
+        n = 0
+        for piece in raw.split(":"):
+            if not piece:
+                continue
+            n += 1
+            expanded = os.path.expanduser(os.path.expandvars(piece))
+            candidate = Path(expanded)
+            if not candidate.is_absolute():
+                candidate = ceiling / candidate
+            resolved = candidate.resolve(strict=False)
+            if resolved == ceiling or not _is_subpath(resolved, ceiling):
+                problems.append(
+                    f"{var} entry {piece!r} is not strictly under the "
+                    f"ceiling ({ceiling}) — startup will reject it"
+                )
+            elif not resolved.exists():
+                problems.append(
+                    f"{var} entry {piece!r} ({resolved}) does not exist "
+                    "(no-op until created)"
+                )
+        counts.append(f"{var}={n}")
+
+    summary = ", ".join(counts)
+    if problems:
+        return _warn(
+            f"In-ceiling blacklist set ({summary}) with issues",
+            "; ".join(problems),
+        )
+    return _ok(f"In-ceiling blacklist OK ({summary}, all under {ceiling})")
+
+
 def check_sandbox_disabled() -> CheckResult:
     """Inform when the kernel sandbox is disabled — not an error, just loud."""
     if (
@@ -412,6 +470,7 @@ SECTIONS: list[tuple[str, list]] = [
     ]),
     ("Configuration", [
         check_fs_ceiling,
+        check_sandbox_exclude_protect,
         check_state_hmac,
         check_coordination_dir,
         check_slot_files,

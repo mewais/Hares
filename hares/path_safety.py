@@ -43,6 +43,17 @@ class PathSafetyError(ValueError):
     """
 
 
+class PathDeniedError(PathSafetyError):
+    """Raised when a path is at-or-under an in-ceiling blacklist entry
+    (``HARES_SANDBOX_EXCLUDE`` or ``HARES_SANDBOX_PROTECT``).
+
+    Kept distinct from the base :class:`PathSafetyError` so callers can
+    tell "blacklisted inside the ceiling" apart from "outside the
+    ceiling entirely" or "under a system dir" — mirrors how
+    ``ScopeViolationError`` is kept distinct in :mod:`hares.fs.operations`.
+    """
+
+
 # ── System-dir policy ──────────────────────────────────────────────────
 
 # Default blocklist when HARES_DISALLOW_SYSTEM_DIRS=1. Conservative —
@@ -164,6 +175,110 @@ def validate_path_no_system_dir(
             )
 
 
+# ── In-ceiling blacklist (exclude / protect) ───────────────────────────
+
+# Two env-driven lists of paths INSIDE the ceiling, mirroring the
+# HARES_SANDBOX_RW / HARES_SANDBOX_RO whitelist for paths OUTSIDE it:
+#
+#   HARES_SANDBOX_EXCLUDE  hide entirely — no read, no write. The path
+#                          effectively does not exist for the agent.
+#   HARES_SANDBOX_PROTECT  read-only-protect — readable, but writes are
+#                          rejected even when the active scope would
+#                          otherwise allow them.
+#
+# Both are colon-separated and accept absolute or ceiling-relative
+# entries (resolved against the ceiling, the same way
+# resolve_under_ceiling resolves a relative tool-call path). Enforcement
+# lives in two mirrored surfaces: these validators (fs mode) and the
+# bwrap mount composition in hares.sandbox (shell mode).
+
+_EXCLUDE_ENV = "HARES_SANDBOX_EXCLUDE"
+_PROTECT_ENV = "HARES_SANDBOX_PROTECT"
+
+
+def _load_denylist(env_var: str, ceiling: Path) -> tuple[Path, ...]:
+    """Parse a colon-separated env var into resolved paths under
+    ``ceiling``. Each entry is expanded (``~``, ``$VAR``); relative
+    entries are resolved against the ceiling. Empty entries dropped."""
+    raw = os.environ.get(env_var, "")
+    if not raw:
+        return ()
+    out: list[Path] = []
+    for piece in raw.split(":"):
+        if not piece:
+            continue
+        expanded = os.path.expanduser(os.path.expandvars(piece))
+        candidate = Path(expanded)
+        if not candidate.is_absolute():
+            candidate = ceiling / candidate
+        out.append(candidate.resolve(strict=False))
+    return tuple(out)
+
+
+def get_exclude_list(ceiling: Path) -> tuple[Path, ...]:
+    """Resolved ``HARES_SANDBOX_EXCLUDE`` entries under ``ceiling``."""
+    return _load_denylist(_EXCLUDE_ENV, ceiling)
+
+
+def get_protect_list(ceiling: Path) -> tuple[Path, ...]:
+    """Resolved ``HARES_SANDBOX_PROTECT`` entries under ``ceiling``."""
+    return _load_denylist(_PROTECT_ENV, ceiling)
+
+
+def is_denied(path: Path, denylist: Iterable[Path]) -> bool:
+    """True if ``path`` is at-or-under any entry in ``denylist``.
+
+    Uses the separator-aware :func:`_is_subpath` so a denied
+    ``/proj/secrets`` does NOT match a sibling ``/proj/secretsXYZ``.
+    """
+    return any(_is_subpath(path, denied) for denied in denylist)
+
+
+def validate_path_not_excluded(
+    resolved: Path,
+    ceiling: Path,
+    *,
+    excludelist: Iterable[Path] | None = None,
+) -> None:
+    """Reject ``resolved`` if it is at-or-under any exclude entry.
+
+    Applies to BOTH reads and writes — an excluded path is hidden
+    entirely. ``excludelist`` overrides the env-loaded list (tests).
+    """
+    candidates = excludelist if excludelist is not None else get_exclude_list(ceiling)
+    for denied in candidates:
+        if _is_subpath(resolved, denied):
+            raise PathDeniedError(
+                f"Path {str(resolved)!r} is at-or-under excluded path "
+                f"{str(denied)!r} ({_EXCLUDE_ENV}); it is hidden from the "
+                f"agent (no read, no write). Remove the entry from "
+                f"{_EXCLUDE_ENV} to allow access."
+            )
+
+
+def validate_path_not_protected(
+    resolved: Path,
+    ceiling: Path,
+    *,
+    protectlist: Iterable[Path] | None = None,
+) -> None:
+    """Reject ``resolved`` if it is at-or-under any protect entry.
+
+    WRITE-ONLY — protected paths stay readable; only mutation is
+    blocked, even when the active scope would otherwise allow it.
+    ``protectlist`` overrides the env-loaded list (tests).
+    """
+    candidates = protectlist if protectlist is not None else get_protect_list(ceiling)
+    for denied in candidates:
+        if _is_subpath(resolved, denied):
+            raise PathDeniedError(
+                f"Path {str(resolved)!r} is at-or-under protected path "
+                f"{str(denied)!r} ({_PROTECT_ENV}); it is read-only and "
+                f"cannot be written, even within the active scope. Remove "
+                f"the entry from {_PROTECT_ENV} to allow writes."
+            )
+
+
 def validate_ceiling(ceiling: Path) -> None:
     """Validate a ceiling path argument (passed to ``--ceiling`` or
     via ``HARES_FS_CEILING``).
@@ -237,4 +352,8 @@ def resolve_under_ceiling(
             f"that would escape via realpath resolution)."
         )
     validate_path_no_system_dir(resolved)
+    # In-ceiling blacklist: excluded paths are hidden for reads AND
+    # writes. (Protect is write-only, so it's checked by the write
+    # chokepoint in hares.fs.operations, not here.)
+    validate_path_not_excluded(resolved, ceiling)
     return resolved

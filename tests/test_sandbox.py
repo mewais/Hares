@@ -200,6 +200,122 @@ def test_is_subpath():
     assert _is_subpath("/tmp", "/tmp/a") is False
 
 
+# ── In-ceiling blacklist (exclude / protect) ───────────────────────────
+
+
+def test_load_config_parses_exclude_protect(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARES_SANDBOX_MODE", "bwrap")
+    monkeypatch.setenv("HARES_SANDBOX_EXCLUDE", "secrets:.env")
+    monkeypatch.setenv("HARES_SANDBOX_PROTECT", "vendor")
+    cfg = load_sandbox_config(default_cwd=str(tmp_path))
+    assert cfg.exclude_binds == ("secrets", ".env")
+    assert cfg.protect_binds == ("vendor",)
+
+
+def test_load_config_exclude_protect_default_empty(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARES_SANDBOX_MODE", "bwrap")
+    monkeypatch.delenv("HARES_SANDBOX_EXCLUDE", raising=False)
+    monkeypatch.delenv("HARES_SANDBOX_PROTECT", raising=False)
+    cfg = load_sandbox_config(default_cwd=str(tmp_path))
+    assert cfg.exclude_binds == ()
+    assert cfg.protect_binds == ()
+
+
+def test_argv_excludes_dir_as_tmpfs(tmp_path):
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    cfg = SandboxConfig(
+        enabled=True, bwrap_bin="bwrap",
+        rw_binds=(str(tmp_path),), exclude_binds=(str(secrets),),
+    )
+    argv = build_bwrap_argv(cfg, "true", cwd=str(tmp_path))
+    assert "--tmpfs" in argv
+    # the tmpfs target is the excluded dir
+    idxs = [i for i, a in enumerate(argv) if a == "--tmpfs"]
+    assert any(argv[i + 1] == str(secrets) for i in idxs), argv
+
+
+def test_argv_excludes_file_as_dev_null(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("SECRET=1")
+    cfg = SandboxConfig(
+        enabled=True, bwrap_bin="bwrap",
+        rw_binds=(str(tmp_path),), exclude_binds=(str(env_file),),
+    )
+    argv = build_bwrap_argv(cfg, "true", cwd=str(tmp_path))
+    # a file exclude maps to --ro-bind /dev/null <file>
+    pairs = _ro_bind_pairs(argv)
+    assert ("/dev/null", str(env_file)) in pairs, argv
+
+
+def test_argv_protect_ro_binds_over_self(tmp_path):
+    vendor = tmp_path / "vendor"
+    vendor.mkdir()
+    cfg = SandboxConfig(
+        enabled=True, bwrap_bin="bwrap",
+        rw_binds=(str(tmp_path),), protect_binds=(str(vendor),),
+    )
+    argv = build_bwrap_argv(cfg, "true", cwd=str(tmp_path))
+    pairs = _ro_bind_pairs(argv)
+    assert (str(vendor), str(vendor)) in pairs, argv
+
+
+def test_argv_blacklist_applied_after_rw_binds(tmp_path):
+    """Precedence: exclude/protect mounts must come AFTER the rw bind so
+    bwrap's last-wins ordering makes deny beat allow."""
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    cfg = SandboxConfig(
+        enabled=True, bwrap_bin="bwrap",
+        rw_binds=(str(tmp_path),), exclude_binds=(str(secrets),),
+    )
+    argv = build_bwrap_argv(cfg, "true", cwd=str(tmp_path))
+    # index of the rw --bind for the ceiling
+    rw_idx = next(
+        i for i in range(len(argv))
+        if argv[i] == "--bind" and argv[i + 1] == str(tmp_path)
+    )
+    tmpfs_idx = next(
+        i for i in range(len(argv))
+        if argv[i] == "--tmpfs" and argv[i + 1] == str(secrets)
+    )
+    assert tmpfs_idx > rw_idx, argv
+
+
+def test_argv_exclude_wins_over_protect_when_both(tmp_path):
+    """A path in both lists ends up hidden (exclude applied last)."""
+    both = tmp_path / "both"
+    both.mkdir()
+    cfg = SandboxConfig(
+        enabled=True, bwrap_bin="bwrap",
+        rw_binds=(str(tmp_path),),
+        protect_binds=(str(both),), exclude_binds=(str(both),),
+    )
+    argv = build_bwrap_argv(cfg, "true", cwd=str(tmp_path))
+    protect_idx = next(
+        i for i in range(len(argv))
+        if argv[i] == "--ro-bind" and argv[i + 1] == str(both)
+        and argv[i + 2] == str(both)
+    )
+    tmpfs_idx = next(
+        i for i in range(len(argv))
+        if argv[i] == "--tmpfs" and argv[i + 1] == str(both)
+    )
+    assert tmpfs_idx > protect_idx, argv
+
+
+def _ro_bind_pairs(argv: list[str]) -> list[tuple[str, str]]:
+    pairs = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--ro-bind" and i + 2 < len(argv):
+            pairs.append((argv[i + 1], argv[i + 2]))
+            i += 3
+        else:
+            i += 1
+    return pairs
+
+
 # ── Live bwrap tests (need a working bubblewrap) ───────────────────────────
 
 
@@ -314,3 +430,49 @@ async def test_bwrap_preserves_resource_caps(tmp_path):
     res = await r.execute(cmd, cwd=str(tmp_path), timeout=15.0)
     # Either awk OOM'd (exit_code != 0) OR the runner detected the kill.
     assert res["exit_code"] != 0 or res["killed_reason"] is not None, res
+
+
+def _runner_with_blacklist(
+    ceiling: Path,
+    *,
+    exclude: tuple[str, ...] = (),
+    protect: tuple[str, ...] = (),
+) -> Runner:
+    cfg = SandboxConfig(
+        enabled=True, bwrap_bin=shutil.which("bwrap") or "bwrap",
+        rw_binds=(str(ceiling),), exclude_binds=exclude, protect_binds=protect,
+    )
+    return Runner(
+        max_concurrent=1, mem_limit_mb=512, cpu_limit_sec=30,
+        sandbox=cfg, ceiling=ceiling,
+    )
+
+
+@needs_bwrap_runtime
+async def test_bwrap_excluded_dir_is_empty(tmp_path):
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    (secrets / "key.pem").write_text("TOPSECRET")
+    r = await _runner_with_blacklist(
+        tmp_path, exclude=(str(secrets),),
+    ).execute("cat secrets/key.pem 2>&1; echo ===; ls secrets | wc -l",
+              cwd=str(tmp_path))
+    # tmpfs over secrets/ → the real key.pem is gone.
+    assert "TOPSECRET" not in r["stdout"], r
+    before, _, after = r["stdout"].partition("===")
+    assert after.strip() == "0", r
+
+
+@needs_bwrap_runtime
+async def test_bwrap_protected_dir_is_read_only(tmp_path):
+    vendor = tmp_path / "vendor"
+    vendor.mkdir()
+    (vendor / "lib.py").write_text("orig")
+    r = await _runner_with_blacklist(
+        tmp_path, protect=(str(vendor),),
+    ).execute("cat vendor/lib.py; echo ===; echo mutated > vendor/lib.py 2>&1",
+              cwd=str(tmp_path))
+    # Read works; write fails (EROFS) and the host file is untouched.
+    before, _, after = r["stdout"].partition("===")
+    assert before.strip() == "orig", r
+    assert (vendor / "lib.py").read_text() == "orig"
