@@ -220,6 +220,56 @@ def test_legacy_sandbox_mode_off_warns(monkeypatch):
     assert doctor.check_sandbox_disabled().level == "warn"
 
 
+# ── check_cgroup_memory ────────────────────────────────────────────────────
+
+def test_cgroup_memory_available_returns_ok(monkeypatch):
+    """When cgroup_memory_available() is True, check returns ok with the
+    machine-safe ceiling MB in the title."""
+    monkeypatch.setattr(doctor._memlimit, "cgroup_memory_available", lambda: True)
+    monkeypatch.setattr(doctor._memlimit, "machine_safe_max_mb", lambda: 22118)
+    monkeypatch.delenv("HARES_MEM_LIMIT_MAX_MB", raising=False)
+    r = doctor.check_cgroup_memory()
+    assert r.level == "ok"
+    assert "cgroup" in r.title.lower()
+    assert "22118" in r.title
+
+
+def test_cgroup_memory_available_honors_env_override(monkeypatch):
+    """HARES_MEM_LIMIT_MAX_MB overrides the computed ceiling in the ok message."""
+    monkeypatch.setattr(doctor._memlimit, "cgroup_memory_available", lambda: True)
+    monkeypatch.setattr(doctor._memlimit, "machine_safe_max_mb", lambda: 99999)
+    monkeypatch.setenv("HARES_MEM_LIMIT_MAX_MB", "8192")
+    r = doctor.check_cgroup_memory()
+    assert r.level == "ok"
+    assert "8192" in r.title
+    # machine_safe_max_mb value should NOT appear (env var wins)
+    assert "99999" not in r.title
+
+
+def test_cgroup_memory_unavailable_returns_warn(monkeypatch):
+    """When cgroup_memory_available() is False, check returns a warning that
+    explains the RLIMIT fallback limitation and how to fix it."""
+    monkeypatch.setattr(doctor._memlimit, "cgroup_memory_available", lambda: False)
+    r = doctor.check_cgroup_memory()
+    assert r.level == "warn"
+    assert "rlimit" in r.title.lower() or "fallback" in r.title.lower()
+    assert r.hint is not None
+    assert "multi-process" in r.hint.lower() or "rlimit" in r.hint.lower()
+    assert "HARES_DISABLE_CGROUP" in r.hint
+
+
+def test_render_includes_cgroup_memory_check(monkeypatch, tmp_path):
+    """render() output includes the cgroup memory check line."""
+    monkeypatch.setenv("HARES_FS_CEILING", str(tmp_path))
+    monkeypatch.setattr(doctor._memlimit, "cgroup_memory_available", lambda: True)
+    monkeypatch.setattr(doctor._memlimit, "machine_safe_max_mb", lambda: 1234)
+    monkeypatch.delenv("HARES_MEM_LIMIT_MAX_MB", raising=False)
+    text, counts = doctor.render(use_color=False)
+    assert "cgroup" in text.lower()
+    assert "1234" in text
+    assert counts["ok"] >= 1
+
+
 # ── check_lsf / check_slurm ────────────────────────────────────────────────
 
 def test_lsf_all_missing_warns(monkeypatch):

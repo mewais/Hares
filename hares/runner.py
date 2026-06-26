@@ -33,6 +33,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional
 
+from . import memlimit
 from .inspector import format_rewrite_notice, inspect_command
 from .sandbox import SandboxConfig, build_bwrap_argv
 
@@ -62,6 +63,66 @@ def _allowed_cores() -> list[int]:
     return []
 
 
+def _try_resolve_scope_dir(scope_name: str, pid: int) -> Optional[Path]:
+    """Single attempt to resolve the cgroup directory for a scope.
+
+    Tries three strategies in order:
+    1. Parse ``/proc/<pid>/cgroup`` of the direct child.
+    2. Search psutil descendants (the real command is a grandchild of
+       systemd-run and lands in the scope before the top process).
+    3. Construct the canonical sysfs path from uid + scope_name.
+
+    Returns the Path if found, None otherwise.  Non-raising.
+    """
+    # Strategy 1: direct pid.
+    scope_dir = memlimit.scope_cgroup_dir(scope_name, member_pid=pid)
+    if scope_dir is not None:
+        return scope_dir
+
+    # Strategy 2: search descendants.
+    if _HAVE_PSUTIL:
+        try:
+            parent = psutil.Process(pid)
+            for child in parent.children(recursive=True):
+                scope_dir = memlimit.scope_cgroup_dir(
+                    scope_name, member_pid=child.pid,
+                )
+                if scope_dir is not None:
+                    return scope_dir
+        except Exception:
+            pass
+
+    # Strategy 3: constructed path (no pid needed — checks sysfs directly).
+    return memlimit.scope_cgroup_dir(scope_name)
+
+
+async def _resolve_scope_dir(scope_name: str, pid: int) -> Optional[Path]:
+    """Resolve the cgroup directory for a newly-spawned scope, with retries.
+
+    ``pid`` is the direct child PID (systemd-run for cgroup-wrapped calls,
+    or bwrap/sh for unwrapped calls). When the direct pid's /proc/cgroup
+    entry does not yet contain the scope name (systemd-run may still be
+    setting up the scope), we fall back to searching descendants via psutil
+    — the real command is a grandchild of systemd-run and lands in the scope
+    first.
+
+    Retries for up to ~0.3 s (6 × 50 ms asyncio sleeps) to accommodate the
+    small race window between systemd-run spawning and the cgroup directory
+    appearing in sysfs.  Using asyncio.sleep keeps the event loop free during
+    each wait.
+
+    Returns None if the directory cannot be found (non-fatal; falls back
+    to RLIMIT-only bounding and disables OOM polling for this call).
+    """
+    for attempt in range(6):
+        result = _try_resolve_scope_dir(scope_name, pid)
+        if result is not None:
+            return result
+        if attempt < 5:
+            await asyncio.sleep(0.05)
+    return None
+
+
 class Runner:
     """Resource-capped subprocess executor.
 
@@ -84,6 +145,8 @@ class Runner:
         coordinator: Optional["CrossProcessCoordinator"] = None,
         ceiling: Optional["Path"] = None,
         network_policy: Optional["NetworkPolicy"] = None,
+        mem_limit_max_mb: Optional[int] = None,
+        use_cgroup: Optional[bool] = None,
     ) -> None:
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be >= 1")
@@ -123,6 +186,33 @@ class Runner:
                 self._cpu_sec = cpu_hard  # pre-clamp
         except Exception:
             pass  # rlimit unavailable on this platform; ignore
+
+        # mem_limit_max_mb is the CEILING for high_memory=True calls.
+        # It defaults to mem_limit_mb when not supplied so existing callers
+        # without this param continue to work without any behavior change.
+        # Clamped to the inherited RLIMIT_AS hard limit the same way
+        # _mem_bytes is, so a high_memory call can never exceed the kernel's
+        # hard limit either.
+        raw_max_bytes = (mem_limit_max_mb or mem_limit_mb) * 1024 * 1024
+        try:
+            _, as_hard = resource.getrlimit(resource.RLIMIT_AS)
+            if as_hard >= 0:
+                raw_max_bytes = min(raw_max_bytes, as_hard)
+        except Exception:
+            pass
+        # Ensure max is at least as large as the normal cap so that the
+        # ceiling is never BELOW the per-process default.
+        self._mem_max_bytes: int = max(raw_max_bytes, self._mem_bytes)
+
+        # Whether to use cgroup v2 scopes (systemd-run --user --scope) for
+        # aggregate memory bounding. When use_cgroup is None, we auto-detect
+        # by calling memlimit.cgroup_memory_available(). Passing True/False
+        # explicitly lets tests force the mode on or off without the overhead
+        # of the functional probe.
+        if use_cgroup is not None:
+            self._cgroup_ok: bool = use_cgroup
+        else:
+            self._cgroup_ok = memlimit.cgroup_memory_available()
         self._rss_poll = rss_poll_interval
         self._rss_overshoot = rss_overshoot_ratio
         self._pin_cpu = pin_cpu and hasattr(os, "sched_setaffinity")
@@ -285,21 +375,31 @@ class Runner:
         pinned_cores: list[int],
         effective_mem_bytes: Optional[int],
         effective_cpu_sec: Optional[int],
-    ) -> "asyncio.subprocess.Process":
+        effective_aggregate_bytes: int,
+        scope_name: Optional[str] = None,
+    ) -> tuple["asyncio.subprocess.Process", Optional[Any]]:
         """Spawn a sandboxed subprocess, coordinating slirp4netns when a
-        network allowlist is configured.
+        network allowlist is configured, and optionally wrapping the argv
+        in a systemd-run cgroup scope for aggregate memory bounding.
 
-        Without an allowlist: builds the bwrap argv normally and spawns.
+        Without an allowlist: builds the bwrap argv normally; if cgroup mode
+        is active wraps the bwrap argv in a systemd-run scope and returns
+        ``(proc, scope_dir)``; otherwise returns ``(proc, None)``.
 
-        With an allowlist: uses bwrap's --sync-fd mechanism to synchronise
-        with slirp4netns:
-          1. Create a pipe; pass the read-end to bwrap as --sync-fd.
-          2. bwrap creates the new user + network namespace and writes a byte
-             to the fd, then blocks waiting for a byte back.
-          3. We read the signal, start slirp4netns with bwrap's PID.
-          4. slirp4netns brings up a tap0 interface in the new netns.
-          5. We write a byte back → bwrap execs the setup script (which
-             configures nftables + execs the real command).
+        With an allowlist (slirp4netns path): composing the --sync-fd
+        handshake with an outer systemd-run wrapper is fragile because
+        systemd-run sits between us and bwrap — the write-end of the sync
+        pipe would reference bwrap's PID relative to a cgroup we cannot
+        easily resolve before bwrap execs. To avoid breaking this critical
+        path we intentionally SKIP cgroup wrapping when a network allowlist
+        is active and fall back to RLIMIT_AS for memory bounding instead.
+        The result dict's ``memory_mode`` will reflect ``'rlimit'`` for this
+        call. This does not affect the per-process RLIMIT_AS that applies
+        through bwrap — it only means the *aggregate* cgroup bound is absent.
+
+        Returns ``(proc, scope_dir)`` where ``scope_dir`` is the resolved
+        cgroup directory Path (or None if cgroup mode is off or resolution
+        failed).
         """
         policy = self._network_policy
         use_allowlist = (
@@ -309,8 +409,19 @@ class Runner:
         )
 
         if not use_allowlist:
-            argv = build_bwrap_argv(effective_sandbox, command, cwd)
-            return await asyncio.create_subprocess_exec(
+            # Build the inner bwrap argv.
+            inner_argv = build_bwrap_argv(effective_sandbox, command, cwd)
+            # Optionally wrap in a cgroup scope.
+            if scope_name is not None:
+                argv = memlimit.build_scope_argv(
+                    inner_argv,
+                    mem_bytes=effective_aggregate_bytes,
+                    scope_name=scope_name,
+                    swap_max_bytes=0,
+                )
+            else:
+                argv = inner_argv
+            proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=stdin_kw,
                 stdout=asyncio.subprocess.PIPE,
@@ -323,8 +434,22 @@ class Runner:
                     cpu_sec=effective_cpu_sec,
                 ),
             )
+            # Resolve the cgroup directory for OOM monitoring/timeout.
+            # Uses async retries to handle the race between systemd-run
+            # spawning and the cgroup directory appearing in sysfs.
+            scope_dir: Optional[Path] = None
+            if scope_name is not None:
+                scope_dir = await _resolve_scope_dir(scope_name, proc.pid)
+            return proc, scope_dir
 
-        # Allowlist mode: --sync-fd + slirp4netns + nftables.
+        # ── Allowlist mode (slirp4netns + nftables) ───────────────────────
+        # Cgroup wrapping is intentionally skipped here: the --sync-fd
+        # handshake requires us to wait for a byte written by bwrap after
+        # it creates namespaces, then pass slirp4netns bwrap's PID. Wrapping
+        # with systemd-run inserts an extra process layer that makes the PID
+        # resolution and pipe coordination unreliable. We fall back to
+        # RLIMIT_AS only; the result's memory_mode will be 'rlimit'.
+
         from .net_policy import (
             build_inner_setup_script,
             slirp4netns_available,
@@ -346,7 +471,7 @@ class Runner:
                 network_setup_script=None,
             )
             argv.insert(argv.index("--unshare-net") + 0, "--unshare-net")
-            return await asyncio.create_subprocess_exec(
+            proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=stdin_kw,
                 stdout=asyncio.subprocess.PIPE,
@@ -359,6 +484,7 @@ class Runner:
                     cpu_sec=effective_cpu_sec,
                 ),
             )
+            return proc, None
 
         # Build the inner setup script (nftables + exec real command).
         setup = build_inner_setup_script(policy, command)
@@ -400,7 +526,7 @@ class Runner:
             logger.error("bwrap --sync-fd: timed out waiting for namespace ready")
             proc.kill()
             os.close(w_fd)
-            return proc
+            return proc, None
 
         # Start slirp4netns to give the isolated netns connectivity.
         try:
@@ -427,7 +553,7 @@ class Runner:
         finally:
             os.close(w_fd)
 
-        return proc
+        return proc, None
 
     async def _claim_cores(self, weight: int) -> list[int]:
         """Grab `weight` free cores from the pool. Returns [] if the
@@ -502,24 +628,97 @@ class Runner:
         kill_flag: dict[str, Any],
         *,
         mem_bytes: Optional[int] = None,
+        scope_dir: Optional[Path] = None,
+        scope_name: Optional[str] = None,
     ) -> None:
-        """Belt-and-suspenders RSS monitor.
+        """RSS / OOM monitor.
 
-        RLIMIT_AS caps the virtual address space of a single process,
-        but pytest-xdist (and any multiprocessing) creates additional
-        children that each get their own AS budget. Aggregate RSS
-        across the whole tree and SIGKILL it if the sum exceeds the
-        per-process cap by `rss_overshoot_ratio` (default 1.2× as a
-        small allowance for shared mappings).
+        **Cgroup mode** (``scope_name`` is not None): polls
+        ``memlimit.read_oom_kill_count(scope_dir)`` every
+        ``self._rss_poll`` seconds. When the counter rises above its
+        initial value the cgroup OOM killer has already terminated the
+        process tree — we simply RECORD it by setting
+        ``kill_flag['reason'] = 'oom'`` without sending any signal (the
+        tree is already dead). No psutil RSS aggregation runs in this mode.
 
-        ``mem_bytes`` overrides the Runner's default for this call —
-        the threshold is computed against the per-call cap so a
-        right-sized small command isn't allowed to balloon up to the
-        global default. Falls back to the instance-level limit when None.
+        If ``scope_dir`` is None at entry but ``scope_name`` is provided,
+        the monitor will attempt to lazily resolve the cgroup directory on
+        each poll iteration until it is found or the command finishes.
+        This handles the race where a fast command exits before
+        ``_resolve_scope_dir`` completes: for such commands there is no
+        OOM to detect, so the lazy path is a no-op. For slower commands
+        that do trigger OOM, the cgroup dir will be resolved before the
+        OOM event and polling will proceed normally.
 
-        Sets kill_flag["reason"] = "rss_exceeded" so the caller can
-        report it accurately.
+        **RLIMIT mode** (``scope_name`` is None): the legacy psutil path.
+        RLIMIT_AS caps the virtual address space of a single process, but
+        pytest-xdist / multiprocessing creates additional children that
+        each have their own AS budget. Aggregate RSS across the whole tree
+        and SIGKILL it if the sum exceeds the per-process cap by
+        ``rss_overshoot_ratio`` (default 1.2× as a small allowance for
+        shared mappings). Sets ``kill_flag['reason'] = 'rss_exceeded'``.
+
+        ``mem_bytes`` overrides the Runner's default threshold for RLIMIT
+        mode — the threshold is computed against the per-call cap so a
+        right-sized small command isn't allowed to balloon up to the global
+        default. Ignored in cgroup mode (the kernel enforces the cap).
         """
+        if scope_name is not None:
+            # ── Cgroup OOM polling ──────────────────────────────────────
+            # scope_dir may be None here for fast commands where the cgroup
+            # directory was not yet visible in sysfs when the command exited.
+            # We lazily attempt to resolve it on each poll until found.
+            #
+            # OOM counter reads are cheap (a single file read), so we poll
+            # at a FIXED short interval (0.1 s) rather than self._rss_poll
+            # which is sized for the more expensive psutil RSS aggregation.
+            # This ensures we catch OOM events within ~100 ms rather than
+            # within ~2 s, giving us time to read the counter before systemd
+            # removes the scope directory (~100–200 ms after OOM fires).
+            _CGROUP_POLL_INTERVAL = 0.1
+            resolved_dir = scope_dir
+            initial_count: Optional[int] = None
+            if resolved_dir is not None:
+                initial_count = memlimit.read_oom_kill_count(resolved_dir)
+                if initial_count is None:
+                    initial_count = 0
+                # Publish the baseline so the post-communicate OOM check
+                # can detect a rise even if the scope dir disappears before
+                # communicate() returns (systemd removes it right after OOM).
+                kill_flag["_oom_baseline"] = initial_count
+            while not kill_flag.get("done"):
+                await asyncio.sleep(_CGROUP_POLL_INTERVAL)
+                # Lazy resolution: if we still don't have the dir, try now.
+                if resolved_dir is None:
+                    resolved_dir = _try_resolve_scope_dir(scope_name, pid)
+                    if resolved_dir is not None:
+                        # First time we have the dir — read the baseline.
+                        initial_count = memlimit.read_oom_kill_count(resolved_dir)
+                        if initial_count is None:
+                            initial_count = 0
+                        kill_flag["_oom_baseline"] = initial_count
+                if resolved_dir is not None:
+                    current = memlimit.read_oom_kill_count(resolved_dir)
+                    if current is not None:
+                        # Always track the last known oom_kill count. The
+                        # scope dir may disappear right after OOM fires;
+                        # saving the peak lets the post-communicate check
+                        # detect the rise even when the dir is gone.
+                        kill_flag["_oom_last_seen"] = current
+                        if current > (initial_count or 0):
+                            # The cgroup OOM killer fired — the process tree
+                            # is already terminated. Just record the reason.
+                            kill_flag["reason"] = "oom"
+                            return
+            # Store the resolved dir back into kill_flag so the post-communicate
+            # OOM check can use it even if scope_dir was None at spawn time.
+            # (The dir may be gone by the time communicate() returns; the
+            # _oom_last_seen fallback covers that case.)
+            if resolved_dir is not None:
+                kill_flag["_resolved_scope_dir"] = resolved_dir
+            return
+
+        # ── RLIMIT / psutil RSS aggregation ────────────────────────────
         if not _HAVE_PSUTIL:
             return
         try:
@@ -561,6 +760,7 @@ class Runner:
         mem_limit_mb: Optional[int] = None,
         cpu_limit_sec: Optional[int] = None,
         stdin: Optional[str] = None,
+        high_memory: bool = False,
     ) -> dict[str, Any]:
         """Run `command` in a shell, return stdout/stderr/exit_code/killed_reason.
 
@@ -574,13 +774,13 @@ class Runner:
             of cores to pin to). Heavy commands (parallel pytest, builds)
             can pass weight=2 to reserve more capacity. Capped at
             max_concurrent.
-          mem_limit_mb: Optional per-call RLIMIT_AS override (and RSS-
-            overshoot threshold). Clamped to the Runner's instance
-            default — callers can request LESS memory than the global
-            default but never more (operator's HARES_MEM_LIMIT_MB is
-            the hard ceiling). Useful for right-sizing known-small
-            commands so failures surface earlier and the kill happens
-            at the intended budget instead of the system default.
+          mem_limit_mb: Optional per-call memory override. In normal mode
+            (high_memory=False) this is clamped DOWN to the Runner's
+            instance default so callers can ask for less, never more. In
+            high_memory mode the ceiling is self._mem_max_bytes instead,
+            permitting up to the machine-safe maximum; any value above that
+            ceiling is still clamped. Useful for right-sizing known-small
+            commands so failures surface earlier.
           cpu_limit_sec: Same idea for RLIMIT_CPU. Clamped to the
             instance default.
           stdin: Optional UTF-8 text to write to the child's stdin
@@ -590,25 +790,48 @@ class Runner:
             the 0.4 behavior. Use this for commands that read input
             (``jq``, ``python -``, ``patch``, ``mail``) instead of
             wrapping them in ``/bin/sh -c 'echo ... | cmd'``.
+          high_memory: When True, the mem_limit_mb ceiling is raised to
+            self._mem_max_bytes (the machine-safe max) rather than the
+            normal per-command cap. The caller should have obtained user
+            approval before setting this flag. If mem_limit_mb is not
+            provided and high_memory is True, the budget defaults to the
+            full self._mem_max_bytes.
 
         Returns:
           dict with keys: exit_code, stdout, stderr, killed_reason,
-          rewrites (list of dicts describing any pre-flight edits).
+          rewrites (list of dicts describing any pre-flight edits),
+          memory_mode ('cgroup' or 'rlimit'),
+          aggregate_mem_limit_mb (effective aggregate cap in MB).
           killed_reason is one of: None, "timeout", "rss_exceeded",
-          "cpu_exceeded".
+          "cpu_exceeded", "oom".
         """
         if not command:
             raise ValueError("command must be non-empty")
         weight = max(1, min(int(weight), self._max_concurrent))
 
-        # Per-call resource overrides clamp DOWN to the operator's
-        # defaults — callers can ask for less, never more. Lets an
-        # agent right-size known-small commands without giving it the
-        # ability to exceed the operator's policy.
-        effective_mem_bytes: Optional[int] = None
+        # Per-call resource overrides. The CEILING depends on high_memory:
+        #   - Normal: cap at self._mem_bytes (operator's default).
+        #   - High-memory: cap at self._mem_max_bytes (machine-safe max).
+        # If high_memory and no mem_limit_mb supplied, default to the
+        # full high-memory budget.
+        ceiling_bytes = self._mem_max_bytes if high_memory else self._mem_bytes
+        effective_mem_bytes: Optional[int]
         if mem_limit_mb is not None:
             requested = max(1, int(mem_limit_mb)) * 1024 * 1024
-            effective_mem_bytes = min(requested, self._mem_bytes)
+            effective_mem_bytes = min(requested, ceiling_bytes)
+        elif high_memory:
+            # Default budget is the full machine-safe ceiling.
+            effective_mem_bytes = ceiling_bytes
+        else:
+            effective_mem_bytes = None
+
+        # effective_aggregate_bytes is BOTH the cgroup memory.max AND the
+        # per-process RLIMIT_AS (defence in depth: the cgroup bounds the
+        # aggregate tree; RLIMIT_AS kills a single runaway process early).
+        effective_aggregate_bytes: int = (
+            effective_mem_bytes if effective_mem_bytes is not None else self._mem_bytes
+        )
+
         effective_cpu_sec: Optional[int] = None
         if cpu_limit_sec is not None:
             requested_cpu = max(1, int(cpu_limit_sec))
@@ -660,59 +883,176 @@ class Runner:
             stdin_kw = asyncio.subprocess.PIPE if stdin is not None else None
             stdin_bytes = stdin.encode("utf-8") if stdin is not None else None
 
+            # Determine if we should use cgroup wrapping for this call.
+            # The allowlist (slirp4netns) path skips cgroup wrapping — see
+            # the note in _spawn_sandboxed for the rationale.
+            policy = self._network_policy
+            use_allowlist = (
+                policy is not None
+                and policy.enabled
+                and self._effective_sandbox(cwd) is not None
+            )
+            use_cgroup_this_call = self._cgroup_ok and not use_allowlist
+
+            # Prepare the scope name if we are wrapping in a cgroup.
+            scope_name: Optional[str] = (
+                memlimit.new_scope_name() if use_cgroup_this_call else None
+            )
+
+            # Track the resolved cgroup directory (set after spawn).
+            scope_dir: Optional[Path] = None
+
             effective_sandbox = self._effective_sandbox(cwd)
             if effective_sandbox is not None:
                 # Sandboxed path: bwrap (possibly with slirp4netns for
-                # network allowlist). _spawn_sandboxed handles both cases.
-                proc = await self._spawn_sandboxed(
+                # network allowlist). _spawn_sandboxed handles both cases
+                # and now returns (proc, scope_dir).
+                proc, scope_dir = await self._spawn_sandboxed(
                     effective_sandbox, command, cwd,
                     child_env, stdin_kw, pinned_cores,
                     effective_mem_bytes, effective_cpu_sec,
+                    effective_aggregate_bytes, scope_name,
                 )
             else:
-                proc = await asyncio.create_subprocess_shell(
-                    command,
-                    stdin=stdin_kw,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=cwd,
-                    env=child_env,
-                    preexec_fn=self._make_preexec(
-                        pinned_cores,
-                        mem_bytes=effective_mem_bytes,
-                        cpu_sec=effective_cpu_sec,
-                    ),
-                )
+                if scope_name is not None:
+                    # No-sandbox path with cgroup wrapping.
+                    # create_subprocess_shell does not accept an explicit argv
+                    # so we switch to create_subprocess_exec with an explicit
+                    # ['/bin/sh', '-c', command] form so we can prepend the
+                    # systemd-run wrapper.
+                    inner_argv = ["/bin/sh", "-c", command]
+                    argv = memlimit.build_scope_argv(
+                        inner_argv,
+                        mem_bytes=effective_aggregate_bytes,
+                        scope_name=scope_name,
+                        swap_max_bytes=0,
+                    )
+                    proc = await asyncio.create_subprocess_exec(
+                        *argv,
+                        stdin=stdin_kw,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=cwd,
+                        env=child_env,
+                        preexec_fn=self._make_preexec(
+                            pinned_cores,
+                            mem_bytes=effective_mem_bytes,
+                            cpu_sec=effective_cpu_sec,
+                        ),
+                    )
+                    scope_dir = await _resolve_scope_dir(scope_name, proc.pid)
+                else:
+                    # No-sandbox, no cgroup: original create_subprocess_shell path.
+                    proc = await asyncio.create_subprocess_shell(
+                        command,
+                        stdin=stdin_kw,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=cwd,
+                        env=child_env,
+                        preexec_fn=self._make_preexec(
+                            pinned_cores,
+                            mem_bytes=effective_mem_bytes,
+                            cpu_sec=effective_cpu_sec,
+                        ),
+                    )
+
+            # Track whether the command was wrapped in a cgroup scope.
+            # This is TRUE whenever scope_name was set — the kernel enforced
+            # memory.max for this command regardless of whether we managed to
+            # resolve the cgroup directory for monitoring purposes.
+            # scope_dir is SEPARATE: it is best-effort/Optional, used only for
+            # OOM counter polling and cgroup_kill on timeout.
+            wrapped_in_cgroup: bool = scope_name is not None
+            memory_mode: str = "cgroup" if wrapped_in_cgroup else "rlimit"
 
             kill_flag: dict[str, Any] = {}
             monitor = asyncio.create_task(self._monitor_rss(
-                proc.pid, kill_flag, mem_bytes=effective_mem_bytes,
+                proc.pid,
+                kill_flag,
+                mem_bytes=effective_mem_bytes,
+                scope_dir=scope_dir,
+                scope_name=scope_name,
             ))
+            timed_out = False
             try:
                 stdout, stderr = await asyncio.wait_for(
                     proc.communicate(input=stdin_bytes), timeout=timeout,
                 )
-                killed_reason = kill_flag.get("reason")
+                # ── Final OOM check (normal exit path) ─────────────────
+                # The cgroup OOM killer may have fired between the last
+                # monitor poll and when communicate() returned.
+                #
+                # TIMING NOTE: systemd removes the scope cgroup directory
+                # very quickly (~100 ms) after OOM fires. We do this check
+                # HERE — while the process just exited and scope_dir is
+                # most likely still present — rather than after
+                # ``await monitor`` where the dir may already be gone.
+                #
+                # The monitor polls at 0.1 s intervals; if OOM fires just
+                # before communicate() returns, the monitor may not have
+                # run its poll yet (asyncio scheduling gives priority to
+                # the communicator returning). Reading scope_dir directly
+                # here is the most reliable window.
+                if wrapped_in_cgroup and kill_flag.get("reason") is None:
+                    # Use scope_dir (resolved at spawn time) as the
+                    # primary read target; fall back to lazily-resolved
+                    # dir stored in kill_flag by the monitor if available.
+                    chk_dir = scope_dir or kill_flag.get("_resolved_scope_dir")
+                    if chk_dir is not None:
+                        final_oom = memlimit.read_oom_kill_count(chk_dir)
+                        baseline = kill_flag.get("_oom_baseline", 0)
+                        if final_oom is not None and final_oom > baseline:
+                            kill_flag["reason"] = "oom"
+                    # Fallback: if the monitor already read a count above
+                    # baseline before the dir disappeared, trust that.
+                    if kill_flag.get("reason") is None:
+                        last_seen = kill_flag.get("_oom_last_seen")
+                        baseline = kill_flag.get("_oom_baseline", 0)
+                        if last_seen is not None and last_seen > baseline:
+                            kill_flag["reason"] = "oom"
             except asyncio.TimeoutError:
                 # Wall-clock exceeded — kill the whole tree.
+                # In cgroup mode, also write to cgroup.kill for belt-and-
+                # suspenders — cgroup.kill is instantaneous and covers
+                # processes that ignore SIGKILL inside a pid namespace.
+                if scope_dir is not None:
+                    memlimit.cgroup_kill(scope_dir)
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     pass
                 stdout, stderr = await proc.communicate()
-                killed_reason = "timeout"
+                timed_out = True
             finally:
                 kill_flag["done"] = True
-                await monitor
+                await monitor  # drain the monitor task
+
+            if timed_out:
+                # After monitor exits, we can use the lazily-resolved dir
+                # for cgroup_kill in case scope_dir was None at timeout.
+                effective_scope_dir = scope_dir or kill_flag.get("_resolved_scope_dir")
+                if effective_scope_dir is not None and scope_dir is None:
+                    memlimit.cgroup_kill(effective_scope_dir)
+                killed_reason = "timeout"
+            else:
+                killed_reason = kill_flag.get("reason")
 
             # Distinguish CPU vs AS based on signal where we can.
+            # In cgroup mode, prefer the OOM reason already set by the
+            # monitor rather than inferring from exit code (which is
+            # unreliable — cgroup OOM exits with 143, not 137).
             if killed_reason is None and proc.returncode is not None:
                 if proc.returncode == -signal.SIGXCPU:
                     killed_reason = "cpu_exceeded"
                 elif proc.returncode == -signal.SIGKILL:
-                    # SIGKILL without a more specific reason is most
-                    # commonly OOM here; flag generically.
-                    killed_reason = "rss_exceeded"
+                    if not wrapped_in_cgroup:
+                        # SIGKILL without a more specific reason is most
+                        # commonly OOM here; flag generically.
+                        killed_reason = "rss_exceeded"
+                    # In cgroup mode: monitor already set 'oom' if the
+                    # cgroup fired; if we reach here without a reason it
+                    # means an external kill or something else — leave None.
 
             stdout_str = stdout.decode("utf-8", errors="replace")
             if rewrite_notice:
@@ -725,23 +1065,32 @@ class Runner:
             # the inherited hard limit.
             applied_mem_mb = (effective_mem_bytes or self._mem_bytes) // 1024 // 1024
             applied_cpu_s  = effective_cpu_sec or self._cpu_sec
+            aggregate_mem_limit_mb = effective_aggregate_bytes // 1024 // 1024
 
             # ── Diagnostic context fields ────────────────────────────────────
 
             # Network mode that was in effect for this command.
             if self._sandbox is None:
-                network_mode = "full"
+                network_mode_str = "full"
             elif self._network_policy is not None and self._network_policy.enabled:
-                network_mode = "allowlist"
+                network_mode_str = "allowlist"
             elif not self._sandbox.allow_network:
-                network_mode = "off"
+                network_mode_str = "off"
             else:
-                network_mode = "full"
+                network_mode_str = "full"
 
             # Human-readable explanation for each kill reason.
             peak_rss_mb: Optional[int] = kill_flag.get("peak_rss_mb")
             killed_note: Optional[str] = None
-            if killed_reason == "rss_exceeded":
+            if killed_reason == "oom":
+                killed_note = (
+                    f"Command tree exceeded the {aggregate_mem_limit_mb}MB aggregate "
+                    "memory cap and was killed by the cgroup OOM killer; your session "
+                    "was unaffected. If this command legitimately needs more memory, "
+                    "it can be re-run with a higher (machine-safe) budget that requires "
+                    "user approval."
+                )
+            elif killed_reason == "rss_exceeded":
                 peak_str = f" (peak RSS: {peak_rss_mb}MB)" if peak_rss_mb is not None else ""
                 killed_note = (
                     f"Process tree killed: RSS exceeded the {applied_mem_mb}MB limit"
@@ -781,7 +1130,9 @@ class Runner:
                 "rewrites": rewrites_dump,
                 "applied_mem_limit_mb": applied_mem_mb,
                 "applied_cpu_limit_sec": applied_cpu_s,
-                "network_mode": network_mode,
+                "network_mode": network_mode_str,
+                "memory_mode": memory_mode,
+                "aggregate_mem_limit_mb": aggregate_mem_limit_mb,
             }
             if killed_note is not None:
                 result["killed_note"] = killed_note

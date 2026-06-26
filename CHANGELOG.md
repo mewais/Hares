@@ -8,6 +8,40 @@ follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+* **Cgroup v2 aggregate memory bounding (session-safe OOM)** — every
+  shell command tree now runs inside a `systemd-run --user --scope`
+  with `memory.max` set when cgroup v2 + the memory controller +
+  user-systemd are available.  The kernel OOM killer is scoped to the
+  command's cgroup, so an OOM kills only the command tree — the Hares
+  process and the MCP client session are completely unaffected.
+  `RLIMIT_AS` is kept per-process as defence-in-depth.  When
+  cgroups/user-systemd are absent, Hares falls back to per-process
+  RLIMIT + RSS poll with an honest warning: a fast multi-process
+  memory bomb can exhaust RAM between polls in this mode.
+
+* **`HARES_MEM_LIMIT_MAX_MB`** — operator-configurable machine-safe
+  ceiling (MB) for approved high-memory runs.  Defaults to ~90 % of
+  installed RAM (``machine_safe_max_mb()``).
+
+* **`HARES_DISABLE_CGROUP`** — set to ``1`` to skip cgroup v2 bounding
+  and revert to per-process RLIMIT only, even when cgroups/user-systemd
+  are available (useful for debugging or constrained environments).
+
+* **`execute_command_high_memory` MCP tool** — exposes an
+  approval-gated variant of `execute_command` for commands that
+  legitimately need more memory than the normal `HARES_MEM_LIMIT_MB`
+  cap.  Hares always prompts the user for explicit approval before
+  running.  The approved run stays cgroup-bounded to
+  `HARES_MEM_LIMIT_MAX_MB` so even an approved high-memory command
+  cannot take down the session.  Non-interactive clients (no
+  elicitation support) fail closed.  Registered in both shell and
+  fs+shell modes; not available in fs-only mode.
+
+* **`hares-mcp doctor` cgroup memory check** — `check_cgroup_memory()`
+  reports whether aggregate cgroup bounding is active and shows the
+  effective high-memory ceiling, or warns (with remediation steps) when
+  the fallback RLIMIT mode is in effect.
+
 * **In-ceiling blacklist** — two env vars carve specific paths *inside*
   the ceiling back out, the inverse of the `HARES_SANDBOX_RW`/`RO`
   whitelist (which is for paths *outside* the ceiling):

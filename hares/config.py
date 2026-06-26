@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .memlimit import machine_safe_max_mb
 from .net_policy import NetworkPolicy, load_network_policy
 from .sandbox import SandboxConfig, load_sandbox_config
 
@@ -35,6 +36,11 @@ class Config:
     coordination_dir: Optional[Path]  # NEW: cross-process coord dir.
     fs_ceiling_default: Optional[Path]  # NEW: HARES_FS_CEILING default.
     network_policy: Optional[NetworkPolicy]  # None = full network (default).
+    mem_limit_max_mb: int   # Machine-safe aggregate memory ceiling (MB).
+                            # Populated from HARES_MEM_LIMIT_MAX_MB; defaults
+                            # to ~90 % of host MemTotal via machine_safe_max_mb().
+                            # Used as the upper bound for high-memory runs that
+                            # require user approval.
 
 
 def _intenv(name: str, default: int) -> int:
@@ -86,4 +92,5 @@ def load_config(default_cwd: str | None = None) -> Config:
         coordination_dir=coordination_dir,
         fs_ceiling_default=fs_ceiling_default,
         network_policy=load_network_policy(),
+        mem_limit_max_mb=_intenv("HARES_MEM_LIMIT_MAX_MB", machine_safe_max_mb()),
     )

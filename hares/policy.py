@@ -160,6 +160,60 @@ class PolicyEngine:
 
 # ── Elicitation helper ────────────────────────────────────────────────────────
 
+def _resolve_session(server_or_session) -> Optional[object]:
+    """Resolve an MCP session from a Server instance or session object.
+
+    Callers may pass either the ``Server`` instance (which exposes a
+    ``request_context`` property pointing at the active session) or the
+    session object itself.  Returns ``None`` when neither resolves — the
+    caller must treat that as a fail-closed deny.
+    """
+    try:
+        ctx = server_or_session.request_context   # Server.request_context property
+        return ctx.session
+    except (LookupError, AttributeError):
+        # LookupError: property called outside an active request context
+        #   (shouldn't happen in practice — we're inside a tool handler).
+        # AttributeError: server_or_session was already a session object,
+        #   not a Server.
+        try:
+            return server_or_session if hasattr(server_or_session, "elicit") else None
+        except Exception:
+            return None
+
+
+async def _send_elicitation(session, message: str, command_label: str) -> bool:
+    """Send an MCP elicitation request and return True iff the user accepted.
+
+    Fail-closed: returns False on any error, AttributeError, or non-accept
+    action.  The empty ``requestedSchema`` produces a simple Accept / Decline
+    dialog — no form fields are needed.
+    """
+    schema: dict = {"type": "object", "properties": {}}
+    try:
+        response = await session.elicit(
+            message=message,
+            requestedSchema=schema,
+        )
+        action = getattr(response, "action", "cancel")
+        approved = action == "accept"
+        logger.info(
+            "Elicitation response: command=%r action=%r approved=%s",
+            command_label, action, approved,
+        )
+        return approved
+    except AttributeError:
+        logger.debug(
+            "Elicitation not supported by this client; denying: %r", command_label,
+        )
+        return False
+    except Exception as exc:
+        logger.debug(
+            "Elicitation failed (%s); denying: %r", exc, command_label,
+        )
+        return False
+
+
 async def elicit_approval(server_or_session, command: str, result: PolicyResult) -> bool:
     """Send an MCP elicitation request and return True if the user approved.
 
@@ -176,48 +230,63 @@ async def elicit_approval(server_or_session, command: str, result: PolicyResult)
         f"```\n{command}\n```\n\n"
         "This command may write to a remote system. Allow it to run?"
     )
-    # Empty schema = simple Accept / Decline dialog, no form fields needed.
-    schema: dict = {"type": "object", "properties": {}}
-    # Resolve to a session. Callers pass the Server instance; request_context
-    # is a property that returns the current RequestContext (not a ContextVar).
-    try:
-        ctx = server_or_session.request_context   # Server.request_context property
-        session = ctx.session
-    except (LookupError, AttributeError):
-        # LookupError: property called outside an active request context (shouldn't
-        #   happen in practice — we're inside a tool handler).
-        # AttributeError: server_or_session was already a session object, not a Server.
-        try:
-            session = server_or_session if hasattr(server_or_session, "elicit") else None
-        except Exception:
-            session = None
-
+    session = _resolve_session(server_or_session)
     if session is None:
         logger.debug("No MCP session available for elicitation; denying: %r", command)
         return False
+    return await _send_elicitation(session, message, command)
 
-    try:
-        response = await session.elicit(
-            message=message,
-            requestedSchema=schema,
-        )
-        action = getattr(response, "action", "cancel")
-        approved = action == "accept"
-        logger.info(
-            "Elicitation response: command=%r action=%r approved=%s",
-            command, action, approved,
-        )
-        return approved
-    except AttributeError:
+
+async def elicit_memory_approval(
+    server_or_session,
+    command: str,
+    requested_mb: int,
+    normal_cap_mb: int,
+) -> bool:
+    """Elicit user approval for a HIGH-MEMORY run.
+
+    Same session-resolution and fail-closed semantics as
+    :func:`elicit_approval` (returns ``False`` when the client cannot
+    elicit or the user declines).
+
+    The dialog message states the requested budget vs the normal cap and
+    explains that the run stays cgroup-bounded so it cannot take down the
+    session even if the command uses the full requested allocation.
+
+    Args:
+        server_or_session: Either the MCP ``Server`` instance or the active
+            ``ServerSession`` object (as used in tool-handler context).
+        command: The shell command being requested — shown verbatim in the
+            dialog so the user can make an informed decision.
+        requested_mb: The memory budget requested for this run (MB).  This is
+            the value the caller will pass to ``runner.execute(mem_limit_mb=…,
+            high_memory=True)``, i.e. the effective cgroup ``memory.max``.
+        normal_cap_mb: The operator's standard cap (``HARES_MEM_LIMIT_MB``).
+            Shown alongside ``requested_mb`` so the user can judge the
+            magnitude of the elevation.
+
+    Returns:
+        ``True`` iff the user explicitly accepted the elicitation; ``False``
+        in all other cases (decline, cancel, no elicitation support, any
+        error).
+    """
+    message = (
+        f"**High-memory command requires approval**\n\n"
+        f"The following command is requesting **{requested_mb} MB** of memory, "
+        f"which exceeds the normal cap of **{normal_cap_mb} MB**:\n\n"
+        f"```\n{command}\n```\n\n"
+        f"This run will be **cgroup-bounded** to {requested_mb} MB in aggregate "
+        f"(including all child processes), so even if the command exhausts its "
+        f"allocation the kernel OOM killer is scoped to the command's cgroup — "
+        f"it cannot take down the MCP session. Allow this high-memory run?"
+    )
+    session = _resolve_session(server_or_session)
+    if session is None:
         logger.debug(
-            "Elicitation not supported by this client; denying: %r", command,
+            "No MCP session available for memory elicitation; denying: %r", command,
         )
         return False
-    except Exception as exc:
-        logger.debug(
-            "Elicitation failed (%s); denying: %r", exc, command,
-        )
-        return False
+    return await _send_elicitation(session, message, command)
 
 
 # ── Loader from CLI args ──────────────────────────────────────────────────────

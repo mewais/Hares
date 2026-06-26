@@ -28,7 +28,7 @@ from mcp.types import TextContent, Tool
 from ..audit import Auditor, audited, load_auditor
 from ..config import load_config
 from ..coordination import CrossProcessCoordinator, install_atexit_cleanup
-from ..policy import Decision, PolicyEngine, elicit_approval
+from ..policy import Decision, PolicyEngine, elicit_approval, elicit_memory_approval
 from ..runner import Runner
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,8 @@ def _build_server(
     auditor: Optional["Auditor"] = None,
     use_roots: bool = False,
     policy: Optional[PolicyEngine] = None,
+    mem_limit_mb: int = 7168,
+    mem_limit_max_mb: int = 0,
 ) -> Server:
     """Build the MCP Server with ``execute_command`` plus the shared
     restrict tools wired to the supplied runner.
@@ -101,6 +103,77 @@ def _build_server(
         scope_state = None
 
     exec_tool_name = _prefixed("execute_command", scope_id)
+    high_mem_tool_name = _prefixed("execute_command_high_memory", scope_id)
+
+    # Shared inputSchema for both execute_command and execute_command_high_memory.
+    _exec_input_schema = {
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": "Shell command to run (interpreted by /bin/sh -c).",
+            },
+            "cwd": {
+                "type": "string",
+                "description": "Working directory. Defaults to the server's cwd.",
+            },
+            "env": {
+                "type": "object",
+                "description": "Environment overrides merged on top of the server's env.",
+                "additionalProperties": {"type": "string"},
+            },
+            "timeout": {
+                "type": "number",
+                "description": "Wall-clock timeout in seconds. Defaults to 300.",
+            },
+            "weight": {
+                "type": "integer",
+                "description": (
+                    "How many semaphore slots (and pinned cores) to occupy. "
+                    "Heavy commands (parallel pytest, builds) can pass weight=2; "
+                    "capped at HARES_MAX_CONCURRENT."
+                ),
+                "minimum": 1,
+            },
+            "mem_limit_mb": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "Per-call RLIMIT_AS override (MB). RIGHT-SIZE THIS — "
+                    "small inspection commands (ls, cat, grep) need 64-256 MB; "
+                    "test runs and small builds 1024-4096 MB; large compiles "
+                    "or simulators 8192+ MB. Clamped to HARES_MEM_LIMIT_MB "
+                    "(operator hard ceiling). Setting it lower means the "
+                    "kernel kill fires earlier if the command unexpectedly "
+                    "balloons — better debugging signal than letting it "
+                    "consume the global default. Defaults to HARES_MEM_LIMIT_MB."
+                ),
+            },
+            "cpu_limit_sec": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "Per-call RLIMIT_CPU override (seconds of CPU time, "
+                    "not wall-clock — see 'timeout' for that). Clamped to "
+                    "HARES_CPU_LIMIT_SEC. Use a tight value for inspection "
+                    "commands so a runaway loop dies via SIGXCPU instead of "
+                    "the wall-clock fallback. Defaults to HARES_CPU_LIMIT_SEC."
+                ),
+            },
+            "stdin": {
+                "type": "string",
+                "description": (
+                    "UTF-8 text written to the child's stdin and then "
+                    "closed (so the child sees EOF). Use this for commands "
+                    "that read from stdin — `jq '.x'`, `python -`, `patch`, "
+                    "`mail`, etc. — instead of wrapping the whole thing in "
+                    "/bin/sh -c with shell-side echo/heredoc. When omitted, "
+                    "stdin behavior is unchanged from prior versions."
+                ),
+            },
+        },
+        "required": ["command"],
+    }
 
     # One-shot flag: fetch roots from the MCP client on the first
     # list_tools() call (always fired before any tool call) and use
@@ -141,74 +214,24 @@ def _build_server(
                     "rewritten to fit the cap; the rewrites are reported "
                     "in stdout and in the `rewrites` field of the result."
                 ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "Shell command to run (interpreted by /bin/sh -c).",
-                        },
-                        "cwd": {
-                            "type": "string",
-                            "description": "Working directory. Defaults to the server's cwd.",
-                        },
-                        "env": {
-                            "type": "object",
-                            "description": "Environment overrides merged on top of the server's env.",
-                            "additionalProperties": {"type": "string"},
-                        },
-                        "timeout": {
-                            "type": "number",
-                            "description": "Wall-clock timeout in seconds. Defaults to 300.",
-                        },
-                        "weight": {
-                            "type": "integer",
-                            "description": (
-                                "How many semaphore slots (and pinned cores) to occupy. "
-                                "Heavy commands (parallel pytest, builds) can pass weight=2; "
-                                "capped at HARES_MAX_CONCURRENT."
-                            ),
-                            "minimum": 1,
-                        },
-                        "mem_limit_mb": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "description": (
-                                "Per-call RLIMIT_AS override (MB). RIGHT-SIZE THIS — "
-                                "small inspection commands (ls, cat, grep) need 64-256 MB; "
-                                "test runs and small builds 1024-4096 MB; large compiles "
-                                "or simulators 8192+ MB. Clamped to HARES_MEM_LIMIT_MB "
-                                "(operator hard ceiling). Setting it lower means the "
-                                "kernel kill fires earlier if the command unexpectedly "
-                                "balloons — better debugging signal than letting it "
-                                "consume the global default. Defaults to HARES_MEM_LIMIT_MB."
-                            ),
-                        },
-                        "cpu_limit_sec": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "description": (
-                                "Per-call RLIMIT_CPU override (seconds of CPU time, "
-                                "not wall-clock — see 'timeout' for that). Clamped to "
-                                "HARES_CPU_LIMIT_SEC. Use a tight value for inspection "
-                                "commands so a runaway loop dies via SIGXCPU instead of "
-                                "the wall-clock fallback. Defaults to HARES_CPU_LIMIT_SEC."
-                            ),
-                        },
-                        "stdin": {
-                            "type": "string",
-                            "description": (
-                                "UTF-8 text written to the child's stdin and then "
-                                "closed (so the child sees EOF). Use this for commands "
-                                "that read from stdin — `jq '.x'`, `python -`, `patch`, "
-                                "`mail`, etc. — instead of wrapping the whole thing in "
-                                "/bin/sh -c with shell-side echo/heredoc. When omitted, "
-                                "stdin behavior is unchanged from prior versions."
-                            ),
-                        },
-                    },
-                    "required": ["command"],
-                },
+                inputSchema=_exec_input_schema,
+            ),
+            Tool(
+                name=high_mem_tool_name,
+                description=(
+                    f"Run a command that needs MORE MEMORY than the normal cap "
+                    f"(HARES_MEM_LIMIT_MB = {mem_limit_mb} MB). "
+                    f"REQUIRES USER APPROVAL — a blocking dialog is shown to the "
+                    f"user on EVERY call; there is no way to skip this. "
+                    f"The run is cgroup-bounded to a machine-safe maximum "
+                    f"(HARES_MEM_LIMIT_MAX_MB = {mem_limit_max_mb} MB) so even a "
+                    f"multi-process memory bomb cannot take down the MCP session — "
+                    f"the kernel OOM killer is scoped to the command's cgroup. "
+                    f"Use this for large compiles, simulators, or any workload that "
+                    f"legitimately exceeds the standard cap. Provide mem_limit_mb to "
+                    f"request a specific budget; omit to request the machine maximum."
+                ),
+                inputSchema=_exec_input_schema,
             ),
         ]
         tools.extend(restrict_descriptors)
@@ -258,7 +281,64 @@ def _build_server(
                 cpu_limit_sec=arguments.get("cpu_limit_sec"),
                 stdin=arguments.get("stdin"),
             )
+            # If the command was killed by the cgroup OOM killer, append a
+            # hint pointing the caller at the high-memory tool.
+            if result.get("killed_reason") == "oom":
+                note = result.get("killed_note", "")
+                note += (
+                    f" Retry via the `{high_mem_tool_name}` tool "
+                    f"(it will ask the user to approve a larger allocation)."
+                )
+                result["killed_note"] = note
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+        if name == high_mem_tool_name:
+            command = arguments["command"]
+
+            # Policy gate: deny wins unconditionally — even high-memory calls
+            # are blocked if the operator has denied the pattern.
+            if policy is not None and policy.active:
+                pr = policy.check(command)
+                if pr.decision is Decision.DENY:
+                    rejection = {
+                        "exit_code": -1, "stdout": "", "stderr": "",
+                        "killed_reason": "rejected_by_policy",
+                        "rejected_reason": pr.message,
+                        "matched_pattern": pr.matched_pattern,
+                    }
+                    return [TextContent(type="text", text=json.dumps(rejection, indent=2))]
+
+            # Unconditional memory elicitation — there is NO argument a caller
+            # can pass to skip this step.  The requested budget is either the
+            # caller-supplied mem_limit_mb or the machine-safe maximum.
+            requested_mb: int = arguments.get("mem_limit_mb") or mem_limit_max_mb
+            approved = await elicit_memory_approval(
+                server, command, requested_mb, mem_limit_mb,
+            )
+            if not approved:
+                rejection = {
+                    "exit_code": -1, "stdout": "", "stderr": "",
+                    "killed_reason": "rejected_by_policy",
+                    "rejected_reason": (
+                        "High-memory run declined by user or client does not "
+                        "support elicitation."
+                    ),
+                }
+                return [TextContent(type="text", text=json.dumps(rejection, indent=2))]
+
+            result = await runner.execute(
+                command=command,
+                cwd=arguments.get("cwd"),
+                env=arguments.get("env"),
+                timeout=float(arguments.get("timeout", 300.0)),
+                weight=int(arguments.get("weight", 1)),
+                mem_limit_mb=arguments.get("mem_limit_mb"),
+                cpu_limit_sec=arguments.get("cpu_limit_sec"),
+                stdin=arguments.get("stdin"),
+                high_memory=True,
+            )
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
         if name in restrict_handlers:
             result = await restrict_handlers[name](arguments)
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
@@ -313,6 +393,7 @@ async def _serve_async(
         coordinator=coord,
         ceiling=ceiling,
         network_policy=cfg.network_policy,
+        mem_limit_max_mb=cfg.mem_limit_max_mb,
     )
     auditor = load_auditor()
     if auditor is not None:
@@ -326,6 +407,8 @@ async def _serve_async(
         auditor=auditor,
         use_roots=use_roots,
         policy=policy,
+        mem_limit_mb=cfg.mem_limit_mb,
+        mem_limit_max_mb=cfg.mem_limit_max_mb,
     )
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())

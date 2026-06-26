@@ -69,3 +69,24 @@ def test_sandbox_exclude_protect_default_empty(monkeypatch):
     cfg = load_config()
     assert cfg.sandbox.exclude_binds == ()
     assert cfg.sandbox.protect_binds == ()
+
+
+def test_mem_limit_max_mb_default_positive(monkeypatch):
+    """mem_limit_max_mb default (from machine_safe_max_mb) must be > 0."""
+    monkeypatch.delenv("HARES_MEM_LIMIT_MAX_MB", raising=False)
+    cfg = load_config()
+    assert cfg.mem_limit_max_mb > 0
+
+
+def test_mem_limit_max_mb_override(monkeypatch):
+    """HARES_MEM_LIMIT_MAX_MB integer override is honored."""
+    monkeypatch.setenv("HARES_MEM_LIMIT_MAX_MB", "8192")
+    cfg = load_config()
+    assert cfg.mem_limit_max_mb == 8192
+
+
+def test_mem_limit_max_mb_bad_value_raises(monkeypatch):
+    """Non-integer value for HARES_MEM_LIMIT_MAX_MB raises ValueError."""
+    monkeypatch.setenv("HARES_MEM_LIMIT_MAX_MB", "not-a-number")
+    with pytest.raises(ValueError):
+        load_config()

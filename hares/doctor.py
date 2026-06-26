@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import __version__
+from . import memlimit as _memlimit
 
 
 # ── Result type ─────────────────────────────────────────────────────────────
@@ -389,6 +390,55 @@ def check_sandbox_disabled() -> CheckResult:
     return _ok("Kernel sandbox enabled (default)")
 
 
+def check_cgroup_memory() -> CheckResult:
+    """Report whether aggregate cgroup v2 memory limiting is available.
+
+    When available (cgroup v2 + memory controller + systemd-run --user
+    functional probe all pass), each command tree runs inside a systemd
+    scope with ``memory.max`` set so the kernel OOM killer is SCOPED to
+    that cgroup — it kills only the command, never the Hares process or
+    MCP client session.  The effective machine-safe ceiling shown here is
+    either ``HARES_MEM_LIMIT_MAX_MB`` (if set by the operator) or the
+    computed ~90 % of RAM returned by :func:`memlimit.machine_safe_max_mb`.
+
+    When unavailable, Hares falls back to per-process ``RLIMIT_AS`` only.
+    Per-process limits cannot bound the AGGREGATE memory of a multi-process
+    command tree (each child gets its own independent AS budget), so a
+    ``make -j`` / ``pytest -n`` / build can exhaust host RAM faster than
+    the 2-second RSS poll catches it — the kernel global OOM killer may
+    then fire and could kill the MCP client session.  Install / enable user
+    systemd and make sure cgroup v2 is mounted to get the strong guarantee.
+    Set ``HARES_DISABLE_CGROUP=1`` to explicitly opt out of cgroup bounding
+    (reverts to RLIMIT-only even when cgroups are available).
+    """
+    available = _memlimit.cgroup_memory_available()
+    if available:
+        # Determine the effective high-memory ceiling.
+        env_max = os.environ.get("HARES_MEM_LIMIT_MAX_MB", "").strip()
+        if env_max:
+            try:
+                ceiling_mb = int(env_max)
+            except ValueError:
+                ceiling_mb = _memlimit.machine_safe_max_mb()
+        else:
+            ceiling_mb = _memlimit.machine_safe_max_mb()
+        return _ok(
+            f"Aggregate memory limiting active (cgroup v2 + systemd-run); "
+            f"high-memory ceiling {ceiling_mb} MB"
+        )
+    return _warn(
+        "Aggregate memory limiting unavailable — falling back to per-process "
+        "RLIMIT_AS only",
+        "Per-process RLIMIT_AS cannot bound the aggregate memory of a "
+        "multi-process command tree (make -j, pytest -n, etc.); the kernel "
+        "global OOM killer may fire and could kill the MCP client session. "
+        "Enable user systemd (loginctl enable-linger $USER) and ensure "
+        "cgroup v2 with the memory controller is mounted to get the "
+        "session-safe OOM guarantee. Set HARES_DISABLE_CGROUP=1 to "
+        "explicitly opt out of cgroup bounding.",
+    )
+
+
 def _check_cluster_bins(
     scheduler: str,
     bins: dict[str, str],
@@ -463,6 +513,7 @@ SECTIONS: list[tuple[str, list]] = [
         check_bwrap,
         check_user_namespaces,
         check_sandbox_disabled,
+        check_cgroup_memory,
     ]),
     ("Dependencies", [
         check_psutil,

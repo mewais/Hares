@@ -16,6 +16,7 @@ from hares.policy import (
     _normalise,
     _parse_patterns,
     elicit_approval,
+    elicit_memory_approval,
     load_policy,
     DEFAULT_SUSPECT_PATTERNS,
 )
@@ -268,3 +269,79 @@ async def test_elicit_approval_none_session_fails_closed():
     pr = engine.check("git push origin main")
     approved = await elicit_approval(None, "git push origin main", pr)
     assert approved is False
+
+
+# ── elicit_memory_approval ────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_elicit_memory_approval_accept():
+    """Mock session that accepts → approved."""
+    session = _MockSession("accept")
+    approved = await elicit_memory_approval(
+        session, "make -j8", requested_mb=16384, normal_cap_mb=7168,
+    )
+    assert approved is True
+
+
+@pytest.mark.asyncio
+async def test_elicit_memory_approval_decline():
+    """Mock session that declines → not approved."""
+    session = _MockSession("decline")
+    approved = await elicit_memory_approval(
+        session, "make -j8", requested_mb=16384, normal_cap_mb=7168,
+    )
+    assert approved is False
+
+
+@pytest.mark.asyncio
+async def test_elicit_memory_approval_cancel():
+    """Cancel action is treated as not approved."""
+    session = _MockSession("cancel")
+    approved = await elicit_memory_approval(
+        session, "make -j8", requested_mb=16384, normal_cap_mb=7168,
+    )
+    assert approved is False
+
+
+@pytest.mark.asyncio
+async def test_elicit_memory_approval_no_elicitation_support_fails_closed():
+    """Client without elicitation method → denied (fail closed)."""
+    class NoElicitSession:
+        async def create_elicitation(self, **_):
+            raise AttributeError("no elicitation")
+
+    approved = await elicit_memory_approval(
+        NoElicitSession(), "make -j8", requested_mb=16384, normal_cap_mb=7168,
+    )
+    assert approved is False
+
+
+@pytest.mark.asyncio
+async def test_elicit_memory_approval_none_session_fails_closed():
+    """None session → denied."""
+    approved = await elicit_memory_approval(
+        None, "make -j8", requested_mb=16384, normal_cap_mb=7168,
+    )
+    assert approved is False
+
+
+@pytest.mark.asyncio
+async def test_elicit_memory_approval_message_mentions_budgets():
+    """The elicitation message must mention both the requested and normal cap."""
+    captured_message: list[str] = []
+
+    class CapturingSession:
+        async def elicit(self, message: str, requestedSchema: dict, **_):
+            captured_message.append(message)
+            class R:
+                action = "decline"
+            return R()
+
+    await elicit_memory_approval(
+        CapturingSession(), "make -j8",
+        requested_mb=16384, normal_cap_mb=7168,
+    )
+    assert captured_message, "elicit() was not called"
+    msg = captured_message[0]
+    assert "16384" in msg, f"requested_mb not in message: {msg!r}"
+    assert "7168" in msg, f"normal_cap_mb not in message: {msg!r}"

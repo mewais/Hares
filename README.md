@@ -271,6 +271,8 @@ Default approval-required patterns (active out of the box):
 | `HARES_CPU_LIMIT_SEC` | `1200` | Per-subprocess `RLIMIT_CPU` |
 | `HARES_DEFAULT_TIMEOUT_SEC` | `300` | Wall-clock timeout per command |
 | `HARES_SANDBOX_DISABLED` | unset | Set to `1` to skip bwrap (loses kernel enforcement) |
+| `HARES_MEM_LIMIT_MAX_MB` | ~90 % of RAM | Machine-safe ceiling (MB) for `execute_command_high_memory` runs; defaults to `machine_safe_max_mb()` (~90 % of `MemTotal`). |
+| `HARES_DISABLE_CGROUP` | unset | Set to `1` to skip cgroup v2 aggregate bounding and use per-process RLIMIT only. |
 | `HARES_SANDBOX_RW` | server cwd | Colon-separated extra RW mounts (gitconfig, pip cache, local tools) |
 | `HARES_SANDBOX_RO` | empty | Colon-separated extra RO mounts |
 | `HARES_SANDBOX_EXCLUDE` | empty | Colon-separated paths **inside** the ceiling to hide entirely (no read, no write). Absolute or ceiling-relative. |
@@ -346,6 +348,24 @@ Entries are colon-separated, absolute or ceiling-relative, and must resolve **st
 **Deny beats allow.** The blacklist mounts are applied last, so a path stays excluded/protected even if `restrict_paths` would otherwise make it writable. A path in both lists is hidden (exclude wins). When `HARES_SANDBOX_DISABLED=1` (no bwrap), shell-side enforcement does not apply — the fs-mode Python checks still do.
 
 **System-dir validation:** set `HARES_DISALLOW_SYSTEM_DIRS=1` to opt into strict mode — ceilings and mounts are validated against `/etc`, `/proc`, `/sys`, `/bin`, `/usr/bin`, etc. The `.git/` ceiling rejection is always on.
+
+---
+
+### Resource caps and aggregate memory bounding
+
+Every shell command is subject to three independent resource limits:
+
+- **`RLIMIT_CPU`** — hard per-process CPU time cap (kernel-enforced, `SIGKILL` on breach).
+- **`RLIMIT_AS`** — per-process virtual-address-space cap.  Applied to every subprocess individually.
+- **Wall-clock timeout** — enforced by Hares's async monitor; the process group is killed on expiry.
+
+**The RLIMIT_AS gap: multi-process memory exhaustion.**  Per-process `RLIMIT_AS` cannot bound the *aggregate* memory of a multi-process command tree.  Each child process inherits an independent AS budget, so `make -j16`, `pytest -n auto`, or a build that forks many workers can collectively exhaust host RAM far faster than Hares's 2-second RSS poll detects it.  When that happens the kernel global OOM killer fires — and it may choose to kill the MCP client session rather than the offending command.
+
+**Cgroup v2 aggregate bounding (when available).**  On systems where cgroup v2 is mounted and `systemd --user` is running, Hares wraps every command tree in a `systemd-run --user --scope` with `memory.max` set.  The kernel OOM killer is then *scoped* to that cgroup: it kills only the command's process tree.  The Hares process and the MCP client are completely unaffected.  `RLIMIT_AS` is kept per-process as defence-in-depth.
+
+**Fallback when cgroups/user-systemd are absent.**  Hares falls back to per-process RLIMIT + RSS poll.  This is best-effort: a fast multi-process memory bomb can exhaust RAM between polls.  Run `hares-mcp doctor` to see which mode is active.  To enable the strong guarantee: ensure cgroup v2 is mounted (`/sys/fs/cgroup/cgroup.controllers` must exist with `memory` listed) and run `loginctl enable-linger $USER` so a user-level systemd instance is always running.  Set `HARES_DISABLE_CGROUP=1` to opt out of cgroup bounding even when it is available.
+
+**`execute_command_high_memory` — approved large-budget runs.**  Some commands (large model loads, heavy builds) legitimately need more memory than the normal `HARES_MEM_LIMIT_MB` cap.  The `execute_command_high_memory` tool lets the agent request a larger budget; Hares always prompts the user for explicit approval before running.  The approved run stays cgroup-bounded to `HARES_MEM_LIMIT_MAX_MB` (default: ~90 % of installed RAM) so even an approved high-memory command cannot take down the session.  Non-interactive clients (no elicitation support) fail closed — the command is denied.
 
 ---
 
@@ -459,6 +479,7 @@ JobSpec(
 | Filesystem writes outside scope | **Blocked — kernel** | Not applicable | `--ro-bind / /` + ceiling |
 | Access to blacklisted in-ceiling paths | **Blocked — kernel (shell) / validated (fs)** | Not applicable | `HARES_SANDBOX_EXCLUDE` / `HARES_SANDBOX_PROTECT` |
 | Resource exhaustion (CPU/RAM) | **Capped — kernel** | Use `resource_spec` | RLIMIT + RSS monitor |
+| Multi-process memory exhaustion killing the session | **Blocked — cgroup `memory.max` scopes the OOM killer to the command** / fallback: best-effort RLIMIT + RSS poll | Not applicable | Requires cgroup v2 + user-systemd; `HARES_DISABLE_CGROUP=1` reverts to RLIMIT |
 | Concurrency overrun | **Capped — semaphore** | Scheduler manages | `HARES_MAX_CONCURRENT` |
 | Connections to non-allowlisted hosts | **Blocked — nftables** | Not applicable | Requires `--network-allow` |
 | Suspicious commands without approval | **Denied / elicited** | Not applicable | `--suspect` + elicitation |

@@ -17,6 +17,28 @@ from typing import AsyncIterator, Optional
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.types import ElicitResult, ElicitRequestParams
+
+
+async def _accept_elicitation_callback(ctx, params: ElicitRequestParams) -> ElicitResult:
+    """Elicitation callback that unconditionally accepts every elicitation.
+
+    Used in tests that need to simulate a user who approves a prompt.
+    The MCP SDK invokes this callback on the client side whenever the
+    server sends an elicitation/create request.
+    """
+    from mcp.types import ElicitResult
+    return ElicitResult(action="accept", content={})
+
+
+async def _decline_elicitation_callback(ctx, params: ElicitRequestParams) -> ElicitResult:
+    """Elicitation callback that unconditionally declines every elicitation.
+
+    Used in tests that explicitly simulate a user who rejects a prompt
+    (as opposed to a client that has no elicitation support at all).
+    """
+    from mcp.types import ElicitResult
+    return ElicitResult(action="decline")
 
 
 @asynccontextmanager
@@ -28,6 +50,7 @@ async def hares_session(
     read_only: bool = False,
     state_file: Optional[Path] = None,
     extra_env: Optional[dict] = None,
+    elicitation_callback=None,
 ) -> AsyncIterator[ClientSession]:
     """Spawn ``hares-mcp`` with the given flags and yield a connected
     ClientSession after ``initialize()`` completes.
@@ -37,6 +60,11 @@ async def hares_session(
         don't depend on bwrap being installed in the sandbox they run in.
       - ``ceiling`` is required for any --enable mode (per CLI), so
         callers MUST pass it explicitly.
+      - Pass ``elicitation_callback=_accept_elicitation_callback`` (or
+        ``_decline_elicitation_callback``) to simulate user interaction
+        with server-initiated elicitation requests.  Without a callback,
+        the default MCP client rejects elicitation with an error — which
+        is the correct "no elicitation support" fail-closed behaviour.
     """
     args: list[str] = [f"--enable={enable}"]
     if scope_id:
@@ -55,7 +83,10 @@ async def hares_session(
 
     params = StdioServerParameters(command="hares-mcp", args=args, env=env)
     async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as session:
+        async with ClientSession(
+            read, write,
+            elicitation_callback=elicitation_callback,
+        ) as session:
             await session.initialize()
             yield session
 
