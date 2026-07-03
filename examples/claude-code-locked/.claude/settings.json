@@ -1,0 +1,6 @@
+{
+  "permissions": {
+    "deny": ["Bash", "Read", "Write", "Edit", "Glob", "Grep"],
+    "allow": ["mcp__hares__*"]
+  }
+}

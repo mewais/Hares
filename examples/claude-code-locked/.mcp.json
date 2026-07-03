@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "hares": {
+      "command": "hares-mcp",
+      "args": ["--enable=fs+shell"],
+      "env": {
+        "HARES_FS_CEILING": "/path/to/your/project",
+        "HARES_MAX_CONCURRENT": "2",
+        "HARES_MEM_LIMIT_MB": "8000",
+        "HARES_CPU_LIMIT_SEC": "1800",
+        "HARES_SANDBOX_RW": "/path/to/your/.gitconfig:/path/to/your/.cache",
+        "HARES_SANDBOX_EXCLUDE": "secrets:.env",
+        "HARES_SANDBOX_PROTECT": "vendor"
+      }
+    }
+  }
+}
