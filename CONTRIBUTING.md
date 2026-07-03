@@ -3,7 +3,7 @@
 ## Development setup
 
 ```sh
-git clone https://github.com/Maksab/Hares.git
+git clone https://github.com/mewais/Hares.git
 cd Hares
 pip install -e ".[dev]"
 ```
@@ -49,7 +49,7 @@ If you ever need to assert behavior when an env var leaks in from outside (rare)
 
 ## Reporting bugs
 
-Open a [GitHub issue](https://github.com/Maksab/Hares/issues) with:
+Open a [GitHub issue](https://github.com/mewais/Hares/issues) with:
 - Hares version (`hares-mcp --version`)
 - OS and kernel version
 - Minimal reproduction steps
