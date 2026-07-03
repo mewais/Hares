@@ -436,6 +436,51 @@ def validate_grant_target(
             )
 
 
+def resolve_path_arg(path_str: str, base: Path) -> Path:
+    """Validate a caller-supplied path arg (reject literal '..'
+    traversal on the string), join it under `base` if relative, and
+    symlink-resolve it (strict=False, so not-yet-existing paths
+    resolve lexically). The shared resolution prologue for every
+    tool-call path in Hares."""
+    validate_path_no_traversal(path_str)
+    raw = Path(path_str)
+    candidate = raw if raw.is_absolute() else base / raw
+    return candidate.resolve(strict=False)
+
+
+def _finish_under_ceiling(
+    resolved: Path,
+    ceiling: Path,
+    *,
+    excludelist: Iterable[Path] | None = None,
+) -> Path:
+    """Everything :func:`resolve_under_ceiling` does AFTER resolution:
+    assert ``resolved`` is under ``ceiling``, apply the system-dir
+    check, and reject in-ceiling excluded paths. Split out so callers
+    that already resolved the path once (e.g.
+    :mod:`hares.fs.operations`) don't have to resolve it again just to
+    run these checks.
+
+    Raises:
+      PathSafetyError: resolved path escapes ceiling, OR (when strict
+        mode is on) lands under a system dir, OR is at-or-under an
+        excluded path.
+    """
+    if not _is_subpath(resolved, ceiling):
+        raise PathSafetyError(
+            f"Resolved path {str(resolved)!r} is not under ceiling "
+            f"{str(ceiling)!r}. Refusing to operate outside the "
+            f"instance's outer bound (this includes symlink targets "
+            f"that would escape via realpath resolution)."
+        )
+    validate_path_no_system_dir(resolved)
+    # In-ceiling blacklist: excluded paths are hidden for reads AND
+    # writes. (Protect is write-only, so it's checked by the write
+    # chokepoint in hares.fs.operations, not here.)
+    validate_path_not_excluded(resolved, ceiling, excludelist=excludelist)
+    return resolved
+
+
 def resolve_under_ceiling(
     path_str: str,
     ceiling: Path,
@@ -465,23 +510,5 @@ def resolve_under_ceiling(
       PathSafetyError: traversal in input, OR resolved path escapes
         ceiling, OR (when strict mode is on) lands under a system dir.
     """
-    validate_path_no_traversal(path_str)
-    raw = Path(path_str)
-    if raw.is_absolute():
-        candidate = raw
-    else:
-        candidate = ceiling / raw
-    resolved = candidate.resolve(strict=False)
-    if not _is_subpath(resolved, ceiling):
-        raise PathSafetyError(
-            f"Resolved path {str(resolved)!r} is not under ceiling "
-            f"{str(ceiling)!r}. Refusing to operate outside the "
-            f"instance's outer bound (this includes symlink targets "
-            f"that would escape via realpath resolution)."
-        )
-    validate_path_no_system_dir(resolved)
-    # In-ceiling blacklist: excluded paths are hidden for reads AND
-    # writes. (Protect is write-only, so it's checked by the write
-    # chokepoint in hares.fs.operations, not here.)
-    validate_path_not_excluded(resolved, ceiling, excludelist=excludelist)
-    return resolved
+    resolved = resolve_path_arg(path_str, ceiling)
+    return _finish_under_ceiling(resolved, ceiling, excludelist=excludelist)

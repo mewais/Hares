@@ -46,8 +46,8 @@ from .grants import GrantStore
 from .path_safety import (
     DenyLists,
     PathSafetyError,
+    resolve_path_arg,
     validate_grant_target,
-    validate_path_no_traversal,
 )
 from .policy import elicit_path_access_approval
 
@@ -130,10 +130,7 @@ def _resolve_candidate(path_str: str, base: Path) -> Path:
     relative to ``base`` (the ceiling, or cwd when there is none).
     Does not assert containment — request_path_access is explicitly
     for paths that may lie outside any ceiling."""
-    validate_path_no_traversal(path_str)
-    raw = Path(path_str)
-    candidate = raw if raw.is_absolute() else base / raw
-    return candidate.resolve(strict=False)
+    return resolve_path_arg(path_str, base)
 
 
 def build_request_path_access_handlers(

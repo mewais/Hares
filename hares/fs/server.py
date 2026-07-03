@@ -14,7 +14,6 @@ the dispatch tables from :mod:`hares.fs.operations`.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from pathlib import Path
 from typing import Optional
@@ -30,6 +29,8 @@ from ..grant_tools import (
 )
 from ..grants import GrantStore
 from ..path_safety import resolve_deny_lists
+from .context import OpContext
+from .dispatch import dispatch_tool_call
 from .operations import READ_OPS, WRITE_OPS
 from .state import ScopeStateStore
 
@@ -70,9 +71,9 @@ def _build_server(
 
     # Build the per-instance tool descriptor list plus a tagged handler
     # registry: name → (kind, handler). "fs" handlers take
-    # (args, ceiling=..., scope=..., deny=...); "restrict" handlers are
-    # bound closures that take only the args dict. Same convention as
-    # the combined server.
+    # (args, ctx=OpContext(...)); "restrict" handlers are bound
+    # closures that take only the args dict. Same convention as the
+    # combined server.
     tool_descriptors: list[Tool] = []
     handlers: dict[str, tuple] = {}
 
@@ -136,20 +137,14 @@ def _build_server(
     @server.call_tool()
     @audited(auditor, scope_id=scope_id)
     async def _call_tool(name: str, arguments: dict) -> list[TextContent]:
-        entry = handlers.get(name)
-        if entry is None:
-            raise ValueError(f"Unknown tool: {name}")
-        kind, handler = entry
-        if kind == "fs":
-            result = await handler(
-                arguments, ceiling=ceiling, scope=scope_state.current(),
-                deny=deny, grants=grant_store,
-            )
-        elif kind in ("restrict", "grant"):
-            result = await handler(arguments)
-        else:
-            raise ValueError(f"Unknown handler kind: {kind!r}")
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        ctx = OpContext(
+            ceiling=ceiling, scope=scope_state.current(),
+            deny=deny, grants=grant_store,
+        )
+        return await dispatch_tool_call(
+            handlers, name, arguments, ctx,
+            non_fs_kinds=("restrict", "grant"),
+        )
 
     return server
 

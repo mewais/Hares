@@ -21,7 +21,6 @@ combined mode.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 from pathlib import Path
@@ -41,6 +40,8 @@ from ..exec_tools import (
     make_roots_refiner,
     prefixed as _prefixed,
 )
+from ..fs.context import OpContext
+from ..fs.dispatch import dispatch_tool_call
 from ..fs.operations import READ_OPS, WRITE_OPS
 from ..grant_tools import (
     build_request_path_access_handlers,
@@ -197,20 +198,14 @@ def _build_server(
     @server.call_tool()
     @audited(auditor, scope_id=scope_id)
     async def _call_tool(name: str, arguments: dict) -> list[TextContent]:
-        entry = handlers.get(name)
-        if entry is None:
-            raise ValueError(f"Unknown tool: {name}")
-        kind, handler = entry
-        if kind == "fs":
-            result = await handler(
-                arguments, ceiling=ceiling, scope=scope_state.current(),
-                deny=deny, grants=grant_store,
-            )
-        elif kind in ("exec", "restrict", "grant"):
-            result = await handler(arguments)
-        else:
-            raise ValueError(f"Unknown handler kind: {kind!r}")
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        ctx = OpContext(
+            ceiling=ceiling, scope=scope_state.current(),
+            deny=deny, grants=grant_store,
+        )
+        return await dispatch_tool_call(
+            handlers, name, arguments, ctx,
+            non_fs_kinds=("exec", "restrict", "grant"),
+        )
 
     return server
 
