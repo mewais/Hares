@@ -1,6 +1,6 @@
 # Hares - حَارِس
 
-> **The kernel-enforced guard for multi-agent LLM workflows.**
+> **The kernel-enforced guard for multi-agent LLM workflows.** (حَارِس — Arabic for "guard" / "guardian".)
 > One binary stands between your LLM agents and your machine — enforcing what they can run, how much they can consume, where they can write, and where they can connect.
 
 [![PyPI](https://img.shields.io/pypi/v/hares.svg)](https://pypi.org/project/hares/)
@@ -33,14 +33,14 @@ Hares fixes all four at the layer where it matters: the kernel.
 
 | | |
 |---|---|
-| **Filesystem isolation** | bwrap mount namespace. Agents physically cannot write outside their declared scope — the kernel rejects it. No policy to argue with. |
+| **Filesystem isolation** | bwrap mount namespace. Agents physically cannot write outside their declared scope — the kernel rejects it, unless a human approves a runtime grant. No policy to argue with. |
 | **Resource caps** | `RLIMIT_AS` + `RLIMIT_CPU` + RSS-overshoot kill + wall-clock timeout, all kernel-enforced. A runaway agent burns its allotment and dies; the host stays alive. |
 | **Command policy** | Deny list for commands that never run. Approval-required list for commands that trigger an MCP elicitation dialog — the user decides before anything executes. Everything else runs immediately. |
 | **Network egress control** | Full, off, or allowlist-filtered. Allowlist mode uses nftables inside an isolated netns: the agent cannot reach undeclared endpoints regardless of the command it runs. |
 | **HPC cluster bridge** | Submit, poll, cancel jobs on LSF or SLURM from inside the agent. No shell on the cluster; jobs are tracked per-session. |
-| **Cross-process coordination** | N parallel Hares instances share one subprocess cap and one core-pool via a POSIX semaphore. Five agents share six slots total — not thirty. |
+| **Cross-process coordination** | N parallel Hares instances share one subprocess cap and one core-pool via per-slot flock files. Five agents share six slots total — not thirty. |
 
-**One binary. One install. Uniform semantics across every mode.**
+**One `pip install`. Uniform semantics across every mode.**
 
 ---
 
@@ -50,7 +50,7 @@ Hares fixes all four at the layer where it matters: the kernel.
 pip install hares
 ```
 
-**For Claude Code (3 steps):**
+**For Claude Code (4 steps):**
 
 **1.** Add to `.mcp.json` in your project root:
 
@@ -171,9 +171,11 @@ HARES_COORDINATION_DIR=/tmp/hares-run \
 
 The key difference from interactive use: there's no approval-required tier. Commands either run or they don't. The default approval list (git push, ssh, curl writes, etc.) still applies, but since there's no human to answer the dialog, it fails closed — those commands are denied. Use `--deny` instead of relying on the approval tier, and use `--suspect=""` to disable the approval tier entirely. Handle the underlying risk via credentials (read-only tokens) and network policy.
 
+The same fail-closed rule applies to `request_path_access`: no human means no approval, so it's always denied under automation. Predeclare any outside-ceiling paths an automated flow needs via `HARES_SANDBOX_RW`/`RO` at startup instead of requesting them at runtime.
+
 ### Already using an MCP filesystem with Claude Code?
 
-Hares is a drop-in replacement. You're already paying MCP latency cost for filesystem ops — swapping gives you kernel-enforced scope plus defense against the [CVE-2025-53109 / CVE-2025-53110](https://nvd.nist.gov/vuln/detail/CVE-2025-53109) class of path-validation bugs that shipped in the reference filesystem MCP.
+Hares is a drop-in replacement. You're already paying MCP latency cost for filesystem ops — swapping gives you hardened, symlink-aware path validation (plus kernel-enforced scope when you run `fs+shell`) plus defense against the [CVE-2025-53109 / CVE-2025-53110](https://nvd.nist.gov/vuln/detail/CVE-2025-53109) class of path-validation bugs that shipped in the reference filesystem MCP.
 
 ```jsonc
 // Before:
@@ -349,6 +351,28 @@ Entries are colon-separated, absolute or ceiling-relative, and must resolve **st
 
 **System-dir validation:** set `HARES_DISALLOW_SYSTEM_DIRS=1` to opt into strict mode — ceilings and mounts are validated against `/etc`, `/proc`, `/sys`, `/bin`, `/usr/bin`, etc. The `.git/` ceiling rejection is always on.
 
+**Runtime path-access grants (`request_path_access`):**
+
+Three ways the writable/readable surface can change, and who drives each one:
+
+- `HARES_SANDBOX_RW` / `RO` (startup) — operator predeclares outside-ceiling access in server config.
+- `restrict_paths` (runtime) — agent narrows the writable surface *within* the ceiling; it can never widen it.
+- `request_path_access` (runtime) — agent requests *new* access **outside** the ceiling, gated by a human's click.
+
+`request_path_access(path, mode, reason)` takes `mode` of `"ro"` or `"rw"` and an agent-authored free-text `reason`. It's registered in shell, fs, and fs+shell modes.
+
+Every call blocks on an MCP elicitation dialog. The dialog shows the *resolved* absolute path (symlinks chased before display), the mode, and an explicit warning that the path is outside the sandbox and — if it's a directory — that the grant covers its entire subtree; the agent's `reason` is shown but visually subordinate to that warning. The human picks one of three options: **Allow once** — consumed by the next access (in shell mode, the very next `execute_command` call, whether or not that command touches the granted path, since bwrap mounts are rebuilt per command and can't tell what was actually touched; in fs mode, the moment a read/write op resolves the granted path) — **Allow for rest of session** — lives until the server process exits — or **Deny**.
+
+Fails closed: non-interactive clients, a decline, a cancel, or any error all resolve to denied, same as the suspicious-command and high-memory elicitations. One deliberate exception: if a client returns *accept* but omits or garbles the scope field (the MCP spec makes response-schema validation a SHOULD, not a MUST), Hares reads it as the least-privileged accept — a single **Allow once** — rather than inventing a session grant. A clear accept is honored at minimum privilege; anything short of accept is denied.
+
+Grants live in memory only. They're never written to disk and don't survive a restart; `--state-file` has no effect on them.
+
+**Deny always wins.** A grant can never open a path blocked by `HARES_SANDBOX_EXCLUDE`, `HARES_SANDBOX_PROTECT`, the system-dir blocklist, or a `.git` directory — checked once when the grant is created (rejected before the human ever sees a dialog) and again at use time (defence in depth). In shell mode, an accepted grant becomes an extra bwrap bind mount applied *before* the exclude/protect mounts, so the kernel resolves any overlap in deny's favor. With `--read-only`, only `mode="ro"` grants are possible — an `rw` request is rejected outright.
+
+`get_active_paths` also lists currently active grants (path, mode, lifetime).
+
+No CLI flag governs this feature — it's intrinsically human-gated and fails closed by design — and there's no revoke tool. Use "Allow once" if you don't want a lasting grant; every grant dies on restart regardless.
+
 ---
 
 ### Resource caps and aggregate memory bounding
@@ -478,9 +502,10 @@ JobSpec(
 |---|---|---|---|
 | Filesystem writes outside scope | **Blocked — kernel** | Not applicable | `--ro-bind / /` + ceiling |
 | Access to blacklisted in-ceiling paths | **Blocked — kernel (shell) / validated (fs)** | Not applicable | `HARES_SANDBOX_EXCLUDE` / `HARES_SANDBOX_PROTECT` |
+| Runtime access outside scope | Only via explicit human approval (`request_path_access`); fails closed | Not applicable | In-memory grants; deny/exclude/protect/system-dirs always win |
 | Resource exhaustion (CPU/RAM) | **Capped — kernel** | Use `resource_spec` | RLIMIT + RSS monitor |
 | Multi-process memory exhaustion killing the session | **Blocked — cgroup `memory.max` scopes the OOM killer to the command** / fallback: best-effort RLIMIT + RSS poll | Not applicable | Requires cgroup v2 + user-systemd; `HARES_DISABLE_CGROUP=1` reverts to RLIMIT |
-| Concurrency overrun | **Capped — semaphore** | Scheduler manages | `HARES_MAX_CONCURRENT` |
+| Concurrency overrun | **Capped — flock slots** | Scheduler manages | `HARES_MAX_CONCURRENT` |
 | Connections to non-allowlisted hosts | **Blocked — nftables** | Not applicable | Requires `--network-allow` |
 | Suspicious commands without approval | **Denied / elicited** | Not applicable | `--suspect` + elicitation |
 | Hard-denied commands | **Blocked** | Not applicable | `--deny` |
@@ -503,9 +528,19 @@ JobSpec(
 - **RLIMIT hard limit inheritance** — if Hares runs inside another Hares process (e.g. test suite), the configured limit is silently clamped to the inherited hard limit. The result includes `applied_mem_limit_mb` showing what was actually applied.
 - **`restrict_paths([])`** — legal; means "no writes". Active-scope freeze useful for operator-initiated lockdown.
 - **In-flight subprocess + restrict change** — existing bwrap trees keep their original mounts; only the next `execute_command` gets the new scope.
-- **POSIX semaphore lifecycle** — kernel-persistent until unlinked. The operator creating `HARES_COORDINATION_DIR` is responsible for cleanup between runs with different caps.
+- **`request_path_access` "once" in shell mode** — a "once" grant is consumed by the next `execute_command` call regardless of whether that command actually touches the granted path; bwrap mounts are rebuilt per command and the mount layer can't introspect actual access. In fs mode, "once" is consumed the moment a read/write op resolves the granted path instead.
+- **One tool call, two paths, one "once" grant** — a call that resolves two paths under the same once-grant (e.g. `move_file` with source and destination both under one once-grant) consumes the grant on the first path and fails on the second. Request a "session" grant for operations like this.
+- **Flock-file slot lifecycle** — coordination slots are per-slot lock files under `HARES_COORDINATION_DIR`. If a process crashes mid-run, the kernel releases its flock automatically when the file descriptor closes — no manual cleanup, no leaked-semaphore problem. The operator is still responsible for the `HARES_COORDINATION_DIR` directory itself between runs with different caps.
 - **slirp4netns not found** — `--network-allow` degrades to `--network=off` with a warning. Run `hares-mcp doctor` to verify the full setup.
 - **`--state-file` requires `HARES_STATE_HMAC_SECRET`** — startup refuses without it (a compromised restart could replay a stale scope). Set to 32+ bytes of base64/hex.
+
+---
+
+## FAQ
+
+### Why not just Docker?
+
+Docker isolates a whole container image — you build it, ship it, and run inside a persistent container lifecycle with its own daemon. Hares wraps each command in a fresh bwrap mount namespace instead: no daemon, no image to build, no container to keep alive. Commands run in your actual dev environment — same tools, same PATH, same files — with the writable surface, resource caps, network egress, and command policy enforced per invocation rather than baked into an image. That means Hares scopes individual command executions inside your real working tree, and layers in the resource-coordination, network-allowlist, command-approval, and HPC-bridge pieces Docker doesn't provide on its own. It's complementary to Docker, not a replacement for it as a deployment or packaging tool.
 
 ---
 
@@ -514,6 +549,8 @@ JobSpec(
 Hares is **0.4.x — beta**. APIs are stable enough to build on; minor versions may tweak env-var names and tool signatures. Pin the minor version in production.
 
 Tested on Linux (RHEL 8+, Ubuntu 20.04+, Fedora). Cluster modes require LSF or SLURM binaries on `PATH` and a shared filesystem visible to both submit and execute hosts.
+
+The test suite is roughly the size of the source itself — about 9,300 lines across `tests/`.
 
 ## Contributing
 

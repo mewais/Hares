@@ -52,8 +52,8 @@ def _version_string() -> str:
     """Build the --version string: Hares version + key system info.
 
     Kept lightweight — no subprocesses, no network. Just shutil.which
-    for bwrap and a quick import check for posix_ipc. Useful for
-    including in bug reports without running the full 'doctor' command.
+    for bwrap. Useful for including in bug reports without running the
+    full 'doctor' command.
     """
     import platform
     import shutil
@@ -75,13 +75,7 @@ def _version_string() -> str:
     else:
         bwrap_str = "bwrap not found"
 
-    try:
-        import posix_ipc as _pipc  # noqa: F401
-        pipc_str = "posix_ipc ✓"
-    except ImportError:
-        pipc_str = "posix_ipc ✗"
-
-    return f"hares-mcp {__version__}  [{py} · {plat} · {bwrap_str} · {pipc_str}]"
+    return f"hares-mcp {__version__}  [{py} · {plat} · {bwrap_str}]"
 
 
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:

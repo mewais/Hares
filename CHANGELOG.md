@@ -64,6 +64,42 @@ follow [Semantic Versioning](https://semver.org/).
   warning on entries that aren't strictly under the ceiling or don't
   exist yet.
 
+* **`request_path_access` MCP tool** — lets the agent request read or
+  write access to a path *outside* the current sandbox scope at
+  runtime, gated by a blocking MCP elicitation dialog (**Allow once**
+  / **Allow for rest of session** / **Deny**). Fails closed for
+  non-interactive clients, declines, cancels, and errors — same
+  posture as the existing suspicious-command and high-memory
+  elicitations. Grants are in-memory only: never persisted, don't
+  survive a restart, unaffected by `--state-file`. Deny always wins —
+  `HARES_SANDBOX_EXCLUDE`, `HARES_SANDBOX_PROTECT`, the system-dir
+  blocklist, and `.git` directories can never be opened by a grant,
+  enforced both when the grant is created and again at use time. In
+  shell mode an accepted grant becomes an extra bwrap bind mount
+  applied *before* the exclude/protect mounts. With `--read-only`,
+  only `mode="ro"` grants are possible. Registered in shell, fs, and
+  fs+shell modes; no CLI flag gates it and there is no revoke tool.
+* **`get_active_paths` now lists active grants** — path, mode, and
+  lifetime for every currently active `request_path_access` grant.
+
+### Changed
+
+* **Cross-process coordination now uses per-slot flock files** instead
+  of a POSIX named semaphore. A crashing process's slot is released
+  automatically by the kernel when its file descriptor closes, so a
+  crash can no longer leak a slot and starve the shared budget (the old
+  semaphore stayed held until explicitly unlinked). Drops the optional
+  `posix_ipc` dependency; `HARES_COORDINATION_DIR` semantics are
+  otherwise unchanged.
+* **Internal refactor: shared `hares.exec_tools` module.**
+  Deduplicated the `execute_command` / `execute_command_high_memory`
+  tool wiring that shell-mode and combined (fs+shell) servers
+  previously each implemented separately. Also unifies the
+  path-containment primitive used across fs validation, bwrap cwd
+  checks, and CLI/doctor diagnostics, adds explicit exclude/protect
+  resolution helpers, and introduces an `ExecuteResult` TypedDict for
+  the exec-tool return shape. No behavior change.
+
 ### Tests
 
 * New coverage across `test_path_safety`, `test_sandbox` (pure builder
