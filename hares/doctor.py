@@ -1,9 +1,10 @@
 """hares-mcp doctor — environment diagnostic.
 
 Prints a one-screen status of everything Hares cares about: bwrap
-install + version, kernel user-namespace support, posix_ipc, the
-ceiling env var, the optional HMAC + coordination-dir + cluster
-binaries, and the sandbox-disabled escape hatch.
+install + version, kernel user-namespace support, the flock-based
+coordination slots, the ceiling env var, the optional HMAC +
+coordination-dir + cluster binaries, and the sandbox-disabled escape
+hatch.
 
 The aim is that every "Hares doesn't work" report can be diagnosed by
 asking the user to paste the output of this command. Each line is one
@@ -373,6 +374,23 @@ def check_sandbox_exclude_protect() -> CheckResult:
     return _ok(f"In-ceiling blacklist OK ({summary}, all under {ceiling})")
 
 
+def check_request_path_access() -> CheckResult:
+    """Informational: summarize the runtime path-access grant escape
+    hatch. There is no env var / CLI flag to check — the tool is
+    always registered (shell/fs/fs+shell modes) and is intrinsically
+    human-in-the-loop-gated: it fails closed for any client without
+    MCP elicitation support, so there is no operator off-switch to
+    report on. This check exists purely so `doctor` output explains
+    the feature's fail-closed posture to anyone diagnosing "why did
+    this get denied" reports.
+    """
+    return _ok(
+        "request_path_access is HITL-gated (blocking elicitation dialog); "
+        "grants are in-memory only, never persisted, and can never "
+        "override excluded/protected/system-dir/.git paths",
+    )
+
+
 def check_sandbox_disabled() -> CheckResult:
     """Inform when the kernel sandbox is disabled — not an error, just loud."""
     if (
@@ -526,6 +544,7 @@ SECTIONS: list[tuple[str, list]] = [
         check_coordination_dir,
         check_slot_files,
         check_network_policy,
+        check_request_path_access,
     ]),
     ("Cluster (lsf / slurm modes)", [
         check_lsf,

@@ -41,6 +41,25 @@ async def _decline_elicitation_callback(ctx, params: ElicitRequestParams) -> Eli
     return ElicitResult(action="decline")
 
 
+async def _cancel_elicitation_callback(ctx, params: ElicitRequestParams) -> ElicitResult:
+    """Elicitation callback that unconditionally cancels (dismissed
+    without an explicit choice) every elicitation."""
+    from mcp.types import ElicitResult
+    return ElicitResult(action="cancel")
+
+
+def _grant_elicitation_callback(grant: str):
+    """Build an elicitation callback that accepts with a specific
+    ``{"grant": ...}`` form-field value — simulates a well-behaved MCP
+    client that honors ``requestedSchema`` and a human who picked
+    ``grant`` in the request_path_access dialog (one of "once",
+    "session", "deny")."""
+    async def _callback(ctx, params: ElicitRequestParams) -> ElicitResult:
+        from mcp.types import ElicitResult
+        return ElicitResult(action="accept", content={"grant": grant})
+    return _callback
+
+
 @asynccontextmanager
 async def hares_session(
     *,

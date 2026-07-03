@@ -113,3 +113,36 @@ async def test_on_change_callback_fires(tmp_path):
     a = tmp_path / "a"; a.mkdir()
     await handlers["restrict_paths"]({"paths": [str(a)]})
     assert fired == ["called"]
+
+
+# ── get_active_paths grants section (request_path_access visibility) ──
+
+
+@pytest.mark.asyncio
+async def test_get_active_paths_grants_empty_without_grant_store(tmp_path):
+    """No grant_store wired up at all — 'grants' key still present,
+    just empty (ADD to the existing shape, never break it)."""
+    state, handlers = build_restrict_tool_handlers(
+        scope_id=None, ceiling=tmp_path, state_file=None,
+    )
+    g = await handlers["get_active_paths"]({})
+    assert g["grants"] == []
+    # Existing shape untouched.
+    assert "active_paths" in g and "seq" in g and "hmac" in g and "version" in g
+
+
+@pytest.mark.asyncio
+async def test_get_active_paths_reflects_grant_store_contents(tmp_path):
+    from hares.grants import GrantStore
+
+    store = GrantStore()
+    outside = tmp_path.parent / "outside_grant_reflect"
+    outside.mkdir(exist_ok=True)
+    store.add(outside, "rw", "once")
+    state, handlers = build_restrict_tool_handlers(
+        scope_id=None, ceiling=tmp_path, state_file=None, grant_store=store,
+    )
+    g = await handlers["get_active_paths"]({})
+    assert g["grants"] == [
+        {"path": str(outside), "mode": "rw", "lifetime": "once"},
+    ]

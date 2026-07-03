@@ -29,8 +29,9 @@ from anywhere in Hares without pulling in the MCP / asyncio stack.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional, Union
 
 
 class PathSafetyError(ValueError):
@@ -110,18 +111,36 @@ def get_system_dir_blocklist() -> tuple[str, ...]:
     return DEFAULT_SYSTEM_DIRS + extra
 
 
-def _is_subpath(child: Path, parent: Path) -> bool:
+def _is_subpath(child: Union[Path, str], parent: Union[Path, str]) -> bool:
     """True if ``child`` equals ``parent`` or lives strictly under it,
-    AFTER both are resolved to absolute paths."""
+    AFTER both are resolved to absolute paths.
+
+    This is the ONE containment primitive for all of Hares (fs path
+    validation, bwrap cwd checks, CLI/doctor diagnostics, cluster
+    submission bounds). Semantics — chosen as the safest superset of
+    the two historical implementations (this one and a former
+    ``os.path.realpath``-based copy in :mod:`hares.sandbox`):
+
+    * BOTH sides are symlink-resolved (``Path.resolve(strict=False)``,
+      equivalent to ``os.path.realpath``) before comparing, so a
+      symlink pointing outside ``parent`` does not count as contained,
+      and a symlinked ``parent`` still matches its real children.
+      ``strict=False``: nonexistent paths resolve lexically instead of
+      failing, so bounds can be validated before paths exist on disk.
+    * The prefix check is separator-aware — ``parent=/work/proj`` must
+      NOT match ``/work/projsomething``, so ``/`` is appended before
+      the ``startswith``.
+    * Fail-closed: if resolution raises (``OSError``, or ``RuntimeError``
+      on pathological symlink loops), the answer is False — callers
+      treat "can't tell" as "not contained".
+    """
     try:
-        c = child.resolve(strict=False)
-        p = parent.resolve(strict=False)
+        c = Path(child).resolve(strict=False)
+        p = Path(parent).resolve(strict=False)
     except (OSError, RuntimeError):
         return False
     if c == p:
         return True
-    # Use os.sep-aware prefix check — a parent like /work/proj must NOT
-    # match /work/projsomething, so add the separator before comparing.
     p_str = str(p).rstrip("/") + "/"
     c_str = str(c)
     return c_str.startswith(p_str)
@@ -225,6 +244,36 @@ def get_protect_list(ceiling: Path) -> tuple[Path, ...]:
     return _load_denylist(_PROTECT_ENV, ceiling)
 
 
+@dataclass(frozen=True)
+class DenyLists:
+    """Both in-ceiling blacklists, resolved against ONE specific ceiling.
+
+    Servers build this once at server-construction time (the moment
+    the fs ceiling is finalized) via :func:`resolve_deny_lists` and
+    pass it down to the fs operations explicitly, so the per-operation
+    hot path does not re-read ``HARES_SANDBOX_EXCLUDE`` /
+    ``HARES_SANDBOX_PROTECT`` from the environment on every call.
+
+    The resolution is keyed on the ceiling — a caller whose ceiling
+    changes must resolve a fresh instance. (The shell Runner keeps its
+    own call-time resolution in ``Runner._resolve_blacklist`` for
+    exactly that reason: its ceiling can be refined from MCP roots
+    after startup.)
+    """
+
+    exclude: tuple[Path, ...] = ()
+    protect: tuple[Path, ...] = ()
+
+
+def resolve_deny_lists(ceiling: Path) -> DenyLists:
+    """Resolve both env-driven blacklists against ``ceiling`` (see
+    :class:`DenyLists`)."""
+    return DenyLists(
+        exclude=get_exclude_list(ceiling),
+        protect=get_protect_list(ceiling),
+    )
+
+
 def is_denied(path: Path, denylist: Iterable[Path]) -> bool:
     """True if ``path`` is at-or-under any entry in ``denylist``.
 
@@ -279,6 +328,32 @@ def validate_path_not_protected(
             )
 
 
+def _contains_forbidden_segment(
+    resolved: Path,
+    segments: Iterable[str] = ALWAYS_FORBIDDEN_CEILING_SEGMENTS,
+) -> bool:
+    """True if ``resolved``'s parts contain any of ``segments`` as a
+    contiguous subsequence at any depth — e.g. a ``.git`` path
+    component anywhere in the path, not just as the final component.
+    This catches both ``ceiling=.git`` (relative, resolves to a
+    trailing segment) and ``ceiling=/work/proj/.git/objects``
+    (absolute, ``.git`` mid-path) via the same check.
+
+    Shared by :func:`validate_ceiling` (a ceiling can never cover
+    ``.git/``) and :func:`validate_grant_target` (a runtime
+    ``request_path_access`` grant can never open ``.git/`` either,
+    regardless of whether the grant target lies inside or outside
+    any ceiling).
+    """
+    parts = resolved.parts
+    for forbidden_segment in segments:
+        seg_parts = Path(forbidden_segment).parts
+        for i in range(len(parts) - len(seg_parts) + 1):
+            if parts[i:i + len(seg_parts)] == seg_parts:
+                return True
+    return False
+
+
 def validate_ceiling(ceiling: Path) -> None:
     """Validate a ceiling path argument (passed to ``--ceiling`` or
     via ``HARES_FS_CEILING``).
@@ -293,30 +368,79 @@ def validate_ceiling(ceiling: Path) -> None:
     # doesn't yet exist (greenfield project root) doesn't fail
     # resolution — we only care about path shape, not file presence.
     resolved = ceiling.resolve(strict=False)
-    for forbidden_segment in ALWAYS_FORBIDDEN_CEILING_SEGMENTS:
-        # Match if the resolved ceiling literally contains the segment
-        # OR is at-or-under a path ending in that segment. This catches
-        # both `ceiling=.git` (relative) and
-        # `ceiling=/work/proj/.git` (absolute) via the same check.
-        parts = resolved.parts
-        seg_parts = Path(forbidden_segment).parts
-        # Look for seg_parts as a contiguous subsequence at any
-        # depth in resolved.parts.
-        for i in range(len(parts) - len(seg_parts) + 1):
-            if parts[i:i + len(seg_parts)] == seg_parts:
-                raise PathSafetyError(
-                    f"Ceiling {str(ceiling)!r} (resolved to "
-                    f"{str(resolved)!r}) covers always-forbidden "
-                    f"segment {forbidden_segment!r}; this is never "
-                    f"legitimate as an LLM-controlled scope. Pick a "
-                    f"different ceiling."
-                )
+    if _contains_forbidden_segment(resolved):
+        raise PathSafetyError(
+            f"Ceiling {str(ceiling)!r} (resolved to "
+            f"{str(resolved)!r}) covers an always-forbidden segment "
+            f"(e.g. '.git'); this is never legitimate as an "
+            f"LLM-controlled scope. Pick a different ceiling."
+        )
     validate_path_no_system_dir(resolved)
+
+
+def validate_grant_target(
+    resolved: Path,
+    *,
+    mode: str = "rw",
+    ceiling: Optional[Path] = None,
+    deny: Optional["DenyLists"] = None,
+) -> None:
+    """Validate that ``resolved`` may become (or continue to be used
+    as) the root of a runtime ``request_path_access`` grant.
+
+    This is the ONE deny check shared by grant-approval time (before
+    a grant is recorded — see
+    :func:`hares.policy.elicit_path_access_approval` and the
+    ``request_path_access`` handler in :mod:`hares.grant_tools`) and
+    use time (defense in depth — see the grant fallback in
+    :mod:`hares.fs.operations` and the bwrap mount composition in
+    :class:`hares.runner.Runner`). Deny always beats a grant; this
+    function is what makes that true in exactly one place.
+
+    Checks, applied regardless of whether ``resolved`` lies inside or
+    outside any ceiling:
+
+    * ``.git`` segment anywhere in the path (mirrors
+      :func:`validate_ceiling` — never legitimate, no opt-out).
+    * System-dir blocklist (opt-in via ``HARES_DISALLOW_SYSTEM_DIRS``).
+
+    When ``ceiling`` is given AND ``resolved`` happens to fall inside
+    it (an edge case — grants are meant to widen access OUTSIDE the
+    ceiling, but nothing stops an agent from requesting a path that's
+    already inside it), the in-ceiling blacklist is ALSO enforced:
+
+    * ``HARES_SANDBOX_EXCLUDE`` — always (hides for both read+write).
+    * ``HARES_SANDBOX_PROTECT`` — only when ``mode == "rw"`` (protect
+      is write-only; a read-mode grant target under a protected path
+      is fine to read, same as any other protected path).
+
+    Raises :class:`PathSafetyError` / :class:`PathDeniedError` on any
+    violation.
+    """
+    if _contains_forbidden_segment(resolved):
+        raise PathSafetyError(
+            f"Path {str(resolved)!r} is at-or-under a '.git' directory; "
+            f"this can never be granted via request_path_access, "
+            f"regardless of user approval."
+        )
+    validate_path_no_system_dir(resolved)
+    if ceiling is not None and _is_subpath(resolved, ceiling):
+        validate_path_not_excluded(
+            resolved, ceiling,
+            excludelist=deny.exclude if deny is not None else None,
+        )
+        if mode == "rw":
+            validate_path_not_protected(
+                resolved, ceiling,
+                protectlist=deny.protect if deny is not None else None,
+            )
 
 
 def resolve_under_ceiling(
     path_str: str,
     ceiling: Path,
+    *,
+    excludelist: Iterable[Path] | None = None,
 ) -> Path:
     """Resolve a tool-call path argument relative to ``ceiling``,
     follow symlinks, assert the result is under ceiling.
@@ -329,6 +453,10 @@ def resolve_under_ceiling(
     Args:
       path_str: Caller-supplied path (relative or absolute).
       ceiling: The instance's outer bound.
+      excludelist: Pre-resolved ``HARES_SANDBOX_EXCLUDE`` entries
+        (see :class:`DenyLists`). When None, the list is loaded from
+        the environment per call (back-compat default for direct
+        callers).
 
     Returns:
       The resolved absolute path (under ceiling).
@@ -355,5 +483,5 @@ def resolve_under_ceiling(
     # In-ceiling blacklist: excluded paths are hidden for reads AND
     # writes. (Protect is write-only, so it's checked by the write
     # chokepoint in hares.fs.operations, not here.)
-    validate_path_not_excluded(resolved, ceiling)
+    validate_path_not_excluded(resolved, ceiling, excludelist=excludelist)
     return resolved

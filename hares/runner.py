@@ -31,13 +31,70 @@ import resource
 import signal
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, TypedDict
 
 from . import memlimit
+from .grants import GrantStore
 from .inspector import format_rewrite_notice, inspect_command
 from .sandbox import SandboxConfig, build_bwrap_argv
 
 logger = logging.getLogger(__name__)
+
+
+class _ExecuteResultBase(TypedDict):
+    """Keys present in EVERY :meth:`Runner.execute` result."""
+
+    #: Child's exit status. Negative = killed by that signal number;
+    #: -1 for the servers' policy-rejection payloads.
+    exit_code: Optional[int]
+    stdout: str
+    stderr: str
+    #: None on a clean run, else one of "timeout", "rss_exceeded",
+    #: "cpu_exceeded", "oom".
+    killed_reason: Optional[str]
+    #: Pre-flight overcommit rewrites applied to the command (empty
+    #: list when none fired). Each entry has kind/original/replacement/
+    #: reason keys.
+    rewrites: list[dict[str, str]]
+    #: Per-process RLIMIT_AS actually applied, in MB (after clamping).
+    applied_mem_limit_mb: int
+    #: RLIMIT_CPU actually applied, in seconds (after clamping).
+    applied_cpu_limit_sec: int
+    #: "full", "off", or "allowlist" — the network isolation in effect.
+    network_mode: str
+    #: "cgroup" when the command tree was wrapped in a cgroup v2 scope,
+    #: else "rlimit".
+    memory_mode: str
+    #: Aggregate (whole-tree) memory cap in MB — the cgroup memory.max
+    #: when memory_mode == "cgroup", and the RLIMIT_AS fallback otherwise.
+    aggregate_mem_limit_mb: int
+
+
+class ExecuteResult(_ExecuteResultBase, total=False):
+    """Result shape of :meth:`Runner.execute`.
+
+    The base keys (see :class:`_ExecuteResultBase`) are always present.
+    The keys below are conditional:
+
+    * ``killed_note`` — present iff ``killed_reason`` is not None; a
+      human-readable explanation of the kill plus remediation advice.
+      (The MCP servers may append a retry hint pointing at
+      ``execute_command_high_memory`` when ``killed_reason == "oom"``.)
+    * ``peak_rss_mb`` — present when the RSS monitor observed the
+      process tree's peak resident set (best-effort; requires psutil
+      and at least one successful poll).
+    * ``preexec_note`` — present when the child failed to start because
+      ``preexec_fn`` raised (typically: requested RLIMIT exceeds the
+      inherited hard limit).
+    * ``resource_note`` — present when a caller-supplied per-call
+      ``mem_limit_mb`` / ``cpu_limit_sec`` was clamped down to the
+      operator ceiling; describes the clamp(s).
+    """
+
+    killed_note: str
+    peak_rss_mb: int
+    preexec_note: str
+    resource_note: str
 
 # Avoid a hard import-time dependency on coordination.py; type-only.
 if False:  # TYPE_CHECKING
@@ -147,6 +204,7 @@ class Runner:
         network_policy: Optional["NetworkPolicy"] = None,
         mem_limit_max_mb: Optional[int] = None,
         use_cgroup: Optional[bool] = None,
+        grant_store: Optional[GrantStore] = None,
     ) -> None:
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be >= 1")
@@ -221,6 +279,12 @@ class Runner:
         self._coordinator = coordinator
         self._ceiling: Optional[Path] = ceiling
         self._network_policy = network_policy
+        # Runtime request_path_access grants (see hares.grants). None
+        # when the caller never wired one up — _effective_sandbox and
+        # execute() both no-op gracefully in that case. In combined
+        # mode, this is the SAME GrantStore instance shared with the
+        # fs operation handlers (see hares.combined.server).
+        self._grant_store = grant_store
 
         # Concurrency: when a coordinator is injected, defer entirely to
         # it (cross-process semaphore). Else fall back to per-process
@@ -301,9 +365,18 @@ class Runner:
           3. Active scope paths (from restrict_paths) — RW (or RO if
              read_only). When set, these override the ceiling mount for
              their subtrees, narrowing write authority.
+          4. Active request_path_access grants (see GrantStore) — RW or
+             RO extra binds OUTSIDE the ceiling, added last among the
+             "allow" tiers (still BEFORE the deny tier below, which
+             ``build_bwrap_argv`` always applies last regardless).
 
         This matches the documented design: ceiling defines what's
-        observable; active scope defines what's modifiable.
+        observable; active scope defines what's modifiable; grants
+        widen past the ceiling on a per-path, human-approved basis.
+
+        Pure / side-effect-free — does NOT consume "once" grants (this
+        method is called more than once per execute() call). See
+        ``execute()`` for the single consumption point.
         """
         if self._sandbox is None:
             return None
@@ -314,7 +387,7 @@ class Runner:
         # HARES_SANDBOX_EXCLUDE) against the ceiling now — load_sandbox_config
         # stored them raw because it doesn't know the ceiling. build_bwrap_argv
         # applies them LAST regardless of which branch below runs, so deny
-        # always beats the rw/active-scope binds.
+        # always beats the rw/active-scope/grant binds.
         base = self._resolve_blacklist(self._sandbox)
 
         if self._active_scope_paths is None:
@@ -322,25 +395,61 @@ class Runner:
             # (read-only mode). Before this fix the ceiling wasn't mounted
             # at all, making project files inaccessible without a cwd.
             if not ceiling_str:
-                return base
-            if self._active_scope_read_only:
+                result = base
+            elif self._active_scope_read_only:
                 new_ro = tuple(base.ro_binds) + (ceiling_str,)
-                return replace(base, ro_binds=new_ro)
-            new_rw = tuple(base.rw_binds) + (ceiling_str,)
-            return replace(base, rw_binds=new_rw)
-
-        # Active scope set — scope paths are RW (or RO), ceiling is RO
-        # for anything not already covered by an RW scope path.
-        extra_paths = tuple(str(p) for p in self._active_scope_paths)
-        if self._active_scope_read_only:
+                result = replace(base, ro_binds=new_ro)
+            else:
+                new_rw = tuple(base.rw_binds) + (ceiling_str,)
+                result = replace(base, rw_binds=new_rw)
+        elif self._active_scope_read_only:
+            # Active scope set — scope paths are RW (or RO), ceiling is RO
+            # for anything not already covered by an RW scope path.
+            extra_paths = tuple(str(p) for p in self._active_scope_paths)
             new_ro = tuple(base.ro_binds) + extra_paths
-            return replace(base, ro_binds=new_ro)
-        # RW scope + ceiling as RO for the rest of the tree.
-        new_rw = tuple(base.rw_binds) + extra_paths
-        new_ro = tuple(base.ro_binds)
-        if ceiling_str and ceiling_str not in new_rw:
-            new_ro = new_ro + (ceiling_str,)
-        return replace(base, rw_binds=new_rw, ro_binds=new_ro)
+            result = replace(base, ro_binds=new_ro)
+        else:
+            # RW scope + ceiling as RO for the rest of the tree.
+            extra_paths = tuple(str(p) for p in self._active_scope_paths)
+            new_rw = tuple(base.rw_binds) + extra_paths
+            new_ro = tuple(base.ro_binds)
+            if ceiling_str and ceiling_str not in new_rw:
+                new_ro = new_ro + (ceiling_str,)
+            result = replace(base, rw_binds=new_rw, ro_binds=new_ro)
+
+        return self._apply_grant_mounts(result)
+
+    def _apply_grant_mounts(self, cfg: SandboxConfig) -> SandboxConfig:
+        """Add active request_path_access grant roots (see
+        hares.grants.GrantStore) as extra bind mounts.
+
+        Appended to ``rw_binds`` / ``ro_binds`` per grant mode — i.e.
+        BEFORE ``build_bwrap_argv`` applies ``protect_binds`` /
+        ``exclude_binds`` (always LAST in that function), so a
+        granted path that also happens to be excluded/protected is
+        still denied: deny beats grant, kernel-enforced, no extra
+        code needed here beyond "add the bind in the right tier."
+
+        Pure / side-effect-free: does NOT consume "once" grants (this
+        method may be called more than once per execute() — see the
+        two call sites in ``execute()``). Consumption happens exactly
+        once, in ``execute()``, right before the subprocess spawns —
+        see the docstring on ``GrantStore.consume_all_once``.
+        """
+        if self._grant_store is None:
+            return cfg
+        grants = self._grant_store.list_active()
+        if not grants:
+            return cfg
+        rw_extra = tuple(g["path"] for g in grants if g["mode"] == "rw")
+        ro_extra = tuple(g["path"] for g in grants if g["mode"] == "ro")
+        if not rw_extra and not ro_extra:
+            return cfg
+        return replace(
+            cfg,
+            rw_binds=tuple(cfg.rw_binds) + rw_extra,
+            ro_binds=tuple(cfg.ro_binds) + ro_extra,
+        )
 
     def _resolve_blacklist(self, sandbox: SandboxConfig) -> SandboxConfig:
         """Resolve HARES_SANDBOX_PROTECT / HARES_SANDBOX_EXCLUDE entries
@@ -761,7 +870,7 @@ class Runner:
         cpu_limit_sec: Optional[int] = None,
         stdin: Optional[str] = None,
         high_memory: bool = False,
-    ) -> dict[str, Any]:
+    ) -> ExecuteResult:
         """Run `command` in a shell, return stdout/stderr/exit_code/killed_reason.
 
         Args:
@@ -798,10 +907,8 @@ class Runner:
             full self._mem_max_bytes.
 
         Returns:
-          dict with keys: exit_code, stdout, stderr, killed_reason,
-          rewrites (list of dicts describing any pre-flight edits),
-          memory_mode ('cgroup' or 'rlimit'),
-          aggregate_mem_limit_mb (effective aggregate cap in MB).
+          An :class:`ExecuteResult` dict — see that class's docstring
+          for the full key set and when each conditional key appears.
           killed_reason is one of: None, "timeout", "rss_exceeded",
           "cpu_exceeded", "oom".
         """
@@ -904,6 +1011,20 @@ class Runner:
 
             effective_sandbox = self._effective_sandbox(cwd)
             if effective_sandbox is not None:
+                # Single consumption point for "once" request_path_access
+                # grants: bwrap mounts are recomputed fresh on every
+                # execute() call (there's no persistent mount namespace to
+                # incrementally update), so a "once" grant is defined to
+                # apply to exactly this upcoming execute() call and is
+                # then removed — regardless of whether the command
+                # actually touches the granted path (bwrap mount
+                # composition can't cheaply introspect that). This must
+                # run exactly ONCE per execute() call: _effective_sandbox
+                # itself stays side-effect-free (it's called twice above,
+                # for the use_allowlist probe and for the real mount
+                # list) so consuming inside it would double-consume.
+                if self._grant_store is not None:
+                    self._grant_store.consume_all_once()
                 # Sandboxed path: bwrap (possibly with slirp4netns for
                 # network allowlist). _spawn_sandboxed handles both cases
                 # and now returns (proc, scope_dir).
@@ -1122,7 +1243,7 @@ class Runner:
                     "starting Hares."
                 )
 
-            result: dict[str, Any] = {
+            result: ExecuteResult = {
                 "exit_code": proc.returncode,
                 "stdout": stdout_str,
                 "stderr": stderr_str,

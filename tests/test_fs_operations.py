@@ -19,7 +19,8 @@ from hares.fs.operations import (
     write_file,
 )
 from hares.fs.state import ActiveScope
-from hares.path_safety import PathDeniedError
+from hares.grants import GrantStore
+from hares.path_safety import PathDeniedError, PathSafetyError
 
 
 def _scope(*paths: Path) -> ActiveScope:
@@ -307,3 +308,157 @@ async def test_exclude_beats_protect_on_read(monkeypatch, tmp_path):
     (both / "f").write_text("x")
     with pytest.raises(PathDeniedError, match="excluded"):
         await read_file({"path": "both/f"}, ceiling=tmp_path, scope=_scope())
+
+
+# ── request_path_access grants — fs enforcement ─────────────────────────
+#
+# These exercise the grant fallback inside hares.fs.operations._resolve
+# directly (unit-level, no MCP round-trip — the request_path_access
+# tool handler itself is covered by test_request_path_access_proto.py).
+
+
+@pytest.mark.asyncio
+async def test_outside_ceiling_read_rejected_without_grant(tmp_path):
+    ceiling = tmp_path / "proj"; ceiling.mkdir()
+    outside = tmp_path / "outside"; outside.mkdir()
+    (outside / "f.txt").write_text("secret")
+    with pytest.raises(PathSafetyError, match="not under ceiling"):
+        await read_file(
+            {"path": str(outside / "f.txt")}, ceiling=ceiling, scope=_scope(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_ro_grant_allows_read_outside_ceiling(tmp_path):
+    ceiling = tmp_path / "proj"; ceiling.mkdir()
+    outside = tmp_path / "outside"; outside.mkdir()
+    (outside / "f.txt").write_text("hello")
+    grants = GrantStore()
+    grants.add(outside, "ro", "session")
+    result = await read_file(
+        {"path": str(outside / "f.txt")}, ceiling=ceiling, scope=_scope(),
+        grants=grants,
+    )
+    assert result["content"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_ro_grant_does_not_allow_write_outside_ceiling(tmp_path):
+    ceiling = tmp_path / "proj"; ceiling.mkdir()
+    outside = tmp_path / "outside"; outside.mkdir()
+    grants = GrantStore()
+    grants.add(outside, "ro", "session")
+    with pytest.raises(PathSafetyError, match="not under ceiling"):
+        await write_file(
+            {"path": str(outside / "f.txt"), "content": "nope"},
+            ceiling=ceiling, scope=_scope(), grants=grants,
+        )
+
+
+@pytest.mark.asyncio
+async def test_rw_grant_allows_both_read_and_write_outside_ceiling(tmp_path):
+    ceiling = tmp_path / "proj"; ceiling.mkdir()
+    outside = tmp_path / "outside"; outside.mkdir()
+    grants = GrantStore()
+    grants.add(outside, "rw", "session")
+    await write_file(
+        {"path": str(outside / "f.txt"), "content": "written"},
+        ceiling=ceiling, scope=_scope(), grants=grants,
+    )
+    result = await read_file(
+        {"path": str(outside / "f.txt")}, ceiling=ceiling, scope=_scope(),
+        grants=grants,
+    )
+    assert result["content"] == "written"
+
+
+@pytest.mark.asyncio
+async def test_directory_grant_covers_nested_file(tmp_path):
+    ceiling = tmp_path / "proj"; ceiling.mkdir()
+    outside = tmp_path / "outside"
+    nested_dir = outside / "a" / "b"
+    nested_dir.mkdir(parents=True)
+    (nested_dir / "deep.txt").write_text("deep-content")
+    grants = GrantStore()
+    grants.add(outside, "ro", "session")
+    result = await read_file(
+        {"path": str(nested_dir / "deep.txt")}, ceiling=ceiling, scope=_scope(),
+        grants=grants,
+    )
+    assert result["content"] == "deep-content"
+
+
+@pytest.mark.asyncio
+async def test_once_grant_consumed_after_one_read(tmp_path):
+    ceiling = tmp_path / "proj"; ceiling.mkdir()
+    outside = tmp_path / "outside"; outside.mkdir()
+    target = outside / "f.txt"
+    target.write_text("once-only")
+    grants = GrantStore()
+    grants.add(outside, "ro", "once")
+    # First read succeeds and consumes the grant.
+    result = await read_file(
+        {"path": str(target)}, ceiling=ceiling, scope=_scope(), grants=grants,
+    )
+    assert result["content"] == "once-only"
+    assert grants.list_active() == []
+    # Second read is now rejected — the grant is gone.
+    with pytest.raises(PathSafetyError, match="not under ceiling"):
+        await read_file(
+            {"path": str(target)}, ceiling=ceiling, scope=_scope(), grants=grants,
+        )
+
+
+@pytest.mark.asyncio
+async def test_session_grant_persists_across_multiple_reads(tmp_path):
+    ceiling = tmp_path / "proj"; ceiling.mkdir()
+    outside = tmp_path / "outside"; outside.mkdir()
+    target = outside / "f.txt"
+    target.write_text("session-content")
+    grants = GrantStore()
+    grants.add(outside, "ro", "session")
+    for _ in range(3):
+        result = await read_file(
+            {"path": str(target)}, ceiling=ceiling, scope=_scope(), grants=grants,
+        )
+        assert result["content"] == "session-content"
+    assert len(grants.list_active()) == 1
+
+
+@pytest.mark.asyncio
+async def test_grant_cannot_open_excluded_path(monkeypatch, tmp_path):
+    """Deny beats grant, always — even a covering grant does not
+    authorize a path that HARES_SANDBOX_EXCLUDE denies. This exercises
+    the defense-in-depth re-check inside _resolve's grant branch (the
+    grant target itself, an absolute path outside the ceiling, was
+    never validated against this ceiling's excludelist before — this
+    proves the use-time re-validation, not just grant-creation time)."""
+    ceiling = tmp_path / "proj"; ceiling.mkdir()
+    outside = tmp_path / "outside"; outside.mkdir()
+    (outside / "f.txt").write_text("secret")
+    monkeypatch.setenv("HARES_DISALLOW_SYSTEM_DIRS", "1")
+    monkeypatch.setenv("HARES_EXTRA_SYSTEM_DIRS", str(outside))
+    grants = GrantStore()
+    grants.add(outside, "ro", "session")
+    with pytest.raises(PathSafetyError, match="system directory"):
+        await read_file(
+            {"path": str(outside / "f.txt")}, ceiling=ceiling, scope=_scope(),
+            grants=grants,
+        )
+
+
+@pytest.mark.asyncio
+async def test_move_file_dst_outside_ceiling_requires_rw_grant(tmp_path):
+    ceiling = tmp_path / "proj"; ceiling.mkdir()
+    src = ceiling / "src.txt"
+    src.write_text("payload")
+    outside = tmp_path / "outside"; outside.mkdir()
+    dst = outside / "dst.txt"
+    grants = GrantStore()
+    grants.add(outside, "rw", "session")
+    await move_file(
+        {"source": "src.txt", "destination": str(dst)},
+        ceiling=ceiling, scope=_scope(ceiling), grants=grants,
+    )
+    assert dst.read_text() == "payload"
+    assert not src.exists()

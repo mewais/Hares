@@ -34,8 +34,21 @@ from mcp.types import TextContent, Tool
 from ..audit import Auditor, audited, load_auditor
 from ..config import load_config
 from ..coordination import CrossProcessCoordinator, install_atexit_cleanup
+from ..exec_tools import (
+    COMBINED_ELICIT_DECLINE_TEMPLATE,
+    build_exec_tool_handlers,
+    combined_exec_tool_descriptors,
+    make_roots_refiner,
+    prefixed as _prefixed,
+)
 from ..fs.operations import READ_OPS, WRITE_OPS
-from ..policy import Decision, PolicyEngine, elicit_approval, elicit_memory_approval
+from ..grant_tools import (
+    build_request_path_access_handlers,
+    request_path_access_tool_descriptor,
+)
+from ..grants import GrantStore
+from ..path_safety import resolve_deny_lists
+from ..policy import PolicyEngine
 from ..fs.state import ScopeStateStore
 from ..fs.tools import (
     build_restrict_tool_handlers,
@@ -44,10 +57,6 @@ from ..fs.tools import (
 from ..runner import Runner
 
 logger = logging.getLogger(__name__)
-
-
-def _prefixed(name: str, scope_id: Optional[str]) -> str:
-    return f"{scope_id}_{name}" if scope_id else name
 
 
 def _build_server(
@@ -62,8 +71,17 @@ def _build_server(
     policy: Optional[PolicyEngine] = None,
     mem_limit_mb: int = 7168,
     mem_limit_max_mb: int = 0,
+    grant_store: Optional[GrantStore] = None,
 ) -> Server:
     server: Server = Server("hares-combined")
+
+    # ONE GrantStore, shared between the fs operation handlers and the
+    # shell Runner — exactly like scope_state below. Caller (serve())
+    # normally constructs this ahead of time so it can also hand it to
+    # the Runner's constructor; build a fresh one only for callers
+    # (tests) that don't pass one.
+    if grant_store is None:
+        grant_store = GrantStore()
 
     # ONE scope state, shared between fs handlers and shell runner.
     scope_state = ScopeStateStore(
@@ -80,6 +98,16 @@ def _build_server(
 
     # Apply the loaded scope (state file may be pre-populated) immediately.
     runner.set_active_scope(scope_state.current().paths, read_only=read_only)
+
+    # Resolve the in-ceiling blacklist (HARES_SANDBOX_EXCLUDE /
+    # HARES_SANDBOX_PROTECT) ONCE, now that the fs ceiling is final —
+    # fs handlers receive it explicitly instead of re-reading the env
+    # per call. (Roots refinement below only updates the RUNNER's
+    # ceiling for bwrap mounts; the fs-op ceiling is fixed at build
+    # time, and the Runner resolves its own blacklist per call in
+    # ``Runner._resolve_blacklist`` precisely because its ceiling can
+    # change.)
+    deny = resolve_deny_lists(ceiling)
 
     # Build descriptors + handlers for both tool families plus restrict.
     tool_descriptors: list[Tool] = []
@@ -106,78 +134,25 @@ def _build_server(
             ))
             handlers[full_name] = ("fs", spec["handler"])
 
-    # Shell tools — shared inputSchema for both execute_command and
-    # execute_command_high_memory.
-    _exec_input_schema = {
-        "type": "object",
-        "properties": {
-            "command": {"type": "string"},
-            "cwd": {"type": "string"},
-            "env": {
-                "type": "object",
-                "additionalProperties": {"type": "string"},
-            },
-            "timeout": {"type": "number"},
-            "weight": {"type": "integer", "minimum": 1},
-            "mem_limit_mb": {
-                "type": "integer", "minimum": 1,
-                "description": (
-                    "Per-call RLIMIT_AS override (MB). Right-size for "
-                    "the command — clamped to HARES_MEM_LIMIT_MB."
-                ),
-            },
-            "cpu_limit_sec": {
-                "type": "integer", "minimum": 1,
-                "description": (
-                    "Per-call RLIMIT_CPU override (CPU seconds, not "
-                    "wall-clock). Clamped to HARES_CPU_LIMIT_SEC."
-                ),
-            },
-            "stdin": {
-                "type": "string",
-                "description": (
-                    "UTF-8 text written to the child's stdin and then "
-                    "closed. Use for commands that read from stdin "
-                    "(jq, python -, patch, mail) instead of wrapping "
-                    "the call in /bin/sh -c."
-                ),
-            },
-        },
-        "required": ["command"],
-    }
-
-    shell_name = _prefixed("execute_command", scope_id)
-    high_mem_name = _prefixed("execute_command_high_memory", scope_id)
-
-    tool_descriptors.append(Tool(
-        name=shell_name,
-        description=(
-            "Run a shell command under Hares's resource caps + bwrap "
-            "sandbox. The bwrap mount list narrows to the active scope "
-            "(set via restrict_paths); subprocess writes outside "
-            "the scope are kernel-rejected. Per-call mem_limit_mb / "
-            "cpu_limit_sec override the operator defaults (clamped down)."
-        ),
-        inputSchema=_exec_input_schema,
+    # Exec tools — descriptors + handlers shared with the shell server
+    # via hares.exec_tools (policy gating, memory elicitation, OOM-hint
+    # appending all live there).
+    tool_descriptors.extend(combined_exec_tool_descriptors(
+        scope_id,
+        mem_limit_mb=mem_limit_mb,
+        mem_limit_max_mb=mem_limit_max_mb,
     ))
-    handlers[shell_name] = ("shell", None)  # dispatched directly to runner.execute
-
-    tool_descriptors.append(Tool(
-        name=high_mem_name,
-        description=(
-            f"Run a command that needs MORE MEMORY than the normal cap "
-            f"(HARES_MEM_LIMIT_MB = {mem_limit_mb} MB) inside the bwrap sandbox. "
-            f"REQUIRES USER APPROVAL — a blocking dialog is shown to the user on "
-            f"EVERY call; there is no way to skip this. "
-            f"The run is cgroup-bounded to a machine-safe maximum "
-            f"(HARES_MEM_LIMIT_MAX_MB = {mem_limit_max_mb} MB) so even a "
-            f"multi-process memory bomb cannot take down the MCP session. "
-            f"Use this for large compiles, simulators, or workloads that "
-            f"legitimately exceed the standard cap."
-        ),
-        inputSchema=_exec_input_schema,
-    ))
-    handlers[high_mem_name] = ("high_memory", None)
+    exec_handlers = build_exec_tool_handlers(
+        server=server,
+        runner=runner,
+        scope_id=scope_id,
+        policy=policy,
+        mem_limit_mb=mem_limit_mb,
+        mem_limit_max_mb=mem_limit_max_mb,
+        elicit_decline_template=COMBINED_ELICIT_DECLINE_TEMPLATE,
+    )
+    for k, v in exec_handlers.items():
+        handlers[k] = ("exec", v)
 
     # Restrict tools — one shared instance for both fs and shell.
     restrict_descriptors = restrict_tool_descriptors(scope_id)
@@ -187,28 +162,36 @@ def _build_server(
         state_file=state_file,
         scope_state=scope_state,
         on_change=_on_change,
+        grant_store=grant_store,
     )
     tool_descriptors.extend(restrict_descriptors)
     for k, v in restrict_handlers.items():
         handlers[k] = ("restrict", v)
 
-    _roots_applied: list[bool] = [False]
+    # request_path_access — the runtime, human-in-the-loop-gated
+    # escape hatch, sharing the SAME grant_store as the fs dispatch
+    # below and the Runner's bwrap mount composition — a grant
+    # recorded here is immediately visible to both. Always
+    # registered (no CLI flag gate): it fails closed on its own for
+    # any non-interactive client. --read-only is enforced INSIDE the
+    # handler (only mode="ro" requests can be granted).
+    tool_descriptors.append(request_path_access_tool_descriptor(scope_id))
+    grant_handlers = build_request_path_access_handlers(
+        server=server,
+        scope_id=scope_id,
+        ceiling=ceiling,
+        deny=deny,
+        grant_store=grant_store,
+        read_only=read_only,
+    )
+    for k, v in grant_handlers.items():
+        handlers[k] = ("grant", v)
+
+    _maybe_refine_from_roots = make_roots_refiner(runner, use_roots)
 
     @server.list_tools()
     async def _list_tools() -> list[Tool]:
-        if use_roots and not _roots_applied[0]:
-            _roots_applied[0] = True
-            try:
-                import mcp.server as _mcp_server
-                ctx = _mcp_server.request_context.get(None)
-                if ctx is not None:
-                    from ..roots import derive_ceiling_from_roots
-                    derived = await derive_ceiling_from_roots(ctx.session)
-                    if derived is not None:
-                        runner.update_ceiling(derived)
-                        logger.info("Ceiling updated from MCP roots: %s", derived)
-            except Exception as exc:
-                logger.debug("Roots ceiling derivation failed: %s", exc)
+        await _maybe_refine_from_roots()
         return tool_descriptors
 
     @server.call_tool()
@@ -221,94 +204,9 @@ def _build_server(
         if kind == "fs":
             result = await handler(
                 arguments, ceiling=ceiling, scope=scope_state.current(),
+                deny=deny, grants=grant_store,
             )
-        elif kind == "shell":
-            command = arguments["command"]
-            if policy is not None and policy.active:
-                pr = policy.check(command)
-                if pr.decision is Decision.DENY:
-                    result = {
-                        "exit_code": -1, "stdout": "", "stderr": "",
-                        "killed_reason": "rejected_by_policy",
-                        "rejected_reason": pr.message,
-                        "matched_pattern": pr.matched_pattern,
-                    }
-                    return [TextContent(type="text", text=json.dumps(result, indent=2))]
-                if pr.decision is Decision.ELICIT:
-                    if not await elicit_approval(server, command, pr):
-                        result = {
-                            "exit_code": -1, "stdout": "", "stderr": "",
-                            "killed_reason": "rejected_by_policy",
-                            "rejected_reason": (
-                                f"Command declined by user or elicitation not supported "
-                                f"(pattern: {pr.matched_pattern!r})."
-                            ),
-                            "matched_pattern": pr.matched_pattern,
-                        }
-                        return [TextContent(type="text", text=json.dumps(result, indent=2))]
-            result = await runner.execute(
-                command=command,
-                cwd=arguments.get("cwd"),
-                env=arguments.get("env"),
-                timeout=float(arguments.get("timeout", 300.0)),
-                weight=int(arguments.get("weight", 1)),
-                mem_limit_mb=arguments.get("mem_limit_mb"),
-                cpu_limit_sec=arguments.get("cpu_limit_sec"),
-                stdin=arguments.get("stdin"),
-            )
-            # If the command was killed by the cgroup OOM killer, append a
-            # hint pointing the caller at the high-memory tool.
-            if result.get("killed_reason") == "oom":
-                note = result.get("killed_note", "")
-                note += (
-                    f" Retry via the `{high_mem_name}` tool "
-                    f"(it will ask the user to approve a larger allocation)."
-                )
-                result["killed_note"] = note
-        elif kind == "high_memory":
-            command = arguments["command"]
-
-            # Policy gate: deny wins unconditionally.
-            if policy is not None and policy.active:
-                pr = policy.check(command)
-                if pr.decision is Decision.DENY:
-                    result = {
-                        "exit_code": -1, "stdout": "", "stderr": "",
-                        "killed_reason": "rejected_by_policy",
-                        "rejected_reason": pr.message,
-                        "matched_pattern": pr.matched_pattern,
-                    }
-                    return [TextContent(type="text", text=json.dumps(result, indent=2))]
-
-            # Unconditional memory elicitation — there is NO argument a caller
-            # can pass to skip this step.
-            requested_mb: int = arguments.get("mem_limit_mb") or mem_limit_max_mb
-            approved = await elicit_memory_approval(
-                server, command, requested_mb, mem_limit_mb,
-            )
-            if not approved:
-                result = {
-                    "exit_code": -1, "stdout": "", "stderr": "",
-                    "killed_reason": "rejected_by_policy",
-                    "rejected_reason": (
-                        "High-memory run declined by user or client does not "
-                        "support elicitation."
-                    ),
-                }
-                return [TextContent(type="text", text=json.dumps(result, indent=2))]
-
-            result = await runner.execute(
-                command=command,
-                cwd=arguments.get("cwd"),
-                env=arguments.get("env"),
-                timeout=float(arguments.get("timeout", 300.0)),
-                weight=int(arguments.get("weight", 1)),
-                mem_limit_mb=arguments.get("mem_limit_mb"),
-                cpu_limit_sec=arguments.get("cpu_limit_sec"),
-                stdin=arguments.get("stdin"),
-                high_memory=True,
-            )
-        elif kind == "restrict":
+        elif kind in ("exec", "restrict", "grant"):
             result = await handler(arguments)
         else:
             raise ValueError(f"Unknown handler kind: {kind!r}")
@@ -332,6 +230,11 @@ async def _serve_async(
         max_concurrent=cfg.max_concurrent,
     )
     install_atexit_cleanup(coord)
+    # ONE GrantStore for the whole process — shared between the fs
+    # operation handlers and the shell Runner's bwrap mount
+    # composition, exactly like the ScopeStateStore built inside
+    # _build_server.
+    grant_store = GrantStore()
     runner = Runner(
         max_concurrent=cfg.max_concurrent,
         mem_limit_mb=cfg.mem_limit_mb,
@@ -343,6 +246,7 @@ async def _serve_async(
         ceiling=ceiling,
         network_policy=cfg.network_policy,
         mem_limit_max_mb=cfg.mem_limit_max_mb,
+        grant_store=grant_store,
     )
     logger.info(
         "Hares combined starting: scope_id=%r ceiling=%s read_only=%s "
@@ -365,6 +269,7 @@ async def _serve_async(
         policy=policy,
         mem_limit_mb=cfg.mem_limit_mb,
         mem_limit_max_mb=cfg.mem_limit_max_mb,
+        grant_store=grant_store,
     )
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())

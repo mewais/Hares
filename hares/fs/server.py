@@ -24,6 +24,12 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
 from ..audit import Auditor, audited, load_auditor
+from ..grant_tools import (
+    build_request_path_access_handlers,
+    request_path_access_tool_descriptor,
+)
+from ..grants import GrantStore
+from ..path_safety import resolve_deny_lists
 from .operations import READ_OPS, WRITE_OPS
 from .state import ScopeStateStore
 
@@ -51,9 +57,24 @@ def _build_server(
         scope_id=scope_id, ceiling=ceiling, state_file=state_file,
     )
 
-    # Build the per-instance tool descriptor list.
+    # Resolve the in-ceiling blacklist (HARES_SANDBOX_EXCLUDE /
+    # HARES_SANDBOX_PROTECT) ONCE, now that the ceiling is final — fs
+    # handlers receive it explicitly instead of re-reading the env per
+    # call. (Standalone fs mode never refines the ceiling at runtime;
+    # see the use_roots note in _serve_async.)
+    deny = resolve_deny_lists(ceiling)
+
+    # In-memory store for runtime request_path_access grants. Per-
+    # process, never persisted — see hares.grants.
+    grant_store = GrantStore()
+
+    # Build the per-instance tool descriptor list plus a tagged handler
+    # registry: name → (kind, handler). "fs" handlers take
+    # (args, ceiling=..., scope=..., deny=...); "restrict" handlers are
+    # bound closures that take only the args dict. Same convention as
+    # the combined server.
     tool_descriptors: list[Tool] = []
-    handlers: dict[str, callable] = {}
+    handlers: dict[str, tuple] = {}
 
     for base_name, spec in READ_OPS.items():
         full_name = _prefixed(base_name, scope_id)
@@ -62,7 +83,7 @@ def _build_server(
             description=spec["description"],
             inputSchema=spec["inputSchema"],
         ))
-        handlers[full_name] = spec["handler"]
+        handlers[full_name] = ("fs", spec["handler"])
 
     if not read_only:
         for base_name, spec in WRITE_OPS.items():
@@ -72,7 +93,7 @@ def _build_server(
                 description=spec["description"],
                 inputSchema=spec["inputSchema"],
             ))
-            handlers[full_name] = spec["handler"]
+            handlers[full_name] = ("fs", spec["handler"])
 
     # Restrict tools — always registered (no flag gate). The agent-side
     # tools allowlist controls who calls them.
@@ -84,9 +105,29 @@ def _build_server(
         state_file=state_file,
         scope_state=scope_state,
         on_change=None,  # fs ops read scope_state directly each call; no notification needed
+        grant_store=grant_store,
     )
     tool_descriptors.extend(restrict_descriptors)
-    handlers.update(restrict_handlers)
+    for k, v in restrict_handlers.items():
+        handlers[k] = ("restrict", v)
+
+    # request_path_access — the runtime, human-in-the-loop-gated
+    # escape hatch for widening access OUTSIDE the ceiling. Always
+    # registered (like restrict tools) — it fails closed on its own
+    # for any non-interactive client, so no operator off-switch is
+    # needed. --read-only is enforced INSIDE the handler (only
+    # mode="ro" requests can be granted).
+    tool_descriptors.append(request_path_access_tool_descriptor(scope_id))
+    grant_handlers = build_request_path_access_handlers(
+        server=server,
+        scope_id=scope_id,
+        ceiling=ceiling,
+        deny=deny,
+        grant_store=grant_store,
+        read_only=read_only,
+    )
+    for k, v in grant_handlers.items():
+        handlers[k] = ("grant", v)
 
     @server.list_tools()
     async def _list_tools() -> list[Tool]:
@@ -95,38 +136,22 @@ def _build_server(
     @server.call_tool()
     @audited(auditor, scope_id=scope_id)
     async def _call_tool(name: str, arguments: dict) -> list[TextContent]:
-        handler = handlers.get(name)
-        if handler is None:
+        entry = handlers.get(name)
+        if entry is None:
             raise ValueError(f"Unknown tool: {name}")
-        # Detect whether this is a restrict-tool (1-arg) vs fs-op (3-arg).
-        # Restrict tools take just args; fs ops take args + ceiling + scope.
-        # Check by calling convention via inspection (cheap):
-        result = await _dispatch(handler, arguments, scope_state, ceiling)
+        kind, handler = entry
+        if kind == "fs":
+            result = await handler(
+                arguments, ceiling=ceiling, scope=scope_state.current(),
+                deny=deny, grants=grant_store,
+            )
+        elif kind in ("restrict", "grant"):
+            result = await handler(arguments)
+        else:
+            raise ValueError(f"Unknown handler kind: {kind!r}")
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
     return server
-
-
-async def _dispatch(handler, arguments: dict, scope_state: ScopeStateStore,
-                    ceiling: Path):
-    """Call handler with the right kwargs based on its name.
-
-    Restrict handlers (restrict_paths, get_active_paths)
-    are bound closures that already capture scope_state + ceiling, so
-    they take only ``args``. FS operations need ``ceiling`` and
-    ``scope`` injected as kwargs.
-    """
-    # Heuristic: bound closures from build_restrict_tool_handlers take
-    # exactly one positional arg (args dict). FS op functions take
-    # (args, *, ceiling, scope). We try the fs-op signature first;
-    # restrict closures will TypeError on unexpected kwargs and we
-    # fall back.
-    try:
-        return await handler(arguments, ceiling=ceiling, scope=scope_state.current())
-    except TypeError as exc:
-        if "unexpected keyword argument" in str(exc) or "ceiling" in str(exc):
-            return await handler(arguments)
-        raise
 
 
 async def _serve_async(

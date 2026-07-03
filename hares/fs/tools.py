@@ -32,6 +32,7 @@ from typing import Awaitable, Callable, Optional
 
 from mcp.types import Tool
 
+from ..grants import GrantStore
 from ..path_safety import (
     PathSafetyError,
     resolve_under_ceiling,
@@ -115,7 +116,11 @@ def restrict_tool_descriptors(scope_id: Optional[str]) -> list[Tool]:
                 "an attacker with state-file write but no secret "
                 "knowledge cannot produce a passing HMAC. Out-of-"
                 "process verifiers use both signals together for "
-                "end-to-end replay-and-forge defense."
+                "end-to-end replay-and-forge defense. Also reports "
+                "'grants': the runtime path-access grants currently "
+                "active via request_path_access (path, mode, "
+                "lifetime) — these are in-memory only, never "
+                "persisted, and NOT covered by the seq/HMAC above."
             ),
             inputSchema={
                 "type": "object",
@@ -132,6 +137,7 @@ def build_restrict_tool_handlers(
     state_file: Optional[Path],
     scope_state: Optional[ScopeStateStore] = None,
     on_change: Optional[Callable[[], None]] = None,
+    grant_store: Optional[GrantStore] = None,
 ) -> tuple[ScopeStateStore, dict[str, Callable[[dict], Awaitable[dict]]]]:
     """Construct the per-instance state store + bound async handlers
     for the two restrict tools.
@@ -146,6 +152,11 @@ def build_restrict_tool_handlers(
         ``restrict_paths`` call. Used by the shell server to notify
         the Runner that the active scope changed (re-spawn bwrap with
         new mounts on next execute_command).
+      grant_store: Optional GrantStore whose active runtime
+        path-access grants (see ``request_path_access`` /
+        :mod:`hares.grant_tools`) are surfaced in ``get_active_paths``
+        output under the ``"grants"`` key. None → an empty list is
+        reported (no grants feature wired up for this instance).
 
     Returns:
       (scope_state, handlers) where handlers is name → async-callable.
@@ -254,6 +265,11 @@ def build_restrict_tool_handlers(
             "seq": cur.seq,
             "hmac": sig,
             "version": STATE_VERSION,
+            # Runtime request_path_access grants — in-memory only, NOT
+            # part of the seq/HMAC-covered payload above (grants are
+            # never persisted and don't survive a restart, so signing
+            # them the same way would be misleading).
+            "grants": grant_store.list_active() if grant_store is not None else [],
         }
 
     return scope_state, {

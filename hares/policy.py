@@ -289,6 +289,161 @@ async def elicit_memory_approval(
     return await _send_elicitation(session, message, command)
 
 
+async def elicit_path_access_approval(
+    server_or_session,
+    resolved_path,
+    mode: str,
+    reason: str,
+    read_only_mode: bool = False,
+) -> Optional[str]:
+    """Elicit human approval for a ``request_path_access`` call.
+
+    Presents an MCP elicitation whose ``requestedSchema`` is a flat
+    object with ONE enum field (``grant``), offering the user a choice
+    of scope rather than a plain accept/decline:
+
+        {"type": "object",
+         "properties": {"grant": {"type": "string",
+                                   "enum": ["once", "session", "deny"]}},
+         "required": ["grant"]}
+
+    The dialog message leads with the hard facts — the RESOLVED
+    absolute path (symlinks already chased by the caller), the mode,
+    and an explicit "this is OUTSIDE the sandbox" warning — and puts
+    the agent-supplied ``reason`` LAST, clearly labeled, because it is
+    agent-authored free text and therefore a potential manipulation
+    channel; it must never be visually confused with the hard facts
+    above it.
+
+    Response handling (MCP spec: response validation is a SHOULD, not
+    a MUST — clients may not honor ``requestedSchema`` faithfully):
+
+      * ``action == "decline"`` or ``"cancel"`` → denied (``None``).
+      * ``action == "accept"`` with a recognized ``content["grant"]``
+        of ``"once"`` or ``"session"`` → that lifetime.
+      * ``action == "accept"`` with ``content["grant"] == "deny"``
+        → denied (``None``) — the user used the in-dialog control to
+        say no while still technically "accepting" the form.
+      * ``action == "accept"`` with missing / invalid / unrecognized
+        ``grant`` content (a lax client that ignores the schema, or a
+        minimal client that only supports accept/decline) → treated
+        as **allow-once**, the minimum-privilege reading of "the user
+        clicked accept". This is the lax-client fallback the feature
+        spec calls for.
+      * No elicitation support / any exception → denied (fail closed),
+        consistent with :func:`elicit_approval` and
+        :func:`elicit_memory_approval`.
+
+    Args:
+      server_or_session: The MCP ``Server`` instance or active
+        ``ServerSession`` — same convention as the other elicit
+        helpers (see :func:`_resolve_session`).
+      resolved_path: The fully resolved (symlinks chased) absolute
+        path being requested. Accepts ``Path`` or ``str``.
+      mode: ``"ro"`` or ``"rw"``.
+      reason: Agent-authored free text explaining why access is
+        needed. Shown verbatim, but visually subordinate to the hard
+        facts above it.
+      read_only_mode: True when the server is running with
+        ``--read-only``. Purely informational here — the CALLER
+        (``hares.grant_tools``) is responsible for refusing ``rw``
+        requests outright in that mode before this function is ever
+        invoked; this flag only affects the dialog's wording so the
+        human sees the same context the caller enforced.
+
+    Returns:
+      ``"once"`` or ``"session"`` on approval; ``None`` on denial
+      (decline/cancel/in-dialog deny/no elicitation support/error).
+    """
+    path_str = str(resolved_path)
+    tree_note = (
+        " If this is a directory, the grant covers its ENTIRE subtree."
+    )
+    mode_label = "read-write" if mode == "rw" else "read-only"
+    message = (
+        f"**Runtime path-access request**\n\n"
+        f"Path (resolved): `{path_str}`\n"
+        f"Mode: **{mode_label}** ({mode})\n\n"
+        f"⚠️ This path is OUTSIDE the current sandbox scope.{tree_note} "
+        f"Approving this grants the agent {mode_label} access to it "
+        f"for the lifetime you choose below.\n\n"
+        + (
+            "(Server is running --read-only; only read-only grants can "
+            "be issued.)\n\n"
+            if read_only_mode and mode == "ro" else ""
+        )
+        + f"Agent's stated reason: {reason}"
+    )
+    schema: dict = {
+        "type": "object",
+        "properties": {
+            "grant": {
+                "type": "string",
+                "title": "Grant scope",
+                "enum": ["once", "session", "deny"],
+                "enumNames": [
+                    "Allow once (this command only)",
+                    "Allow for rest of session",
+                    "Deny",
+                ],
+            },
+        },
+        "required": ["grant"],
+    }
+    session = _resolve_session(server_or_session)
+    if session is None:
+        logger.debug(
+            "No MCP session available for path-access elicitation; "
+            "denying: path=%r mode=%r", path_str, mode,
+        )
+        return None
+    try:
+        response = await session.elicit(message=message, requestedSchema=schema)
+        action = getattr(response, "action", "cancel")
+        if action != "accept":
+            logger.info(
+                "request_path_access elicitation: path=%r mode=%r "
+                "action=%r -> denied", path_str, mode, action,
+            )
+            return None
+        content = getattr(response, "content", None) or {}
+        grant = content.get("grant") if isinstance(content, dict) else None
+        if grant == "deny":
+            logger.info(
+                "request_path_access elicitation: path=%r mode=%r "
+                "accepted with grant='deny' -> denied", path_str, mode,
+            )
+            return None
+        if grant in ("once", "session"):
+            logger.info(
+                "request_path_access elicitation: path=%r mode=%r "
+                "-> granted (%s)", path_str, mode, grant,
+            )
+            return grant
+        # Lax-client fallback: accept was returned but `grant` is
+        # missing/invalid/unrecognized. Per MCP spec, requestedSchema
+        # compliance is a SHOULD not a MUST. The minimum-privilege
+        # reading of "the user clicked accept" is allow-once.
+        logger.info(
+            "request_path_access elicitation: path=%r mode=%r accepted "
+            "with missing/invalid grant content %r -> lax-client "
+            "fallback to allow-once", path_str, mode, content,
+        )
+        return "once"
+    except AttributeError:
+        logger.debug(
+            "Elicitation not supported by this client; denying "
+            "path-access request: path=%r mode=%r", path_str, mode,
+        )
+        return None
+    except Exception as exc:
+        logger.debug(
+            "Path-access elicitation failed (%s); denying: path=%r mode=%r",
+            exc, path_str, mode,
+        )
+        return None
+
+
 # ── Loader from CLI args ──────────────────────────────────────────────────────
 
 def load_policy(

@@ -42,6 +42,11 @@ import shutil
 from dataclasses import dataclass, field
 from typing import Optional
 
+# Single shared containment primitive — see its docstring for the
+# (security-relevant) semantics. Re-exported here because sandbox
+# callers and tests historically import it from this module.
+from .path_safety import _is_subpath
+
 
 @dataclass(frozen=True)
 class SandboxConfig:
@@ -163,18 +168,6 @@ def load_sandbox_config(default_cwd: Optional[str] = None) -> SandboxConfig:
         allow_network=allow_network,
         tmp_size_mb=tmp_size_mb,
     )
-
-
-def _is_subpath(child: str, parent: str) -> bool:
-    """True if `child` is `parent` or lives strictly under it."""
-    try:
-        child_real = os.path.realpath(child)
-        parent_real = os.path.realpath(parent)
-    except OSError:
-        return False
-    if child_real == parent_real:
-        return True
-    return child_real.startswith(parent_real.rstrip("/") + "/")
 
 
 def build_bwrap_argv(
