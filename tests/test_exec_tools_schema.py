@@ -1,46 +1,40 @@
-"""Drift guards for the two exec-tool input schemas.
+"""Guards for the shared exec-tool input schema.
 
-``hares.exec_tools`` deliberately keeps SHELL_ and COMBINED_ variants
-of the exec input schema and the elicit-decline template verbatim,
-because the advertised tool surface was frozen byte-identical during
-the server-dedup refactor. Nothing else enforces that the two schemas
-stay structurally aligned, so a future contributor who adds a field to
-one and not the other would silently diverge the shell and combined
-tool surfaces. These tests fail loudly if that happens.
+execute_command and execute_command_high_memory share ONE input schema
+(`EXEC_INPUT_SCHEMA`) across both the shell and combined servers, so the
+agent-facing parameter guidance can't silently diverge between modes.
+These tests fail loudly if a future change drops a field, a per-param
+description, or the mem_limit_mb floor, or if the two descriptor builders
+stop advertising the same schema.
 """
 
 from __future__ import annotations
 
 from hares.exec_tools import (
-    SHELL_EXEC_INPUT_SCHEMA,
-    COMBINED_EXEC_INPUT_SCHEMA,
+    EXEC_INPUT_SCHEMA,
+    shell_exec_tool_descriptors,
+    combined_exec_tool_descriptors,
 )
 
 
-def test_exec_schemas_have_identical_field_sets():
-    shell_props = set(SHELL_EXEC_INPUT_SCHEMA["properties"])
-    combined_props = set(COMBINED_EXEC_INPUT_SCHEMA["properties"])
-    assert shell_props == combined_props, (
-        "shell/combined exec schemas diverged: "
-        f"only-shell={shell_props - combined_props}, "
-        f"only-combined={combined_props - shell_props}"
-    )
-    assert (
-        SHELL_EXEC_INPUT_SCHEMA["required"]
-        == COMBINED_EXEC_INPUT_SCHEMA["required"]
-    )
-
-
-def test_exec_schemas_agree_on_field_types():
-    for name, shell_spec in SHELL_EXEC_INPUT_SCHEMA["properties"].items():
-        combined_spec = COMBINED_EXEC_INPUT_SCHEMA["properties"][name]
-        assert shell_spec.get("type") == combined_spec.get("type"), name
+def test_every_param_has_a_description():
+    """No bare parameters — each one carries agent-facing guidance."""
+    for name, spec in EXEC_INPUT_SCHEMA["properties"].items():
+        assert spec.get("description", "").strip(), f"{name} has no description"
 
 
 def test_mem_limit_mb_has_positive_minimum():
     """The high-memory approval path relies on the schema rejecting a
     non-positive mem_limit_mb (belt-and-suspenders alongside the
     in-handler guard in _execute_high_memory)."""
-    for schema in (SHELL_EXEC_INPUT_SCHEMA, COMBINED_EXEC_INPUT_SCHEMA):
-        mem = schema["properties"]["mem_limit_mb"]
-        assert mem.get("minimum", 0) >= 1, mem
+    assert EXEC_INPUT_SCHEMA["properties"]["mem_limit_mb"].get("minimum", 0) >= 1
+
+
+def test_shell_and_combined_advertise_the_same_schema():
+    """Both servers must expose identical exec input schemas — only the
+    top-level tool description is allowed to differ (bwrap framing)."""
+    shell = shell_exec_tool_descriptors(None, mem_limit_mb=7168, mem_limit_max_mb=64000)
+    combined = combined_exec_tool_descriptors(None, mem_limit_mb=7168, mem_limit_max_mb=64000)
+    for s_tool, c_tool in zip(shell, combined):
+        assert s_tool.name == c_tool.name
+        assert s_tool.inputSchema == c_tool.inputSchema

@@ -9,12 +9,12 @@ MCP wiring.
 What is shared here:
 
 * :func:`prefixed` — the ``<scope_id>_<name>`` tool-name convention.
-* The exec-tool input schemas (one per server flavor — the two servers
-  historically advertise different property-level description text, and
-  the advertised tool surface is frozen, so both variants are kept
-  verbatim side by side rather than unified).
+* :data:`EXEC_INPUT_SCHEMA` — the single input schema both tools use in
+  both server flavors (the parameters are identical across modes).
 * Descriptor builders (:func:`shell_exec_tool_descriptors`,
-  :func:`combined_exec_tool_descriptors`) — same split, same reason.
+  :func:`combined_exec_tool_descriptors`) — same schema; only the
+  top-level tool description differs (the combined one adds the
+  bwrap-sandbox framing).
 * :func:`build_exec_tool_handlers` — the full handler logic for both
   tools: policy deny/elicit gating, the unconditional memory-approval
   elicitation for the high-memory tool, the ``runner.execute(...)``
@@ -46,15 +46,16 @@ def prefixed(name: str, scope_id: Optional[str]) -> str:
     return f"{scope_id}_{name}" if scope_id else name
 
 
-# ── Input schemas ──────────────────────────────────────────────────────
+# ── Input schema ───────────────────────────────────────────────────────
 #
-# Both tools share ONE inputSchema per server flavor. The shell and
-# combined servers advertise structurally identical schemas (same
-# properties, same types, same required list) that differ only in
-# property-level description text; both texts are preserved verbatim
-# because the advertised tool surface is frozen.
+# execute_command and execute_command_high_memory share ONE inputSchema,
+# used by both the shell and combined (fs+shell) servers. The parameters
+# are identical across modes; only the top-level tool *description*
+# legitimately differs (the combined descriptor adds the bwrap-sandbox
+# framing). Keeping a single schema keeps the agent-facing parameter
+# guidance from silently diverging between the two modes.
 
-SHELL_EXEC_INPUT_SCHEMA: dict = {
+EXEC_INPUT_SCHEMA: dict = {
     "type": "object",
     "properties": {
         "command": {
@@ -77,7 +78,7 @@ SHELL_EXEC_INPUT_SCHEMA: dict = {
         "weight": {
             "type": "integer",
             "description": (
-                "How many semaphore slots (and pinned cores) to occupy. "
+                "How many concurrency slots (and pinned cores) to occupy. "
                 "Heavy commands (parallel pytest, builds) can pass weight=2; "
                 "capped at HARES_MAX_CONCURRENT."
             ),
@@ -115,46 +116,7 @@ SHELL_EXEC_INPUT_SCHEMA: dict = {
                 "closed (so the child sees EOF). Use this for commands "
                 "that read from stdin — `jq '.x'`, `python -`, `patch`, "
                 "`mail`, etc. — instead of wrapping the whole thing in "
-                "/bin/sh -c with shell-side echo/heredoc. When omitted, "
-                "stdin behavior is unchanged from prior versions."
-            ),
-        },
-    },
-    "required": ["command"],
-}
-
-COMBINED_EXEC_INPUT_SCHEMA: dict = {
-    "type": "object",
-    "properties": {
-        "command": {"type": "string"},
-        "cwd": {"type": "string"},
-        "env": {
-            "type": "object",
-            "additionalProperties": {"type": "string"},
-        },
-        "timeout": {"type": "number"},
-        "weight": {"type": "integer", "minimum": 1},
-        "mem_limit_mb": {
-            "type": "integer", "minimum": 1,
-            "description": (
-                "Per-call RLIMIT_AS override (MB). Right-size for "
-                "the command — clamped to HARES_MEM_LIMIT_MB."
-            ),
-        },
-        "cpu_limit_sec": {
-            "type": "integer", "minimum": 1,
-            "description": (
-                "Per-call RLIMIT_CPU override (CPU seconds, not "
-                "wall-clock). Clamped to HARES_CPU_LIMIT_SEC."
-            ),
-        },
-        "stdin": {
-            "type": "string",
-            "description": (
-                "UTF-8 text written to the child's stdin and then "
-                "closed. Use for commands that read from stdin "
-                "(jq, python -, patch, mail) instead of wrapping "
-                "the call in /bin/sh -c."
+                "/bin/sh -c with shell-side echo/heredoc."
             ),
         },
     },
@@ -188,7 +150,7 @@ def shell_exec_tool_descriptors(
                 "rewritten to fit the cap; the rewrites are reported "
                 "in stdout and in the `rewrites` field of the result."
             ),
-            inputSchema=SHELL_EXEC_INPUT_SCHEMA,
+            inputSchema=EXEC_INPUT_SCHEMA,
         ),
         Tool(
             name=prefixed(EXECUTE_COMMAND_HIGH_MEMORY_TOOL, scope_id),
@@ -205,7 +167,7 @@ def shell_exec_tool_descriptors(
                 f"legitimately exceeds the standard cap. Provide mem_limit_mb to "
                 f"request a specific budget; omit to request the machine maximum."
             ),
-            inputSchema=SHELL_EXEC_INPUT_SCHEMA,
+            inputSchema=EXEC_INPUT_SCHEMA,
         ),
     ]
 
@@ -221,13 +183,22 @@ def combined_exec_tool_descriptors(
         Tool(
             name=prefixed(EXECUTE_COMMAND_TOOL, scope_id),
             description=(
-                "Run a shell command under Hares's resource caps + bwrap "
-                "sandbox. The bwrap mount list narrows to the active scope "
-                "(set via restrict_paths); subprocess writes outside "
-                "the scope are kernel-rejected. Per-call mem_limit_mb / "
-                "cpu_limit_sec override the operator defaults (clamped down)."
+                "Run a shell command under Hares's resource caps inside a "
+                "bwrap sandbox. Memory is limited to HARES_MEM_LIMIT_MB per "
+                "process, CPU to HARES_CPU_LIMIT_SEC seconds, and only "
+                "HARES_MAX_CONCURRENT commands run at once across all callers "
+                "(GLOBAL when HARES_COORDINATION_DIR is set, else per-process). "
+                "The sandbox mounts ONLY the active scope (set via "
+                "restrict_paths) writable — writes outside it are kernel-"
+                "rejected with EROFS, so prefer paths under the active scope "
+                "and use restrict_paths to widen it. Subprocesses are pinned "
+                "to a small CPU set so tools like pytest-xdist auto-detect a "
+                "safe worker count. Known overcommit patterns (e.g., "
+                "`pytest -n auto`, `make -j`) are rewritten to fit the cap; "
+                "the rewrites are reported in stdout and in the `rewrites` "
+                "field of the result."
             ),
-            inputSchema=COMBINED_EXEC_INPUT_SCHEMA,
+            inputSchema=EXEC_INPUT_SCHEMA,
         ),
         Tool(
             name=prefixed(EXECUTE_COMMAND_HIGH_MEMORY_TOOL, scope_id),
@@ -238,11 +209,13 @@ def combined_exec_tool_descriptors(
                 f"EVERY call; there is no way to skip this. "
                 f"The run is cgroup-bounded to a machine-safe maximum "
                 f"(HARES_MEM_LIMIT_MAX_MB = {mem_limit_max_mb} MB) so even a "
-                f"multi-process memory bomb cannot take down the MCP session. "
-                f"Use this for large compiles, simulators, or workloads that "
-                f"legitimately exceed the standard cap."
+                f"multi-process memory bomb cannot take down the MCP session — "
+                f"the kernel OOM killer is scoped to the command's cgroup. "
+                f"Use this for large compiles, simulators, or any workload that "
+                f"legitimately exceeds the standard cap. Provide mem_limit_mb to "
+                f"request a specific budget; omit to request the machine maximum."
             ),
-            inputSchema=COMBINED_EXEC_INPUT_SCHEMA,
+            inputSchema=EXEC_INPUT_SCHEMA,
         ),
     ]
 
