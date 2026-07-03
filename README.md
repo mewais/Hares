@@ -85,7 +85,7 @@ Replace `/home/YOU` with your actual home directory (or use `$(realpath -m ~/.gi
 
 ```md
 ## Shell execution
-Use `mcp__hares__hares_execute_command` for all shell work.
+Use `mcp__hares__execute_command` for all shell work.
 
 By default: git push, SSH connections, HTTP writes (curl -X POST/PUT/DELETE),
 docker push, and similar remote-write operations will prompt for your approval
@@ -105,7 +105,7 @@ That's it. Most commands run without interruption. `git push origin main` trigge
 
 **Default approval-required operations** (out of the box, no extra configuration):
 `git push`, `git remote set-url`, `ssh`, `scp`, `curl -X POST/PUT/DELETE/PATCH`,
-`wget --post-data/--post-file`, `gh pr/issue/release create/merge`, `docker push`,
+`wget --post-data/--post-file`, `gh` pr/issue/release/repo mutations, `docker push`,
 `npm publish`, `twine upload`, `cargo publish`, `pip install --index-url`.
 
 **Nothing is hard-denied by default.** To add hard blocks (e.g. `sudo`), use `--deny` in the server args. Suggested starting point:
@@ -261,7 +261,7 @@ Default approval-required patterns (active out of the box):
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--network {on,off}` | `on` | `off` = unshare netns, no external connectivity |
+| `--network {on,off,allowlist}` | `on` | `off` = unshare netns, no external connectivity; `allowlist` is normally implied by `--network-allow` |
 | `--network-allow HOST:PORT[,...]` | unset | Allowlist mode; only declared destinations reachable via nftables. Implies `--unshare-net`. Requires `slirp4netns`. |
 
 **Sandbox tuning** (env vars; CLI flags override when set)
@@ -282,9 +282,18 @@ Default approval-required patterns (active out of the box):
 | `HARES_SANDBOX_NETWORK` | `on` | Overridden by `--network` flag |
 | `HARES_SANDBOX_NETWORK_ALLOW` | unset | Overridden by `--network-allow` flag |
 | `HARES_SLIRP4NETNS_BIN` | `slirp4netns` | Required for network allowlist mode |
-| `HARES_COORDINATION_DIR` | unset | Shared semaphore + core-pool dir across Hares processes |
+| `HARES_COORDINATION_DIR` | unset | Shared flock-slot + core-pool dir across Hares processes |
 | `HARES_STATE_HMAC_SECRET` | unset | Required when `--state-file` is set |
 | `HARES_AUDIT_LOG` | unset | File path or `stderr` — structured JSONL of every tool call |
+| `HARES_AUDIT_HMAC_SECRET` | unset | 32+ bytes → tamper-evident (HMAC-signed) audit entries |
+| `HARES_AUDIT_REDACT_FIELDS` | `env` | Comma-separated arg fields to redact in the audit log; set empty to redact nothing |
+| `HARES_AUDIT_MAX_VALUE_CHARS` | `500` | Per-value truncation length in the audit log |
+| `HARES_EXTRA_SYSTEM_DIRS` | empty | Colon-separated extra paths added to the system-dir blocklist (see below) |
+| `HARES_SANDBOX_BWRAP_BIN` | `bwrap` | Path/name of the `bwrap` binary |
+| `HARES_SANDBOX_TMP_SIZE_MB` | unset | Size cap for the per-command `/tmp` tmpfs (MB) |
+| `HARES_SYSTEMD_RUN_BIN` | `systemd-run` | Path/name of `systemd-run` (cgroup bounding) |
+| `HARES_RSS_POLL_INTERVAL_SEC` | `2.0` | RSS monitor poll interval |
+| `HARES_RSS_OVERSHOOT_RATIO` | `1.2` | RSS kill threshold as a multiple of the mem cap |
 
 **Common sandbox additions for locally-installed tools:**
 
@@ -303,6 +312,8 @@ export HARES_SANDBOX_RW="$(realpath -m ~/.gitconfig):$(realpath -m ~/.cache)"
 | `HARES_LSF_OUTPUT_DIR` / `HARES_SLURM_OUTPUT_DIR` | per-session tempdir |
 | `HARES_LSF_POLL_INTERVAL_SEC` / `HARES_SLURM_POLL_INTERVAL_SEC` | `10` |
 | `HARES_LSF_DEFAULT_TIMEOUT_SEC` / `HARES_SLURM_DEFAULT_TIMEOUT_SEC` | `86400` |
+| `HARES_SLURM_ACCOUNT` | unset (SLURM only) |
+| `HARES_LSF_{BSUB,BJOBS,BKILL}_BIN` / `HARES_SLURM_{SBATCH,SQUEUE,SCANCEL}_BIN` | scheduler binary names (`bsub`, `sbatch`, …) |
 
 ---
 
@@ -524,11 +535,12 @@ JobSpec(
 ### Quirks and edge cases
 
 - **Ceiling defaults to `$PWD`** when neither `--ceiling` nor `$HARES_FS_CEILING` is set (logged at INFO). Rejected if it resolves under `.git/`.
+- **MCP-roots ceiling refinement is shell/bwrap-only.** When no explicit `--ceiling`/`$HARES_FS_CEILING` is set, Hares refines the ceiling from the MCP client's declared roots — but only the `execute_command` bwrap mounts track that refinement. The fs-tool path validation and `request_path_access`'s in-ceiling exclude/protect checks keep using the ceiling resolved at startup. The `.git` and system-dir denials are ceiling-independent and always apply; only the `HARES_SANDBOX_EXCLUDE`/`PROTECT` overlay can go stale this way. If your client's roots differ from the server's launch directory and you rely on exclude/protect, pass an explicit `--ceiling`.
 - **Elicitation fails closed** — if the client doesn't support MCP elicitation, suspicious commands are denied. Automated flows: use `--deny` instead of `--suspect`.
 - **RLIMIT hard limit inheritance** — if Hares runs inside another Hares process (e.g. test suite), the configured limit is silently clamped to the inherited hard limit. The result includes `applied_mem_limit_mb` showing what was actually applied.
 - **`restrict_paths([])`** — legal; means "no writes". Active-scope freeze useful for operator-initiated lockdown.
 - **In-flight subprocess + restrict change** — existing bwrap trees keep their original mounts; only the next `execute_command` gets the new scope.
-- **`request_path_access` "once" in shell mode** — a "once" grant is consumed by the next `execute_command` call regardless of whether that command actually touches the granted path; bwrap mounts are rebuilt per command and the mount layer can't introspect actual access. In fs mode, "once" is consumed the moment a read/write op resolves the granted path instead.
+- **`request_path_access` "once" is consumed by the next tool call on the granting surface** — in shell mode a "once" grant is consumed by the next `execute_command` call regardless of whether that command actually touches the granted path (bwrap mounts are rebuilt per command and the mount layer can't introspect actual access); in fs mode it's consumed the moment a read/write op resolves the granted path. **In `fs+shell` (combined) mode the two surfaces share one grant store**, so an "Allow once" grant is consumed by whichever comes first — an `execute_command` call (any command) *or* a file op — even if you approved it intending the other surface. If a workflow interleaves shell and file operations before using the granted path, request **"Allow for the session"** instead. This fails safe: a prematurely-consumed grant causes a clear "not covered by any active grant" denial, never silent access.
 - **One tool call, two paths, one "once" grant** — a call that resolves two paths under the same once-grant (e.g. `move_file` with source and destination both under one once-grant) consumes the grant on the first path and fails on the second. Request a "session" grant for operations like this.
 - **Flock-file slot lifecycle** — coordination slots are per-slot lock files under `HARES_COORDINATION_DIR`. If a process crashes mid-run, the kernel releases its flock automatically when the file descriptor closes — no manual cleanup, no leaked-semaphore problem. The operator is still responsible for the `HARES_COORDINATION_DIR` directory itself between runs with different caps.
 - **slirp4netns not found** — `--network-allow` degrades to `--network=off` with a warning. Run `hares-mcp doctor` to verify the full setup.
@@ -546,7 +558,7 @@ Docker isolates a whole container image — you build it, ship it, and run insid
 
 ## Project status
 
-Hares is **0.4.x — beta**. APIs are stable enough to build on; minor versions may tweak env-var names and tool signatures. Pin the minor version in production.
+Hares is **0.5.x — beta**. APIs are stable enough to build on; minor versions may tweak env-var names and tool signatures. Pin the minor version in production.
 
 Tested on Linux (RHEL 8+, Ubuntu 20.04+, Fedora). Cluster modes require LSF or SLURM binaries on `PATH` and a shared filesystem visible to both submit and execute hosts.
 

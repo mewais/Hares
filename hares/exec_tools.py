@@ -373,7 +373,20 @@ def build_exec_tool_handlers(
         # Unconditional memory elicitation — there is NO argument a caller
         # can pass to skip this step.  The requested budget is either the
         # caller-supplied mem_limit_mb or the machine-safe maximum.
-        requested_mb: int = arguments.get("mem_limit_mb") or mem_limit_max_mb
+        # The input schema declares `minimum: 1`, but don't rely on the
+        # client validating it: reject a non-positive explicit value here
+        # rather than letting `... or mem_limit_max_mb` silently promote a
+        # 0 to the machine max (a value the user never asked to approve).
+        raw_mb = arguments.get("mem_limit_mb")
+        if raw_mb is not None and raw_mb < 1:
+            return {
+                "exit_code": -1, "stdout": "", "stderr": "",
+                "killed_reason": "rejected_by_policy",
+                "rejected_reason": (
+                    f"mem_limit_mb must be a positive integer (got {raw_mb!r})."
+                ),
+            }
+        requested_mb: int = raw_mb or mem_limit_max_mb
         approved = await elicit_memory_approval(
             server, command, requested_mb, mem_limit_mb,
         )

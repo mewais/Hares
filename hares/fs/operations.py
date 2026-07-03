@@ -100,6 +100,12 @@ def _resolve(
 
     # Outside the ceiling: only an active request_path_access grant
     # can authorize this.
+    # NOTE: the covers_* check and the consume_once below are two
+    # separate GrantStore lock acquisitions. They are atomic w.r.t. the
+    # asyncio event loop ONLY because this function — and every write
+    # handler that calls it — is await-free between the two. Do not add
+    # `await` (async I/O) inside this resolve path without revisiting the
+    # once-grant consumption for check-then-consume races.
     covered = (
         grants.covers_write(resolved) if need_write else grants.covers_read(resolved)
     )
@@ -127,6 +133,11 @@ def _exclude_list(ceiling: Path, deny: Optional[DenyLists]) -> tuple[Path, ...]:
 def _is_hidden(path: Path, excluded: tuple[Path, ...]) -> bool:
     """True when ``path`` must be hidden from listings/search results
     because it is at-or-under a HARES_SANDBOX_EXCLUDE entry."""
+    if not excluded:
+        # Common case (no HARES_SANDBOX_EXCLUDE): skip the per-entry
+        # realpath resolution entirely — this runs once per child in
+        # every list_directory / directory_tree / search_files walk.
+        return False
     return is_denied(path.resolve(strict=False), excluded)
 
 
@@ -151,6 +162,7 @@ class ScopeViolationError(ValueError):
 def _ensure_under_active_scope(
     target: Path, scope: ActiveScope, ceiling: Path,
     deny: Optional[DenyLists] = None,
+    grants: Optional[GrantStore] = None,
 ) -> None:
     """For write operations: assert target is under at least one of
     the active-scope paths. Reads bypass this check (bounded by
@@ -167,15 +179,23 @@ def _ensure_under_active_scope(
         protectlist=deny.protect if deny is not None else None,
     )
     if not _is_subpath(target, ceiling):
-        # Target lies entirely outside the ceiling. The ONLY way
-        # _resolve() would have returned such a target is that an
-        # active request_path_access "rw" grant already authorized
-        # it (see _resolve's grant fallback) — active-scope narrowing
-        # is a ceiling-INTERNAL concept ("write authority within the
-        # ceiling") and has nothing to say about paths outside it, so
-        # it does not apply here. The protect check above still ran
-        # (a no-op for genuinely outside-ceiling paths, since protect
-        # entries are themselves always inside the ceiling).
+        # Target lies entirely outside the ceiling. The only legitimate
+        # way to reach here is that _resolve()'s grant fallback already
+        # authorized it via an active request_path_access "rw" grant —
+        # active-scope narrowing is a ceiling-INTERNAL concept and has
+        # nothing to say about paths outside it. Re-verify that a
+        # covering rw grant actually exists rather than trusting the
+        # caller: a defense-in-depth check so a future write handler
+        # that resolves its own path can't silently bypass both the
+        # scope check and the grant requirement. (The protect check
+        # above already ran — a no-op for genuinely outside-ceiling
+        # paths, since protect entries are always inside the ceiling.)
+        if grants is None or not grants.covers_write(target):
+            raise ScopeViolationError(
+                f"Path {str(target)!r} is outside the ceiling and not "
+                f"covered by any active request_path_access 'rw' grant; "
+                f"refusing to write. Call request_path_access first."
+            )
         return
     if not scope.paths:
         return  # no narrowing in effect; ceiling alone bounds writes
@@ -314,7 +334,7 @@ async def write_file(args: dict, *, ceiling: Path, scope: ActiveScope,
                      deny: Optional[DenyLists] = None,
                      grants: Optional[GrantStore] = None) -> dict:
     target = _resolve(args["path"], ceiling, deny, grants=grants, need_write=True)
-    _ensure_under_active_scope(target, scope, ceiling, deny)
+    _ensure_under_active_scope(target, scope, ceiling, deny, grants)
     content = args["content"]
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
@@ -328,7 +348,7 @@ async def edit_file(args: dict, *, ceiling: Path, scope: ActiveScope,
     must match exactly once; ambiguity raises an error so the caller
     rewrites the input."""
     target = _resolve(args["path"], ceiling, deny, grants=grants, need_write=True)
-    _ensure_under_active_scope(target, scope, ceiling, deny)
+    _ensure_under_active_scope(target, scope, ceiling, deny, grants)
     edits = args.get("edits", [])
     text = target.read_text(encoding="utf-8")
     applied = 0
@@ -355,7 +375,7 @@ async def create_directory(args: dict, *, ceiling: Path, scope: ActiveScope,
                            deny: Optional[DenyLists] = None,
                            grants: Optional[GrantStore] = None) -> dict:
     target = _resolve(args["path"], ceiling, deny, grants=grants, need_write=True)
-    _ensure_under_active_scope(target, scope, ceiling, deny)
+    _ensure_under_active_scope(target, scope, ceiling, deny, grants)
     target.mkdir(parents=True, exist_ok=True)
     return {"path": str(target)}
 
@@ -367,8 +387,8 @@ async def move_file(args: dict, *, ceiling: Path, scope: ActiveScope,
     dst = _resolve(args["destination"], ceiling, deny, grants=grants, need_write=True)
     # Both endpoints must be in the active scope (mv counts as a write
     # on both sides — source is unlinked, destination is created).
-    _ensure_under_active_scope(src, scope, ceiling, deny)
-    _ensure_under_active_scope(dst, scope, ceiling, deny)
+    _ensure_under_active_scope(src, scope, ceiling, deny, grants)
+    _ensure_under_active_scope(dst, scope, ceiling, deny, grants)
     dst.parent.mkdir(parents=True, exist_ok=True)
     os.replace(src, dst)
     return {"source": str(src), "destination": str(dst)}

@@ -27,10 +27,10 @@ consume the global default.
 For LSF / SLURM cluster work, use `mcp__hares-slurm__hpc_slurm_*`
 (or `mcp__hares-lsf__*` if your cluster uses LSF):
 
-- `slurm_execute_blocking` — single job, wait for it, get
+- `hpc_slurm_execute_blocking` — single job, wait for it, get
   stdout/stderr.
-- `slurm_submit` — batch-submit N jobs, get back job_ids; pair with
-  `slurm_wait`.
+- `hpc_slurm_submit` — batch-submit N jobs, get back job_ids; pair
+  with `hpc_slurm_wait`.
 
 Right-size the job's `resource_spec` per submission. SLURM and LSF
 both prioritize jobs whose resource asks fit current cluster slack —

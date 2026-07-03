@@ -166,8 +166,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "Comma-separated glob patterns. Commands matching any pattern "
             "are rejected immediately with a structured error — no elicitation, "
             "no way for the agent to work around it. "
-            "Example: 'sudo *,rm -rf /*'. "
-            "Adds to (does not replace) any $HARES_DENY env var."
+            "Example: 'sudo *,rm -rf /*'."
         ),
     )
     parser.add_argument(

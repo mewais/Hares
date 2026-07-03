@@ -159,6 +159,16 @@ def build_request_path_access_handlers(
         case where the requested path already lies inside the
         ceiling, so the in-ceiling deny lists (exclude/protect) are
         also enforced via :func:`hares.path_safety.validate_grant_target`.
+        NOTE: this is the ceiling resolved at server-build time. When
+        ``--use-roots`` later refines the Runner's ceiling from the MCP
+        client's declared roots, that refinement updates only the
+        shell/bwrap ceiling — this handler (like the fs-op dispatch)
+        keeps validating against the build-time ceiling/deny. The `.git`
+        and system-dir checks in ``validate_grant_target`` are ceiling-
+        independent and always apply; only the in-ceiling exclude/protect
+        overlay can go stale under roots refinement. Pass an explicit
+        ``--ceiling`` / ``$HARES_FS_CEILING`` if you rely on those under
+        roots refinement.
       deny: Pre-resolved exclude/protect lists against ``ceiling``
         (see :class:`hares.path_safety.DenyLists`). Treated as empty
         when None.

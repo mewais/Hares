@@ -54,7 +54,7 @@ adjust the `HARES_SANDBOX_*` paths). Restart Claude Code.
 - Full lockdown: every file op goes through `mcp__hares__*` too — see
   the tool list in `claude-code-locked/CLAUDE.md`.
 
-The README's [Use with Claude Code section](../README.md#claude-code-lose-nothing-gain-a-lot)
+The README's [Claude Code section](../README.md#claude-code)
 explains what you gain in each case.
 
 ### Shell-rc defaults (`hares.env.sh`)
