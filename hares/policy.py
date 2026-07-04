@@ -182,11 +182,17 @@ def _resolve_session(server_or_session) -> Optional[object]:
             return None
 
 
-async def _send_elicitation(session, message: str, command_label: str) -> bool:
-    """Send an MCP elicitation request and return True iff the user accepted.
+async def _send_elicitation(session, message: str, command_label: str) -> str:
+    """Send an MCP elicitation request and return a reason string.
 
-    Fail-closed: returns False on any error, AttributeError, or non-accept
-    action.  The empty ``requestedSchema`` produces a simple Accept / Decline
+    Returns one of:
+      ``"accepted"``      — user explicitly approved.
+      ``"user_declined"`` — user explicitly declined or cancelled.
+      ``"unsupported"``   — client does not support elicitation (AttributeError).
+      ``"error"``         — unexpected exception during elicitation.
+
+    Fail-closed: every value other than ``"accepted"`` must be treated as a
+    deny.  The empty ``requestedSchema`` produces a simple Accept / Decline
     dialog — no form fields are needed.
     """
     schema: dict = {"type": "object", "properties": {}}
@@ -201,17 +207,17 @@ async def _send_elicitation(session, message: str, command_label: str) -> bool:
             "Elicitation response: command=%r action=%r approved=%s",
             command_label, action, approved,
         )
-        return approved
+        return "accepted" if approved else "user_declined"
     except AttributeError:
         logger.debug(
             "Elicitation not supported by this client; denying: %r", command_label,
         )
-        return False
+        return "unsupported"
     except Exception as exc:
         logger.debug(
             "Elicitation failed (%s); denying: %r", exc, command_label,
         )
-        return False
+        return "error"
 
 
 async def elicit_approval(server_or_session, command: str, result: PolicyResult) -> bool:
@@ -234,7 +240,7 @@ async def elicit_approval(server_or_session, command: str, result: PolicyResult)
     if session is None:
         logger.debug("No MCP session available for elicitation; denying: %r", command)
         return False
-    return await _send_elicitation(session, message, command)
+    return (await _send_elicitation(session, message, command)) == "accepted"
 
 
 async def elicit_memory_approval(
@@ -242,12 +248,21 @@ async def elicit_memory_approval(
     command: str,
     requested_mb: int,
     normal_cap_mb: int,
-) -> bool:
+) -> str:
     """Elicit user approval for a HIGH-MEMORY run.
 
-    Same session-resolution and fail-closed semantics as
-    :func:`elicit_approval` (returns ``False`` when the client cannot
-    elicit or the user declines).
+    Returns the reason string from :func:`_send_elicitation`:
+      ``"accepted"``      — user explicitly approved; proceed with the run.
+      ``"user_declined"`` — user explicitly clicked Decline or Cancel.
+      ``"unsupported"``   — client does not support elicitation.
+      ``"error"``         — unexpected exception during the dialog.
+      ``"no_session"``    — no MCP session was resolvable.
+
+    Every value other than ``"accepted"`` must be treated as a deny.  Callers
+    use the reason string to surface a precise message to the LLM so it can
+    tell whether the block was the user's decision or an infrastructure gap
+    — the old combined "declined by user or client does not support
+    elicitation" wording could not.
 
     The dialog message states the requested budget vs the normal cap and
     explains that the run stays cgroup-bounded so it cannot take down the
@@ -264,11 +279,6 @@ async def elicit_memory_approval(
         normal_cap_mb: The operator's standard cap (``HARES_MEM_LIMIT_MB``).
             Shown alongside ``requested_mb`` so the user can judge the
             magnitude of the elevation.
-
-    Returns:
-        ``True`` iff the user explicitly accepted the elicitation; ``False``
-        in all other cases (decline, cancel, no elicitation support, any
-        error).
     """
     message = (
         f"**High-memory command requires approval**\n\n"
@@ -285,7 +295,7 @@ async def elicit_memory_approval(
         logger.debug(
             "No MCP session available for memory elicitation; denying: %r", command,
         )
-        return False
+        return "no_session"
     return await _send_elicitation(session, message, command)
 
 

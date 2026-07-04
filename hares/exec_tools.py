@@ -236,6 +236,23 @@ COMBINED_ELICIT_DECLINE_TEMPLATE = (
     "(pattern: {pattern!r})."
 )
 
+# ``rejected_reason`` text for a blocked high-memory run, keyed on the reason
+# string returned by :func:`hares.policy.elicit_memory_approval`. Kept distinct
+# so the LLM can tell an explicit user decision apart from an infrastructure
+# gap (unsupported client / no session) rather than seeing one ambiguous line.
+_HIGH_MEM_DENIAL_MESSAGES = {
+    "user_declined": "High-memory run declined by the user.",
+    "unsupported": (
+        "High-memory run blocked: this MCP client does not support the approval "
+        "dialog (elicitation). Use an interactive client such as Claude Code to "
+        "approve high-memory commands."
+    ),
+    "no_session": (
+        "High-memory run blocked: no MCP session is available to present the "
+        "approval dialog."
+    ),
+}
+
 
 def _policy_rejection(pr) -> dict:
     """The result payload for a policy DENY (or declined elicitation
@@ -360,16 +377,16 @@ def build_exec_tool_handlers(
                 ),
             }
         requested_mb: int = raw_mb or mem_limit_max_mb
-        approved = await elicit_memory_approval(
+        approval_reason = await elicit_memory_approval(
             server, command, requested_mb, mem_limit_mb,
         )
-        if not approved:
+        if approval_reason != "accepted":
             return {
                 "exit_code": -1, "stdout": "", "stderr": "",
                 "killed_reason": "rejected_by_policy",
-                "rejected_reason": (
-                    "High-memory run declined by user or client does not "
-                    "support elicitation."
+                "rejected_reason": _HIGH_MEM_DENIAL_MESSAGES.get(
+                    approval_reason,
+                    f"High-memory run blocked (reason: {approval_reason}).",
                 ),
             }
 

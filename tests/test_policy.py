@@ -275,54 +275,54 @@ async def test_elicit_approval_none_session_fails_closed():
 
 @pytest.mark.asyncio
 async def test_elicit_memory_approval_accept():
-    """Mock session that accepts → approved."""
+    """Mock session that accepts → 'accepted'."""
     session = _MockSession("accept")
-    approved = await elicit_memory_approval(
+    reason = await elicit_memory_approval(
         session, "make -j8", requested_mb=16384, normal_cap_mb=7168,
     )
-    assert approved is True
+    assert reason == "accepted"
 
 
 @pytest.mark.asyncio
 async def test_elicit_memory_approval_decline():
-    """Mock session that declines → not approved."""
+    """Mock session that declines → 'user_declined'."""
     session = _MockSession("decline")
-    approved = await elicit_memory_approval(
+    reason = await elicit_memory_approval(
         session, "make -j8", requested_mb=16384, normal_cap_mb=7168,
     )
-    assert approved is False
+    assert reason == "user_declined"
 
 
 @pytest.mark.asyncio
 async def test_elicit_memory_approval_cancel():
-    """Cancel action is treated as not approved."""
+    """Cancel action → 'user_declined' (treated same as explicit decline)."""
     session = _MockSession("cancel")
-    approved = await elicit_memory_approval(
+    reason = await elicit_memory_approval(
         session, "make -j8", requested_mb=16384, normal_cap_mb=7168,
     )
-    assert approved is False
+    assert reason == "user_declined"
 
 
 @pytest.mark.asyncio
 async def test_elicit_memory_approval_no_elicitation_support_fails_closed():
-    """Client without elicitation method → denied (fail closed)."""
+    """Client whose elicit() raises AttributeError → 'unsupported' (fail closed)."""
     class NoElicitSession:
-        async def create_elicitation(self, **_):
+        async def elicit(self, **_):
             raise AttributeError("no elicitation")
 
-    approved = await elicit_memory_approval(
+    reason = await elicit_memory_approval(
         NoElicitSession(), "make -j8", requested_mb=16384, normal_cap_mb=7168,
     )
-    assert approved is False
+    assert reason == "unsupported"
 
 
 @pytest.mark.asyncio
 async def test_elicit_memory_approval_none_session_fails_closed():
-    """None session → denied."""
-    approved = await elicit_memory_approval(
+    """None session → 'no_session'."""
+    reason = await elicit_memory_approval(
         None, "make -j8", requested_mb=16384, normal_cap_mb=7168,
     )
-    assert approved is False
+    assert reason == "no_session"
 
 
 @pytest.mark.asyncio
