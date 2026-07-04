@@ -1159,21 +1159,31 @@ class Runner:
             else:
                 killed_reason = kill_flag.get("reason")
 
-            # Distinguish CPU vs AS based on signal where we can.
-            # In cgroup mode, prefer the OOM reason already set by the
-            # monitor rather than inferring from exit code (which is
-            # unreliable — cgroup OOM exits with 143, not 137).
+            # Distinguish CPU vs AS/OOM based on signal where we can. The
+            # counter-based OOM detection in _monitor_rss is the primary,
+            # precise signal; the inference below is the fallback for when it
+            # could not observe the transient scope's memory.events in time.
             if killed_reason is None and proc.returncode is not None:
                 if proc.returncode == -signal.SIGXCPU:
                     killed_reason = "cpu_exceeded"
+                elif wrapped_in_cgroup and proc.returncode in (
+                    -signal.SIGKILL, -signal.SIGTERM,
+                ):
+                    # Cgroup-mode OOM fallback. The counter read depends on
+                    # inspecting the transient scope's memory.events BEFORE
+                    # systemd tears the cgroup down — which races on some
+                    # hosts (and CI) — and does not fire at all when a
+                    # userspace killer (systemd-oomd) reaps the scope with
+                    # SIGTERM (exit 143) instead of the kernel cgroup OOM
+                    # killer's SIGKILL (exit 137). By this point timeouts
+                    # (killed_reason set above) and CPU limits (SIGXCPU) are
+                    # already accounted for, so a memory-bounded tree that
+                    # died by SIGKILL/SIGTERM with no other cause is an OOM.
+                    killed_reason = "oom"
                 elif proc.returncode == -signal.SIGKILL:
-                    if not wrapped_in_cgroup:
-                        # SIGKILL without a more specific reason is most
-                        # commonly OOM here; flag generically.
-                        killed_reason = "rss_exceeded"
-                    # In cgroup mode: monitor already set 'oom' if the
-                    # cgroup fired; if we reach here without a reason it
-                    # means an external kill or something else — leave None.
+                    # Non-cgroup mode: SIGKILL without a more specific reason
+                    # is most commonly OOM here; flag generically.
+                    killed_reason = "rss_exceeded"
 
             stdout_str = stdout.decode("utf-8", errors="replace")
             if rewrite_notice:
@@ -1206,10 +1216,10 @@ class Runner:
             if killed_reason == "oom":
                 killed_note = (
                     f"Command tree exceeded the {aggregate_mem_limit_mb}MB aggregate "
-                    "memory cap and was killed by the cgroup OOM killer; your session "
-                    "was unaffected. If this command legitimately needs more memory, "
-                    "it can be re-run with a higher (machine-safe) budget that requires "
-                    "user approval."
+                    "memory cap and was killed under its cgroup (out of memory); your "
+                    "session was unaffected. If this command legitimately needs more "
+                    "memory, it can be re-run with a higher (machine-safe) budget that "
+                    "requires user approval."
                 )
             elif killed_reason == "rss_exceeded":
                 peak_str = f" (peak RSS: {peak_rss_mb}MB)" if peak_rss_mb is not None else ""
