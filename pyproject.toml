@@ -55,6 +55,10 @@ exclude = [
   ".github/workflows/",  # CI is for the repo, not for sdist consumers
   "*.pyc",
   "__pycache__",
+  ".venv*/",             # local build/dev virtualenvs
+  "dist/",               # build output
+  "build/",              # build output
+  "*.egg-info/",
 ]
 
 [tool.pytest.ini_options]

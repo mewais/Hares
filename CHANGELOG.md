@@ -18,6 +18,13 @@ follow [Semantic Versioning](https://semver.org/).
   cgroups/user-systemd are absent, Hares falls back to per-process
   RLIMIT + RSS poll with an honest warning: a fast multi-process
   memory bomb can exhaust RAM between polls in this mode.
+  OOM is reported as `killed_reason="oom"`: primarily via the
+  cgroup's `memory.events` counter, with a fallback that classifies a
+  cgroup-bounded tree dying by SIGKILL/SIGTERM (no timeout, no CPU
+  limit) as an OOM — this covers both the kernel cgroup OOM killer
+  (SIGKILL/137) and a userspace `systemd-oomd` reap (SIGTERM/143),
+  and is robust to the transient scope's cgroup dir being torn down
+  before the counter can be read.
 
 * **`HARES_MEM_LIMIT_MAX_MB`** — operator-configurable machine-safe
   ceiling (MB) for approved high-memory runs.  Defaults to ~90 % of
@@ -35,7 +42,10 @@ follow [Semantic Versioning](https://semver.org/).
   `HARES_MEM_LIMIT_MAX_MB` so even an approved high-memory command
   cannot take down the session.  Non-interactive clients (no
   elicitation support) fail closed.  Registered in both shell and
-  fs+shell modes; not available in fs-only mode.
+  fs+shell modes; not available in fs-only mode.  A blocked run
+  reports a precise `rejected_reason` distinguishing an explicit user
+  decline from an infrastructure gap (client lacks elicitation
+  support / no MCP session) rather than one ambiguous message.
 
 * **`hares-mcp doctor` cgroup memory check** — `check_cgroup_memory()`
   reports whether aggregate cgroup bounding is active and shows the
