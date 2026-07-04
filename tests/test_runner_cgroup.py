@@ -161,9 +161,10 @@ async def test_oom_multiprocess_kills_command_not_session(tmp_path):
         "test process was killed during the OOM bomb — cgroup bounding failed!"
     )
 
-    # A human-readable note must be present.
+    # A human-readable note must be present and mention the cgroup + OOM.
     assert "killed_note" in result, result
-    assert "cgroup OOM killer" in result["killed_note"], result["killed_note"]
+    note = result["killed_note"]
+    assert "cgroup" in note and "out of memory" in note, note
 
 
 # ── LIVE: high_memory=True raises the ceiling ──────────────────────────────────
