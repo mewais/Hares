@@ -336,7 +336,17 @@ class CrossProcessCoordinator:
                     os.close(self._fd)
 
     def _core_pool_lock(self, path: Path) -> "_LockCtx":
-        return CrossProcessCoordinator._LockCtx(path)
+        # Lock a DEDICATED sibling lockfile, never the pool file itself.
+        # _write_core_pool replaces the pool file via os.replace (a fresh
+        # inode each time); locking a file that gets replaced out from
+        # under waiters breaks mutual exclusion — a process that opened
+        # the pool file before the replace ends up holding a lock on an
+        # orphaned inode while a process that opens after gets a
+        # different inode and its flock succeeds concurrently. The
+        # lockfile is only ever created/opened, never renamed, so its
+        # inode is stable and the lock is genuinely exclusive.
+        lock_path = path.with_name(path.name + ".lock")
+        return CrossProcessCoordinator._LockCtx(lock_path)
 
     def _read_core_pool(self, path: Path) -> dict:
         """Read the core-pool JSON, returning a fresh dict on
@@ -364,8 +374,10 @@ class CrossProcessCoordinator:
         return data
 
     def _write_core_pool(self, path: Path, state: dict) -> None:
-        """Atomic write: tmp + rename."""
-        tmp = path.with_suffix(path.suffix + ".tmp")
+        """Atomic write: tmp + rename. The tmp name is pid-unique so
+        concurrent writers never collide on a shared tmp file (belt and
+        suspenders — the core-pool lock already serializes writers)."""
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
         os.replace(tmp, path)
 

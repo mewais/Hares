@@ -287,3 +287,42 @@ async def test_capacity_decrease_uses_fewer_slots(tmp_path):
     await coord.release_subprocess_slot(token2)
     free, _ = count_free_slots(coord_dir, 2)
     assert free == 2
+
+
+def _core_pool_churn(coord_dir_str: str) -> list[str]:
+    """Hammer claim_cores/release_cores against a shared core pool.
+
+    Returns the list of exceptions this worker hit (empty = clean)."""
+    errors: list[str] = []
+    for _ in range(25):
+        coord = CrossProcessCoordinator(
+            coord_dir=Path(coord_dir_str), max_concurrent=2,
+        )
+        try:
+            coord.claim_cores()
+            coord.release_cores()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{type(exc).__name__}: {exc}")
+    return errors
+
+
+def test_core_pool_survives_concurrent_read_modify_write(tmp_path):
+    """Regression for the core-pool lock-on-replaced-file race.
+
+    The lock must be held on a stable lockfile, not on the pool file
+    that _write_core_pool atomically replaces — otherwise concurrent
+    claim/release across processes breaks mutual exclusion, corrupting
+    the pool JSON and raising FileNotFoundError on the shared tmp
+    rename. With many workers churning one shared pool, every worker
+    must complete cleanly.
+    """
+    coord_dir = tmp_path / "coord"
+    coord_dir.mkdir()
+    n_workers = 16
+    with multiprocessing.Pool(n_workers) as pool:
+        results = pool.map(_core_pool_churn, [str(coord_dir)] * n_workers)
+    all_errors = [e for worker in results for e in worker]
+    assert not all_errors, (
+        f"{len(all_errors)} error(s) under concurrent core-pool churn; "
+        f"first few: {all_errors[:5]}"
+    )
