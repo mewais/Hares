@@ -4,6 +4,24 @@ All notable changes to Hares are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] — 2026-07-15
+
+### Fixed
+
+* **Session-wide hang on SIGKILL-resistant process trees** — after a
+  wall-clock timeout, `Runner.execute` sent `SIGKILL` and then drained
+  the child's stdout/stderr with an *unbounded* `proc.communicate()`.
+  A process wedged in uninterruptible D-state (e.g. blocked on a
+  stalled hard-mounted NFS path — visible inside the sandbox via
+  `--ro-bind / /`) ignores `SIGKILL`, so the drain blocked forever.
+  The `finally` block never ran, the concurrency-slot flock was held
+  permanently, and every subsequent command from every session blocked
+  waiting for a slot. The post-kill drain is now bounded by
+  `_POST_KILL_DRAIN_TIMEOUT` (30 s); on expiry Hares abandons the
+  drain, surfaces the D-state condition in `killed_note` plus a
+  `logger.warning`, and releases the slot. The orphaned process is left
+  until its I/O returns (nothing can reap a D-state process sooner).
+
 ## [0.5.0] — 2026-07-03
 
 ### Added
