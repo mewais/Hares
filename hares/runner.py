@@ -40,6 +40,14 @@ from .sandbox import SandboxConfig, build_bwrap_argv
 
 logger = logging.getLogger(__name__)
 
+#: Seconds to wait for a killed process tree to drain its stdout/stderr
+#: after SIGKILL. Processes wedged in uninterruptible D-state (e.g. a
+#: stalled hard-mounted NFS path) ignore SIGKILL, so an unbounded drain
+#: would hold the concurrency slot forever and block every session. When
+#: this elapses we abandon the drain, release the slot, and leave the
+#: (unkillable-until-I/O-returns) process orphaned on the host.
+_POST_KILL_DRAIN_TIMEOUT = 30.0
+
 
 class _ExecuteResultBase(TypedDict):
     """Keys present in EVERY :meth:`Runner.execute` result."""
@@ -1096,6 +1104,7 @@ class Runner:
                 scope_name=scope_name,
             ))
             timed_out = False
+            drain_stalled = False
             try:
                 stdout, stderr = await asyncio.wait_for(
                     proc.communicate(input=stdin_bytes), timeout=timeout,
@@ -1143,7 +1152,30 @@ class Runner:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     pass
-                stdout, stderr = await proc.communicate()
+                # Drain output with a second timeout. Processes in
+                # uninterruptible D-state (e.g. waiting on a stalled
+                # hard-mounted NFS path) ignore SIGKILL; without a
+                # timeout here the slot flock is held forever and all
+                # subsequent commands from every session block indefinitely.
+                try:
+                    stdout, stderr = await asyncio.wait_for(
+                        proc.communicate(), timeout=_POST_KILL_DRAIN_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    # The tree ignored SIGKILL even after the drain window —
+                    # almost certainly wedged in D-state on stalled I/O. Give
+                    # up the drain so we release the slot; the process stays
+                    # orphaned on the host until its I/O returns. Surface this
+                    # loudly rather than reporting a plain empty-output timeout.
+                    drain_stalled = True
+                    stdout, stderr = b"", b""
+                    logger.warning(
+                        "Post-kill drain timed out after %.0fs (pid=%s); "
+                        "process is likely wedged in D-state on stalled I/O "
+                        "(e.g. a hard-mounted NFS path). Releasing the slot "
+                        "and abandoning the orphaned process tree.",
+                        _POST_KILL_DRAIN_TIMEOUT, proc.pid,
+                    )
                 timed_out = True
             finally:
                 kill_flag["done"] = True
@@ -1240,6 +1272,15 @@ class Runner:
                     "Increase the timeout parameter or split the command into "
                     "smaller steps."
                 )
+                if drain_stalled:
+                    killed_note += (
+                        f" NOTE: the process ignored SIGKILL and could not be "
+                        f"drained within {_POST_KILL_DRAIN_TIMEOUT:.0f}s — it is "
+                        "likely wedged in uninterruptible D-state on stalled I/O "
+                        "(commonly a hard-mounted NFS path). Its stdout/stderr "
+                        "were unavailable and it remains orphaned on the host "
+                        "until the I/O returns. The concurrency slot was released."
+                    )
 
             # Detect preexec_fn failures (e.g. requested RLIMIT exceeds the
             # inherited hard limit — common when Hares runs inside Hares).

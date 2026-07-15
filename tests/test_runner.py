@@ -75,6 +75,43 @@ async def test_timeout_kills(small_runner: Runner):
     assert r["exit_code"] != 0
 
 
+async def test_stalled_drain_releases_slot(monkeypatch):
+    """A process that ignores SIGKILL (simulated D-state) must not hold
+    its concurrency slot forever: the post-kill drain has its own timeout,
+    after which execute() returns and the slot is freed.
+
+    Simulated by no-op'ing killpg so the timed-out `sleep` keeps running,
+    forcing the second communicate() to hit the (shrunk) drain timeout.
+    cgroup mode is forced off so cgroup.kill can't reap the process for
+    real and defeat the no-op killpg.
+    """
+    import hares.runner as runner_mod
+
+    runner = Runner(
+        max_concurrent=1,
+        mem_limit_mb=1024,
+        cpu_limit_sec=60,
+        use_cgroup=False,
+    )
+    monkeypatch.setattr(runner_mod, "_POST_KILL_DRAIN_TIMEOUT", 0.3)
+    monkeypatch.setattr(runner_mod.os, "killpg", lambda *a, **k: None)
+
+    start = time.monotonic()
+    # 1s wall-clock timeout, then ~0.3s stalled drain; sleep self-reaps at 3s.
+    r = await runner.execute("sleep 3", timeout=1.0)
+    elapsed = time.monotonic() - start
+
+    assert r["killed_reason"] == "timeout"
+    assert elapsed < 2.5  # did NOT wait the full 3s sleep
+    assert "D-state" in r.get("killed_note", "")
+    assert r["stdout"] == ""
+
+    # Slot must be free again — a follow-up command runs immediately.
+    r2 = await runner.execute("echo ok")
+    assert r2["exit_code"] == 0
+    assert r2["stdout"].strip() == "ok"
+
+
 # ── concurrency cap ────────────────────────────────────────────────────────
 
 
