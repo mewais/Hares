@@ -26,9 +26,12 @@ async def _accept_elicitation_callback(ctx, params: ElicitRequestParams) -> Elic
     Used in tests that need to simulate a user who approves a prompt.
     The MCP SDK invokes this callback on the client side whenever the
     server sends an elicitation/create request.
+
+    Includes ``content={"decision": "allow"}`` so the callback honours
+    the schema Hares sends (a ``decision`` enum with Allow / Deny).
     """
     from mcp.types import ElicitResult
-    return ElicitResult(action="accept", content={})
+    return ElicitResult(action="accept", content={"decision": "allow"})
 
 
 async def _decline_elicitation_callback(ctx, params: ElicitRequestParams) -> ElicitResult:

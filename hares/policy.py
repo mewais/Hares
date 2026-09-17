@@ -182,6 +182,33 @@ def _resolve_session(server_or_session) -> Optional[object]:
             return None
 
 
+# ── Shared elicitation schema ──────────────────────────────────────────────
+#
+# A single enum field so the client renders a choice (dropdown / radio)
+# rather than auto-accepting an empty form.  ``default: "deny"`` means the
+# user must explicitly pick "Allow" — the safe default is rejection.
+#
+# This schema is used by both the suspect-command gate
+# (:func:`elicit_approval`) and the high-memory gate
+# (:func:`elicit_memory_approval`).  The path-access gate
+# (:func:`elicit_path_access_approval`) carries its own richer schema
+# (grant scope) and is not affected.
+
+_ELICIT_DECISION_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "decision": {
+            "type": "string",
+            "title": "Decision",
+            "enum": ["allow", "deny"],
+            "enumNames": ["Allow", "Deny"],
+            "default": "deny",
+        },
+    },
+    "required": ["decision"],
+}
+
+
 async def _send_elicitation(session, message: str, command_label: str) -> str:
     """Send an MCP elicitation request and return a reason string.
 
@@ -192,20 +219,36 @@ async def _send_elicitation(session, message: str, command_label: str) -> str:
       ``"error"``         — unexpected exception during elicitation.
 
     Fail-closed: every value other than ``"accepted"`` must be treated as a
-    deny.  The empty ``requestedSchema`` produces a simple Accept / Decline
-    dialog — no form fields are needed.
+    deny.  The schema carries a ``decision`` enum (Allow / Deny, defaulting
+    to Deny) so that clients which auto-accept empty-form elicitations
+    (notably OpenCode V2 as of Sep 2026) still render a choice the user
+    must explicitly answer.
     """
-    schema: dict = {"type": "object", "properties": {}}
     try:
         response = await session.elicit(
             message=message,
-            requestedSchema=schema,
+            requestedSchema=_ELICIT_DECISION_SCHEMA,
         )
         action = getattr(response, "action", "cancel")
-        approved = action == "accept"
+        if action != "accept":
+            logger.info(
+                "Elicitation response: command=%r action=%r -> denied",
+                command_label, action,
+            )
+            return "user_declined"
+
+        # Defence-in-depth: also check the form content.  A well-behaved
+        # client honours requestedSchema and returns ``decision``; a lax
+        # client that ignores the schema but still returns ``action=accept``
+        # is treated as allow (the MCP spec makes schema compliance a
+        # SHOULD, not a MUST, so we don't penalise a client that only
+        # supports plain accept/decline).
+        content = getattr(response, "content", None) or {}
+        decision = content.get("decision") if isinstance(content, dict) else None
+        approved = decision != "deny"  # missing / unrecognised → allow (lax-client fallback)
         logger.info(
-            "Elicitation response: command=%r action=%r approved=%s",
-            command_label, action, approved,
+            "Elicitation response: command=%r action=accept decision=%r approved=%s",
+            command_label, decision, approved,
         )
         return "accepted" if approved else "user_declined"
     except AttributeError:

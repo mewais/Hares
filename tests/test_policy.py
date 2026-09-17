@@ -211,24 +211,61 @@ def test_load_policy_explicit_suspect():
 # ── elicit_approval ───────────────────────────────────────────────────────────
 
 class _MockSession:
-    def __init__(self, action: str):
+    """Simulates an MCP client session for elicitation unit tests.
+
+    *action* is the top-level elicitation response action
+    (``"accept"``, ``"decline"``, ``"cancel"``).
+
+    *content* is the form-field payload the client returns alongside
+    ``action=accept``.  When omitted the response carries no content
+    at all (simulating a lax client that ignores ``requestedSchema``).
+    """
+
+    def __init__(self, action: str, content: dict | None = None):
         self._action = action
+        self._content = content
 
     async def elicit(self, message: str, requestedSchema: dict, **_):
         class R:
             pass
+
         r = R()
         r.action = self._action
+        if self._content is not None:
+            r.content = self._content
         return r
 
 
 @pytest.mark.asyncio
 async def test_elicit_approval_accept():
-    session = _MockSession("accept")
+    session = _MockSession("accept", {"decision": "allow"})
     engine = PolicyEngine(deny_patterns=(), suspect_patterns=("*git push*",))
     pr = engine.check("git push origin main")
     approved = await elicit_approval(session, "git push origin main", pr)
     assert approved is True
+
+
+@pytest.mark.asyncio
+async def test_elicit_approval_accept_lax_client_no_content():
+    """A client that returns action=accept but no content (ignores
+    requestedSchema) is still treated as approved — the MCP spec makes
+    schema compliance a SHOULD, not a MUST."""
+    session = _MockSession("accept", content=None)
+    engine = PolicyEngine(deny_patterns=(), suspect_patterns=("*git push*",))
+    pr = engine.check("git push origin main")
+    approved = await elicit_approval(session, "git push origin main", pr)
+    assert approved is True
+
+
+@pytest.mark.asyncio
+async def test_elicit_approval_accept_but_decision_deny():
+    """action=accept with decision=deny in content → denied (user used
+    the in-form control to say no while still submitting)."""
+    session = _MockSession("accept", {"decision": "deny"})
+    engine = PolicyEngine(deny_patterns=(), suspect_patterns=("*git push*",))
+    pr = engine.check("git push origin main")
+    approved = await elicit_approval(session, "git push origin main", pr)
+    assert approved is False
 
 
 @pytest.mark.asyncio
@@ -276,7 +313,7 @@ async def test_elicit_approval_none_session_fails_closed():
 @pytest.mark.asyncio
 async def test_elicit_memory_approval_accept():
     """Mock session that accepts → 'accepted'."""
-    session = _MockSession("accept")
+    session = _MockSession("accept", {"decision": "allow"})
     reason = await elicit_memory_approval(
         session, "make -j8", requested_mb=16384, normal_cap_mb=7168,
     )
@@ -329,10 +366,12 @@ async def test_elicit_memory_approval_none_session_fails_closed():
 async def test_elicit_memory_approval_message_mentions_budgets():
     """The elicitation message must mention both the requested and normal cap."""
     captured_message: list[str] = []
+    captured_schema: list[dict] = []
 
     class CapturingSession:
         async def elicit(self, message: str, requestedSchema: dict, **_):
             captured_message.append(message)
+            captured_schema.append(requestedSchema)
             class R:
                 action = "decline"
             return R()
@@ -345,3 +384,26 @@ async def test_elicit_memory_approval_message_mentions_budgets():
     msg = captured_message[0]
     assert "16384" in msg, f"requested_mb not in message: {msg!r}"
     assert "7168" in msg, f"normal_cap_mb not in message: {msg!r}"
+
+
+# ── Elicitation schema shape ──────────────────────────────────────────────────
+
+def test_elicit_decision_schema_is_non_empty():
+    """The schema sent to the MCP client must have at least one property
+    so that clients which auto-accept empty-form elicitations (OpenCode V2)
+    render a choice the user must explicitly answer."""
+    from hares.policy import _ELICIT_DECISION_SCHEMA
+
+    schema = _ELICIT_DECISION_SCHEMA
+    assert schema["type"] == "object"
+    assert "properties" in schema
+    assert len(schema["properties"]) > 0, (
+        "Schema must have at least one property; empty schemas are "
+        "auto-accepted by OpenCode V2"
+    )
+    assert "decision" in schema["properties"]
+    decision = schema["properties"]["decision"]
+    assert decision["type"] == "string"
+    assert decision["enum"] == ["allow", "deny"]
+    assert decision["default"] == "deny"
+    assert schema["required"] == ["decision"]
