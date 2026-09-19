@@ -22,7 +22,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install bubblewrap
-        run: sudo apt-get install -y bubblewrap
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y bubblewrap
 
       - name: Install Hares + dev dependencies
         run: pip install -e ".[dev]"
